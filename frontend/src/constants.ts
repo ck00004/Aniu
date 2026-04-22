@@ -1,0 +1,5 @@
+export const LOGIN_STORAGE_KEY = 'aniu-session-authenticated'
+export const TOKEN_STORAGE_KEY = 'aniu-session-token'
+export const REMEMBERED_PASSWORD_STORAGE_KEY = 'aniu-remembered-password'
+export const LOGIN_REDIRECT_STORAGE_KEY = 'aniu-login-redirect'
+export const LOGIN_NOTICE_STORAGE_KEY = 'aniu-login-notice'

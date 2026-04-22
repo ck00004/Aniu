@@ -1,0 +1,11 @@
+services:
+  aniu:
+    image: ghcr.io/anacondakc/aniu:${ANIU_IMAGE_TAG:-latest}
+    container_name: aniu
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env.docker
+    volumes:
+      - ./data:/app/data

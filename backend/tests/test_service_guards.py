@@ -1,0 +1,669 @@
+from pathlib import Path
+import sys
+from datetime import date, datetime
+from types import SimpleNamespace
+
+import pytest
+
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+
+from app.db.database import init_db
+from app.db.models import StrategySchedule
+from app.services.aniu_service import aniu_service
+from app.services.jin10_news_service import Jin10NewsService
+from app.services.mx_skill_service import mx_skill_service
+from app.services.llm_service import LLMService, LLMUpstreamError, llm_service
+
+
+def test_execute_run_rejects_unknown_schedule_id(monkeypatch, tmp_path) -> None:
+    from app.core.config import get_settings
+    from app.db import database as database_module
+    from app.services.trading_calendar_service import trading_calendar_service
+
+    monkeypatch.setenv("SQLITE_DB_PATH", str(tmp_path / "guards.db"))
+    monkeypatch.setattr(
+        trading_calendar_service,
+        "warm_up_months",
+        lambda current: None,
+    )
+    get_settings.cache_clear()
+    database_module._engine = None
+    database_module._session_local = None
+    init_db()
+
+    with pytest.raises(RuntimeError, match="指定的定时任务不存在"):
+        aniu_service.execute_run(schedule_id=999999)
+
+    database_module._engine = None
+    database_module._session_local = None
+    get_settings.cache_clear()
+
+
+def test_moni_trade_requires_limit_price() -> None:
+    with pytest.raises(RuntimeError, match="LIMIT 委托必须提供有效价格"):
+        mx_skill_service._handle_moni_trade(
+            client=None,
+            app_settings=None,
+            arguments={
+                "action": "BUY",
+                "symbol": "600519.SH",
+                "quantity": 100,
+                "price_type": "LIMIT",
+            },
+        )
+
+
+def test_moni_trade_rejects_non_positive_limit_price() -> None:
+    with pytest.raises(RuntimeError, match="LIMIT 委托价格必须大于 0"):
+        mx_skill_service._handle_moni_trade(
+            client=None,
+            app_settings=None,
+            arguments={
+                "action": "BUY",
+                "symbol": "600519.SH",
+                "quantity": 100,
+                "price_type": "LIMIT",
+                "price": 0,
+            },
+        )
+
+
+def test_resolve_run_type_maps_schedule_names() -> None:
+    assert aniu_service._resolve_run_type(None) == "analysis"
+    assert aniu_service._resolve_run_type(StrategySchedule(name="盘前分析", run_type="analysis")) == "analysis"
+    assert aniu_service._resolve_run_type(StrategySchedule(name="午间复盘", run_type="analysis")) == "analysis"
+    assert aniu_service._resolve_run_type(StrategySchedule(name="收盘分析", run_type="analysis")) == "analysis"
+    assert aniu_service._resolve_run_type(StrategySchedule(name="上午运行1号", run_type="trade")) == "trade"
+    assert aniu_service._resolve_run_type(StrategySchedule(name="下午运行2号", run_type="trade")) == "trade"
+
+
+def test_resolve_run_type_falls_back_to_name_when_schedule_type_missing() -> None:
+    assert aniu_service._resolve_run_type(StrategySchedule(name="上午运行1号", run_type="")) == "trade"
+    assert aniu_service._resolve_run_type(StrategySchedule(name="收盘分析", run_type="")) == "analysis"
+
+
+def test_build_persistent_session_user_content_includes_prefetched_context() -> None:
+    content = aniu_service._build_persistent_session_user_content(
+        settings=None,
+        trigger_source="manual",
+        schedule_id=None,
+        schedule_name=None,
+        run_type="analysis",
+        task_prompt="请分析今天市场",
+        prefetched_context="[Jin10 当天新闻参考]\n1. [09:30:00] 新闻A",
+    )
+
+    assert "本轮任务:" in content
+    assert "请分析今天市场" in content
+    assert "[Jin10 当天新闻参考]" in content
+    assert "新闻A" in content
+    assert "mx_get_self_selects" in content
+    assert "mx_search_news" in content
+    assert "mx_screen_stocks" in content
+    assert "mx_manage_self_select" in content
+
+
+def test_build_persistent_session_user_content_skips_self_select_guidance_for_trade() -> None:
+    content = aniu_service._build_persistent_session_user_content(
+        settings=None,
+        trigger_source="manual",
+        schedule_id=None,
+        schedule_name=None,
+        run_type="trade",
+        task_prompt="请根据持仓执行交易",
+        prefetched_context="[Jin10 当天新闻参考]\n1. [09:30:00] 新闻A",
+    )
+
+    assert "请根据持仓执行交易" in content
+    assert "[Jin10 当天新闻参考]" in content
+    assert "mx_get_self_selects" not in content
+    assert "mx_search_news" not in content
+    assert "mx_screen_stocks" not in content
+    assert "mx_manage_self_select" not in content
+
+
+def test_jin10_news_service_fetches_and_formats_context(monkeypatch) -> None:
+    service = Jin10NewsService()
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {
+                "items": [
+                    {
+                        "id": "1",
+                        "time": "09:31:00",
+                        "title": "央行公开市场操作",
+                        "content": "今日净投放资金，市场流动性边际改善。",
+                        "analysis": "有助于提升风险偏好，券商和金融权重或受提振。",
+                        "important": True,
+                        "createdAt": 1776821460000,
+                    }
+                ],
+                "total": 1,
+                "hasMore": False,
+            }
+
+    captured: dict[str, object] = {}
+
+    def fake_get(url: str, *, params: dict[str, str], timeout: float):
+        captured["url"] = url
+        captured["params"] = params
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr("app.services.jin10_news_service.httpx.get", fake_get)
+
+    context, meta = service.fetch_news_context(
+        base_url="http://127.0.0.1:3000",
+        target_day=date(2026, 4, 22),
+        current_time=datetime(2026, 4, 22, 14, 30),
+        limit=10,
+        timeout_seconds=3,
+    )
+
+    assert captured["url"] == "http://127.0.0.1:3000/api/news"
+    assert captured["params"] == {
+        "date": "2026-04-22",
+        "startTime": "00:00:00",
+        "endTime": "14:30:00",
+        "limit": "10",
+        "includeAnalysis": "1",
+        "importantOnly": "1",
+    }
+    assert captured["timeout"] == 3
+    assert context is not None
+    assert "Jin10 当天新闻参考" in context
+    assert "央行公开市场操作" in context
+    assert "Jin10解读" in context
+    assert meta is not None
+    assert meta["ok"] is True
+
+
+def test_jin10_news_service_fetches_all_pages(monkeypatch) -> None:
+    service = Jin10NewsService()
+
+    calls: list[dict[str, object]] = []
+
+    class FakeResponse:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self._payload = payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    def fake_get(url: str, *, params: dict[str, str], timeout: float):
+        calls.append({"url": url, "params": dict(params), "timeout": timeout})
+        before = params.get("before")
+        if before is None:
+            return FakeResponse(
+                {
+                    "items": [
+                        {
+                            "id": "1",
+                            "time": "09:31:00",
+                            "title": "新闻A",
+                            "content": "内容A",
+                            "analysis": "解读A",
+                            "important": True,
+                            "createdAt": 1776821460000,
+                        },
+                        {
+                            "id": "2",
+                            "time": "09:25:00",
+                            "title": "新闻B",
+                            "content": "内容B",
+                            "analysis": "解读B",
+                            "important": True,
+                            "createdAt": 1776821100000,
+                        },
+                    ],
+                    "total": 3,
+                    "hasMore": True,
+                }
+            )
+        return FakeResponse(
+            {
+                "items": [
+                    {
+                        "id": "3",
+                        "time": "09:10:00",
+                        "title": "新闻C",
+                        "content": "内容C",
+                        "analysis": "解读C",
+                        "important": True,
+                        "createdAt": 1776820200000,
+                    }
+                ],
+                "total": 3,
+                "hasMore": False,
+            }
+        )
+
+    monkeypatch.setattr("app.services.jin10_news_service.httpx.get", fake_get)
+
+    context, meta = service.fetch_news_context(
+        base_url="http://127.0.0.1:3000",
+        target_day=date(2026, 4, 22),
+        current_time=datetime(2026, 4, 22, 14, 30),
+        limit=2,
+        timeout_seconds=3,
+    )
+
+    assert len(calls) == 2
+    assert calls[0]["params"]["limit"] == "2"
+    assert "before" not in calls[0]["params"]
+    assert calls[1]["params"]["before"] == "1776821100000"
+    assert context is not None
+    assert "新闻A" in context
+    assert "新闻B" in context
+    assert "新闻C" in context
+    assert meta is not None
+    assert meta["ok"] is True
+    assert meta["item_count"] == 3
+    assert meta["total"] == 3
+    assert meta["has_more"] is False
+
+
+def test_infer_run_type_recovers_trade_runs_from_schedule_name() -> None:
+    run = SimpleNamespace(
+        schedule_name="上午运行1号",
+        trade_orders=[],
+        executed_actions=None,
+        skill_payloads=None,
+        decision_payload=None,
+        run_type="analysis",
+    )
+
+    assert aniu_service._infer_run_type(run) == "trade"
+
+
+def test_infer_run_type_recovers_trade_runs_from_actions() -> None:
+    run = SimpleNamespace(
+        schedule_name=None,
+        trade_orders=[],
+        executed_actions=[{"action": "BUY", "symbol": "300059"}],
+        skill_payloads=None,
+        decision_payload=None,
+        run_type="analysis",
+    )
+
+    assert aniu_service._infer_run_type(run) == "trade"
+
+
+def test_build_tools_excludes_trade_mutations_for_analysis_runs() -> None:
+    tools = mx_skill_service.build_tools(run_type="analysis")
+    names = {tool["function"]["name"] for tool in tools}
+
+    assert "mx_moni_trade" not in names
+    assert "mx_moni_cancel" not in names
+    assert "mx_query_market" in names
+    assert "mx_get_positions" in names
+
+
+def test_build_tools_includes_trade_mutations_for_trade_runs() -> None:
+    tools = mx_skill_service.build_tools(run_type="trade")
+    names = {tool["function"]["name"] for tool in tools}
+
+    assert "mx_moni_trade" in names
+    assert "mx_moni_cancel" in names
+
+
+def test_build_initial_request_payload_uses_run_type_tool_profile() -> None:
+    app_settings = SimpleNamespace(
+        llm_model="demo-model",
+        system_prompt="system",
+        task_prompt="task",
+        run_type="analysis",
+    )
+
+    payload = llm_service.build_initial_request_payload(app_settings)
+    names = {tool["function"]["name"] for tool in payload["tools"]}
+
+    assert "mx_moni_trade" not in names
+    assert "mx_query_market" in names
+
+
+def test_consume_llm_stream_uses_fresh_http_client_per_request(monkeypatch) -> None:
+    service = LLMService()
+    created_timeouts: list[int] = []
+    client_ids: list[int] = []
+
+    class FakeResponse:
+        is_error = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def iter_lines(self):
+            return iter(())
+
+        def read(self) -> bytes:
+            return b""
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def stream(self, method, url, headers=None, json=None):
+            del method, url, headers, json
+            client_ids.append(id(self))
+            return FakeResponse()
+
+    def fake_create_http_client(timeout_seconds: int):
+        created_timeouts.append(timeout_seconds)
+        return FakeClient()
+
+    monkeypatch.setattr(service, "_create_http_client", fake_create_http_client)
+    monkeypatch.setattr(
+        service,
+        "_parse_llm_stream_response",
+        lambda *, lines, emit, cancel_event=None: {
+            "choices": [{"message": {"content": "ok"}}]
+        },
+    )
+
+    payload = {"messages": [], "model": "demo"}
+    service._consume_llm_stream(
+        base_url="https://example.com/v1",
+        api_key="token",
+        payload=payload,
+        timeout_seconds=5,
+    )
+    service._consume_llm_stream(
+        base_url="https://example.com/v1",
+        api_key="token",
+        payload=payload,
+        timeout_seconds=7,
+    )
+
+    assert created_timeouts == [5, 7]
+    assert len(client_ids) == 2
+    assert client_ids[0] != client_ids[1]
+
+
+def test_consume_llm_stream_reads_json_error_body_from_stream(monkeypatch) -> None:
+    service = LLMService()
+
+    class FakeErrorResponse:
+        status_code = 400
+        is_error = True
+        encoding = "utf-8"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return (
+                b'{"error":{"message":"stream_options.include_usage is not supported"}}'
+            )
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def stream(self, method, url, headers=None, json=None):
+            del method, url, headers, json
+            return FakeErrorResponse()
+
+    monkeypatch.setattr(service, "_create_http_client", lambda timeout_seconds: FakeClient())
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"大模型请求参数错误 \(400\): stream_options.include_usage is not supported",
+    ) as exc_info:
+        service._consume_llm_stream(
+            base_url="https://example.com/v1",
+            api_key="token",
+            payload={"messages": [], "model": "demo"},
+            timeout_seconds=5,
+        )
+
+    assert "Attempted to access streaming response content" not in str(exc_info.value)
+
+
+def test_consume_llm_stream_reads_text_error_body_from_stream(monkeypatch) -> None:
+    service = LLMService()
+
+    class FakeErrorResponse:
+        status_code = 500
+        is_error = True
+        encoding = "utf-8"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b"upstream internal error"
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def stream(self, method, url, headers=None, json=None):
+            del method, url, headers, json
+            return FakeErrorResponse()
+
+    monkeypatch.setattr(service, "_create_http_client", lambda timeout_seconds: FakeClient())
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"大模型接口返回错误 \(500\): upstream internal error",
+    ):
+        service._consume_llm_stream(
+            base_url="https://example.com/v1",
+            api_key="token",
+            payload={"messages": [], "model": "demo"},
+            timeout_seconds=5,
+        )
+
+
+def test_parse_llm_stream_response_raises_for_error_chunk() -> None:
+    service = LLMService()
+
+    lines = iter(
+        [
+            'data: {"error":{"message":"quota exceeded"}}',
+            "",
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="大模型流式响应错误: quota exceeded"):
+        service._parse_llm_stream_response(lines=lines, emit=lambda *_a, **_kw: None)
+
+
+def test_call_llm_stream_retries_without_include_usage_on_400(monkeypatch) -> None:
+    service = LLMService()
+    seen_payloads: list[dict[str, object]] = []
+
+    def fake_consume_llm_stream(*, payload, **kwargs):
+        del kwargs
+        seen_payloads.append(payload)
+        if len(seen_payloads) == 1:
+            raise LLMUpstreamError(
+                "大模型请求参数错误 (400): unsupported stream_options",
+                status_code=400,
+            )
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    monkeypatch.setattr(service, "_consume_llm_stream", fake_consume_llm_stream)
+
+    result = service._call_llm_stream(
+        base_url="https://example.com/v1",
+        api_key="token",
+        payload={"messages": [], "model": "demo"},
+        timeout_seconds=5,
+    )
+
+    assert result["choices"][0]["message"]["content"] == "ok"
+    assert len(seen_payloads) == 2
+    assert seen_payloads[0]["stream"] is True
+    assert seen_payloads[0]["stream_options"] == {"include_usage": True}
+    assert seen_payloads[1]["stream"] is True
+    assert "stream_options" not in seen_payloads[1]
+
+
+def test_agent_loop_retries_when_final_answer_is_empty_after_tools() -> None:
+    service = LLMService()
+    seen_payloads: list[dict[str, object]] = []
+
+    responses = [
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "tool-1",
+                                "function": {
+                                    "name": "demo_tool",
+                                    "arguments": "{}",
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        },
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                    },
+                    "finish_reason": "stop",
+                }
+            ]
+        },
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": "最终结论：继续跟踪新能源主线。",
+                    },
+                    "finish_reason": "stop",
+                }
+            ]
+        },
+    ]
+
+    def fake_call_llm_stream(*, payload, **kwargs):
+        del kwargs
+        seen_payloads.append(payload)
+        return responses[len(seen_payloads) - 1]
+
+    service._call_llm_stream = fake_call_llm_stream  # type: ignore[method-assign]
+
+    result = service._agent_loop(
+        model="demo-model",
+        base_url="https://example.com/v1",
+        api_key="token",
+        initial_messages=[{"role": "user", "content": "请分析市场"}],
+        run_type="analysis",
+        timeout_seconds=1800,
+        tool_executor=lambda tool_name, arguments: {
+            "ok": True,
+            "tool_name": tool_name,
+            "summary": "工具执行成功",
+            "result": {"value": 1, "arguments": arguments},
+        },
+        emit=lambda *_a, **_kw: None,
+    )
+
+    assert result["final_answer"] == "最终结论：继续跟踪新能源主线。"
+    assert len(result["tool_history"]) == 1
+    assert len(seen_payloads) == 3
+    last_messages = seen_payloads[-1]["messages"]
+    assert any(
+        message.get("role") == "user"
+        and "请基于上面的工具结果直接输出最终结论" in str(message.get("content") or "")
+        for message in last_messages
+    )
+
+
+def test_execute_tool_adds_guidance_for_api_key_error() -> None:
+    def boom(*, client, app_settings, arguments):
+        del client, app_settings, arguments
+        raise RuntimeError("401 Unauthorized / API密钥不存在")
+
+    original_handler = mx_skill_service._handlers["mx_get_balance"]
+    mx_skill_service._handlers["mx_get_balance"] = boom
+    try:
+        result = mx_skill_service.execute_tool(
+            client=None,
+            app_settings=None,
+            tool_name="mx_get_balance",
+            arguments={},
+        )
+    finally:
+        mx_skill_service._handlers["mx_get_balance"] = original_handler
+
+    assert result["ok"] is False
+    assert "请检查 MX_APIKEY" in result["error"]
+
+
+def test_screen_tool_returns_raw_result_without_normalized() -> None:
+    class StubClient:
+        def screen_stocks(self, query):
+            del query
+            return {
+                "data": {
+                    "data": {
+                        "allResults": {
+                            "result": {
+                                "total": 1,
+                                "columns": [
+                                    {"key": "SECURITY_CODE", "title": "代码"},
+                                    {"key": "SECURITY_SHORT_NAME", "title": "名称"},
+                                    {"key": "NEWEST_PRICE", "title": "最新价"},
+                                ],
+                                "dataList": [
+                                    {
+                                        "SECURITY_CODE": "300059",
+                                        "SECURITY_SHORT_NAME": "东方财富",
+                                        "NEWEST_PRICE": "20.01",
+                                    }
+                                ],
+                            }
+                        }
+                    }
+                }
+            }
+
+    result = mx_skill_service._handle_screen_stocks(
+        client=StubClient(),
+        app_settings=SimpleNamespace(task_prompt=""),
+        arguments={"query": "低估值股票"},
+    )
+
+    assert result["ok"] is True
+    assert "normalized" not in result
+    rows = result["result"]["data"]["data"]["allResults"]["result"]["dataList"]
+    assert rows[0]["SECURITY_CODE"] == "300059"
