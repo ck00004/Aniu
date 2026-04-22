@@ -73,6 +73,7 @@ def test_resolve_run_type_maps_schedule_names() -> None:
     assert aniu_service._resolve_run_type(StrategySchedule(name="盘前分析", run_type="analysis")) == "analysis"
     assert aniu_service._resolve_run_type(StrategySchedule(name="午间复盘", run_type="analysis")) == "analysis"
     assert aniu_service._resolve_run_type(StrategySchedule(name="收盘分析", run_type="analysis")) == "analysis"
+    assert aniu_service._resolve_run_type(StrategySchedule(name="夜间分析", run_type="analysis")) == "analysis"
     assert aniu_service._resolve_run_type(StrategySchedule(name="上午运行1号", run_type="trade")) == "trade"
     assert aniu_service._resolve_run_type(StrategySchedule(name="下午运行2号", run_type="trade")) == "trade"
 
@@ -80,6 +81,7 @@ def test_resolve_run_type_maps_schedule_names() -> None:
 def test_resolve_run_type_falls_back_to_name_when_schedule_type_missing() -> None:
     assert aniu_service._resolve_run_type(StrategySchedule(name="上午运行1号", run_type="")) == "trade"
     assert aniu_service._resolve_run_type(StrategySchedule(name="收盘分析", run_type="")) == "analysis"
+    assert aniu_service._resolve_run_type(StrategySchedule(name="夜间分析", run_type="")) == "analysis"
 
 
 def test_build_persistent_session_user_content_includes_prefetched_context() -> None:

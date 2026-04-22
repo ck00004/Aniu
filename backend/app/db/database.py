@@ -219,7 +219,7 @@ def _backfill_schedule_run_types(engine) -> None:
         connection.execute(
             text(
                 "UPDATE strategy_schedules SET run_type = 'analysis' "
-                "WHERE run_type IS NULL OR trim(run_type) = '' OR name IN ('盘前分析', '午间复盘', '收盘分析', '默认任务')"
+                "WHERE run_type IS NULL OR trim(run_type) = '' OR name IN ('盘前分析', '午间复盘', '收盘分析', '夜间分析', '默认任务')"
             )
         )
 
@@ -257,7 +257,7 @@ def _backfill_strategy_run_types(engine) -> None:
 
             if schedule_name.startswith("上午运行") or schedule_name.startswith("下午运行"):
                 inferred = "trade"
-            elif schedule_name in {"盘前分析", "午间复盘", "收盘分析"}:
+            elif schedule_name in {"盘前分析", "午间复盘", "收盘分析", "夜间分析"}:
                 inferred = "analysis"
             elif trade_order_counts.get(int(row["id"]), 0) > 0:
                 inferred = "trade"

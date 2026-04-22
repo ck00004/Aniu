@@ -12,6 +12,7 @@ from app.core.config import get_settings
 from app.db import database as database_module
 from app.db.database import init_db, session_scope
 from app.db.models import StrategyRun, StrategySchedule, TradeOrder
+from app.schemas.aniu import ScheduleUpdate
 from app.services.aniu_service import aniu_service
 
 
@@ -159,6 +160,35 @@ def test_compute_next_run_at_skips_non_trading_holiday() -> None:
 
     assert result is not None
     assert result.date().isoformat() == "2026-10-09"
+
+
+def test_replace_schedules_normalizes_analysis_tasks_to_weekday_custom_time(
+    monkeypatch, tmp_path
+) -> None:
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+
+    try:
+        with session_scope() as db:
+            schedules = aniu_service.replace_schedules(
+                db,
+                [
+                    ScheduleUpdate(
+                        name="盘前分析",
+                        run_type="analysis",
+                        cron_expression="7 8 1-31 * *",
+                        task_prompt="test",
+                        timeout_seconds=1800,
+                        enabled=True,
+                    )
+                ],
+            )
+
+        assert len(schedules) == 1
+        assert schedules[0].cron_expression == "7 8 * * 1-5"
+        assert schedules[0].next_run_at is not None
+    finally:
+        _reset_db_state()
 
 
 def test_process_due_schedule_recomputes_non_trading_due_task_without_running(

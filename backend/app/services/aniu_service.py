@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 RAW_TOOL_PREVIEW_MAX_CHARS = 6000
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
-ANALYSIS_TASK_NAMES = {"盘前分析", "午间复盘", "收盘分析"}
+ANALYSIS_TASK_NAMES = {"盘前分析", "午间复盘", "收盘分析", "夜间分析"}
 SCHEDULE_RETRY_DELAY = timedelta(minutes=5)
 SCHEDULE_MAX_RETRIES = 3
 ACCOUNT_PREFETCH_TOOL_NAMES = (
@@ -126,6 +126,26 @@ def _scaled_decimal(value: Any, decimal_places: Any) -> float | None:
     if scale <= 0:
         return numeric
     return numeric / (10**scale)
+
+
+def _extract_fixed_analysis_time(cron_expression: str | None) -> tuple[int, int] | None:
+    if not cron_expression:
+        return None
+
+    parts = cron_expression.strip().split()
+    if len(parts) != 5:
+        return None
+
+    try:
+        minute = int(parts[0])
+        hour = int(parts[1])
+    except (TypeError, ValueError):
+        return None
+
+    if minute < 0 or minute > 59 or hour < 0 or hour > 23:
+        return None
+
+    return hour, minute
 
 
 def _market_suffix(value: Any) -> str:
@@ -408,6 +428,12 @@ class AniuService:
 
             for field, value in data.items():
                 setattr(instance, field, value)
+
+            if instance.run_type == "analysis" and instance.name in ANALYSIS_TASK_NAMES:
+                parsed_time = _extract_fixed_analysis_time(instance.cron_expression)
+                if parsed_time is not None:
+                    hour, minute = parsed_time
+                    instance.cron_expression = f"{minute} {hour} * * 1-5"
 
             instance.next_run_at = self._compute_next_run_at(instance.cron_expression)
             db.add(instance)

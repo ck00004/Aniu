@@ -12,3 +12,13 @@ test('schedule overview is rendered as a standalone panel before schedule settin
   assert.notEqual(settingsIndex, -1)
   assert.ok(overviewIndex < settingsIndex)
 })
+
+test('analysis schedule cards provide custom time inputs', () => {
+  const source = readFileSync(new URL('../src/views/ScheduleView.vue', import.meta.url), 'utf-8')
+
+  const timeInputCount = source.match(/type="time"/g)?.length ?? 0
+
+  assert.equal(timeInputCount, 4)
+  assert.ok(source.includes('支持自定义 HH:MM'))
+  assert.ok(source.includes('夜间分析'))
+})

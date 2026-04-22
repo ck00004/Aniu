@@ -4,7 +4,7 @@ import type { ScheduleConfig } from '@/types'
 
 type ScheduleLike = Pick<ScheduleConfig, 'id' | 'name' | 'run_type' | 'cron_expression' | 'task_prompt' | 'timeout_seconds' | 'enabled'>
 
-type ScheduleKey = 'preMarket' | 'midday' | 'postMarket'
+type ScheduleKey = 'preMarket' | 'midday' | 'postMarket' | 'night'
 type SessionKey = 'morning' | 'afternoon'
 
 type FixedTaskTimeOption = {
@@ -38,6 +38,14 @@ export const FIXED_TASK_TIME_OPTIONS = {
       { hour: 16, minute: 0, label: '16:00' },
     ] as FixedTaskTimeOption[],
   },
+  night: {
+    options: [
+      { hour: 20, minute: 0, label: '20:00' },
+      { hour: 20, minute: 30, label: '20:30' },
+      { hour: 21, minute: 0, label: '21:00' },
+      { hour: 21, minute: 30, label: '21:30' },
+    ] as FixedTaskTimeOption[],
+  },
 } as const
 
 export const RUN_COUNT_OPTIONS = [1, 2, 3, 4] as const
@@ -46,6 +54,7 @@ export interface ScheduleFormState {
   preMarket: { enabled: boolean; hour: number; minute: number; prompt: string }
   postMarket: { enabled: boolean; hour: number; minute: number; prompt: string }
   midday: { enabled: boolean; hour: number; minute: number; prompt: string }
+  night: { enabled: boolean; hour: number; minute: number; prompt: string }
   morning: { enabled: boolean; runCount: number; prompt: string }
   afternoon: { enabled: boolean; runCount: number; prompt: string }
 }
@@ -54,6 +63,7 @@ const FIXED_TASK_NAMES = {
   preMarket: '盘前分析',
   midday: '午间复盘',
   postMarket: '收盘分析',
+  night: '夜间分析',
 } as const
 
 const SESSION_TASK_NAMES = {
@@ -63,41 +73,11 @@ const SESSION_TASK_NAMES = {
 
 const DEFAULT_TIMEOUT = 1800
 
-function normalizeSectionTime(section: ScheduleKey, hour: number, minute: number) {
-  const options = FIXED_TASK_TIME_OPTIONS[section]
-
-  if (section === 'preMarket' && hour === 7 && minute === 15) {
-    return {
-      hour: 8,
-      minute: 0,
-    }
-  }
-
-  const exactMatch = options.options.find((option) => option.hour === hour && option.minute === minute)
-  if (exactMatch) {
-    return {
-      hour: exactMatch.hour,
-      minute: exactMatch.minute,
-    }
-  }
-
-  const currentMinutes = hour * 60 + minute
-  const nearest = options.options.reduce((best, option) => {
-    const optionMinutes = option.hour * 60 + option.minute
-    const bestMinutes = best.hour * 60 + best.minute
-    return Math.abs(optionMinutes - currentMinutes) < Math.abs(bestMinutes - currentMinutes) ? option : best
-  }, options.options[0])
-
-  return {
-    hour: nearest.hour,
-    minute: nearest.minute,
-  }
-}
-
 const defaultState = (): ScheduleFormState => ({
   preMarket: { enabled: false, hour: 8, minute: 0, prompt: '你正在执行盘前分析任务，请分析今日市场情况和持仓情况，做好今日市场走势预测，为你决策交易做好准备。' },
   postMarket: { enabled: false, hour: 15, minute: 30, prompt: '你正在执行收盘分析任务，请对今日市场和交易操作进行全面复盘，总结今日市场和明日可能的走势。' },
   midday: { enabled: false, hour: 12, minute: 0, prompt: '你正在执行午间复盘任务，请对上午市场和交易操作进行复盘，做好下午市场走势预测，为你决策交易做好准备。' },
+  night: { enabled: false, hour: 21, minute: 0, prompt: '你正在执行夜间分析任务，请结合收盘结果、盘后资讯、政策消息与题材演化，梳理次日重点方向、风险点和跟踪计划。' },
   morning: { enabled: true, runCount: 2, prompt: '你正在执行盘中交易操作，你的唯一目标是追求收益最大化。' },
   afternoon: { enabled: true, runCount: 2, prompt: '你正在执行盘中交易操作，你的唯一目标是追求收益最大化。' },
 })
@@ -112,6 +92,25 @@ function parseCron(cronExpression: string) {
 
 function buildCron(hour: number, minute: number) {
   return `${minute} ${hour} * * 1-5`
+}
+
+function isValidHourMinute(hour: number, minute: number) {
+  return Number.isInteger(hour) && Number.isInteger(minute) && hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59
+}
+
+function formatTimeValue(hour: number, minute: number) {
+  return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`
+}
+
+function parseTimeValue(value: string) {
+  const match = /^(\d{2}):(\d{2})$/.exec(value.trim())
+  if (!match) {
+    return null
+  }
+
+  const hour = Number(match[1])
+  const minute = Number(match[2])
+  return isValidHourMinute(hour, minute) ? { hour, minute } : null
 }
 
 function getSessionTimes(session: SessionKey, runCount: number) {
@@ -165,10 +164,11 @@ export function useScheduleForm() {
       }
 
       const { hour, minute } = parseCron(matched.cron_expression)
-      const normalizedTime = normalizeSectionTime(key, hour, minute)
       scheduleSettings[key].enabled = matched.enabled
-      scheduleSettings[key].hour = normalizedTime.hour
-      scheduleSettings[key].minute = normalizedTime.minute
+      if (isValidHourMinute(hour, minute)) {
+        scheduleSettings[key].hour = hour
+        scheduleSettings[key].minute = minute
+      }
       scheduleSettings[key].prompt = matched.task_prompt || scheduleSettings[key].prompt
     })
 
@@ -224,6 +224,19 @@ export function useScheduleForm() {
     scheduleSettings[section].minute = option.minute
   }
 
+  function getSectionTimeValue(section: ScheduleKey) {
+    return formatTimeValue(scheduleSettings[section].hour, scheduleSettings[section].minute)
+  }
+
+  function setSectionTimeValue(section: ScheduleKey, value: string) {
+    const parsed = parseTimeValue(value)
+    if (!parsed) {
+      return
+    }
+    scheduleSettings[section].hour = parsed.hour
+    scheduleSettings[section].minute = parsed.minute
+  }
+
   function autoResizeTextarea(event: Event) {
     const textarea = event.target as HTMLTextAreaElement
     textarea.style.height = 'auto'
@@ -245,6 +258,8 @@ export function useScheduleForm() {
     syncFromSchedules,
     buildPayload,
     setFixedTaskTime,
+    getSectionTimeValue,
+    setSectionTimeValue,
     autoResizeTextarea,
     getMorningRunTimes,
     getAfternoonRunTimes,

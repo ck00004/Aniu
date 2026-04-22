@@ -27,9 +27,9 @@ test('buildPayload marks fixed tasks as analysis', () => {
   const { buildPayload } = useScheduleForm()
 
   const payload = buildPayload([])
-  const fixedRuns = payload.filter((item) => ['盘前分析', '午间复盘', '收盘分析'].includes(item.name))
+  const fixedRuns = payload.filter((item) => ['盘前分析', '午间复盘', '收盘分析', '夜间分析'].includes(item.name))
 
-  assert.equal(fixedRuns.length, 3)
+  assert.equal(fixedRuns.length, 4)
   assert.equal(fixedRuns.every((item) => item.run_type === 'analysis'), true)
 })
 
@@ -78,7 +78,7 @@ test('buildPayload preserves disabled session schedules', () => {
   assert.equal(morningRuns.every((item) => item.enabled === false), true)
 })
 
-test('syncFromSchedules normalizes pre-market times to supported button options', () => {
+test('syncFromSchedules preserves custom pre-market times', () => {
   const { scheduleSettings, syncFromSchedules } = useScheduleForm()
 
   syncFromSchedules([
@@ -92,8 +92,8 @@ test('syncFromSchedules normalizes pre-market times to supported button options'
     },
   ])
 
-  assert.equal(scheduleSettings.preMarket.hour, 8)
-  assert.equal(scheduleSettings.preMarket.minute, 0)
+  assert.equal(scheduleSettings.preMarket.hour, 7)
+  assert.equal(scheduleSettings.preMarket.minute, 30)
 })
 
 test('pre-market default display time is 08:00', () => {
@@ -103,7 +103,7 @@ test('pre-market default display time is 08:00', () => {
   assert.equal(scheduleSettings.preMarket.minute, 0)
 })
 
-test('syncFromSchedules migrates legacy pre-market default 07:15 to 08:00', () => {
+test('syncFromSchedules preserves legacy pre-market time instead of forcing a fixed option', () => {
   const { scheduleSettings, syncFromSchedules } = useScheduleForm()
 
   syncFromSchedules([
@@ -117,11 +117,11 @@ test('syncFromSchedules migrates legacy pre-market default 07:15 to 08:00', () =
     },
   ])
 
-  assert.equal(scheduleSettings.preMarket.hour, 8)
-  assert.equal(scheduleSettings.preMarket.minute, 0)
+  assert.equal(scheduleSettings.preMarket.hour, 7)
+  assert.equal(scheduleSettings.preMarket.minute, 15)
 })
 
-test('syncFromSchedules normalizes midday times to 12:00/15/30/45 options', () => {
+test('syncFromSchedules preserves custom midday times', () => {
   const { scheduleSettings, syncFromSchedules } = useScheduleForm()
 
   syncFromSchedules([
@@ -135,11 +135,11 @@ test('syncFromSchedules normalizes midday times to 12:00/15/30/45 options', () =
     },
   ])
 
-  assert.equal(scheduleSettings.midday.hour, 12)
-  assert.equal(scheduleSettings.midday.minute, 0)
+  assert.equal(scheduleSettings.midday.hour, 11)
+  assert.equal(scheduleSettings.midday.minute, 45)
 })
 
-test('syncFromSchedules normalizes post-market times to supported button options', () => {
+test('syncFromSchedules preserves custom post-market times', () => {
   const { scheduleSettings, syncFromSchedules } = useScheduleForm()
 
   syncFromSchedules([
@@ -154,5 +154,41 @@ test('syncFromSchedules normalizes post-market times to supported button options
   ])
 
   assert.equal(scheduleSettings.postMarket.hour, 16)
-  assert.equal(scheduleSettings.postMarket.minute, 0)
+  assert.equal(scheduleSettings.postMarket.minute, 15)
+})
+
+test('syncFromSchedules preserves custom night analysis times', () => {
+  const { scheduleSettings, syncFromSchedules } = useScheduleForm()
+
+  syncFromSchedules([
+    {
+      id: 4,
+      name: '夜间分析',
+      cron_expression: '20 21 * * 1-5',
+      task_prompt: 'night',
+      timeout_seconds: 1800,
+      enabled: true,
+    },
+  ])
+
+  assert.equal(scheduleSettings.night.hour, 21)
+  assert.equal(scheduleSettings.night.minute, 20)
+  assert.equal(scheduleSettings.night.prompt, 'night')
+})
+
+test('setSectionTimeValue updates analysis task time from HH:MM input', () => {
+  const { scheduleSettings, getSectionTimeValue, setSectionTimeValue } = useScheduleForm()
+
+  setSectionTimeValue('postMarket', '14:07')
+
+  assert.equal(scheduleSettings.postMarket.hour, 14)
+  assert.equal(scheduleSettings.postMarket.minute, 7)
+  assert.equal(getSectionTimeValue('postMarket'), '14:07')
+})
+
+test('night analysis default display time is 21:00', () => {
+  const { scheduleSettings } = useScheduleForm()
+
+  assert.equal(scheduleSettings.night.hour, 21)
+  assert.equal(scheduleSettings.night.minute, 0)
 })

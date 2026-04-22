@@ -66,6 +66,16 @@
                     <div class="task-card-body" :class="{ 'is-disabled': !scheduleSettings.preMarket.enabled }">
                       <div class="task-field">
                         <span class="field-label">执行时间</span>
+                        <div class="task-time-row">
+                          <input
+                            type="time"
+                            class="task-time-input"
+                            :value="getSectionTimeValue('preMarket')"
+                            :disabled="!scheduleSettings.preMarket.enabled"
+                            @input="handleTimeInput('preMarket', $event)"
+                          />
+                          <span class="field-tip">支持自定义 HH:MM，下面的按钮可快速填入常用时间。</span>
+                        </div>
                         <div class="choice-chip-group" :class="{ 'is-disabled': !scheduleSettings.preMarket.enabled }">
                           <button
                             v-for="option in fixedTaskTimeOptions.preMarket.options"
@@ -107,6 +117,16 @@
                     <div class="task-card-body" :class="{ 'is-disabled': !scheduleSettings.midday.enabled }">
                       <div class="task-field">
                         <span class="field-label">执行时间</span>
+                        <div class="task-time-row">
+                          <input
+                            type="time"
+                            class="task-time-input"
+                            :value="getSectionTimeValue('midday')"
+                            :disabled="!scheduleSettings.midday.enabled"
+                            @input="handleTimeInput('midday', $event)"
+                          />
+                          <span class="field-tip">支持自定义 HH:MM，下面的按钮可快速填入常用时间。</span>
+                        </div>
                         <div class="choice-chip-group" :class="{ 'is-disabled': !scheduleSettings.midday.enabled }">
                           <button
                             v-for="option in fixedTaskTimeOptions.midday.options"
@@ -148,6 +168,16 @@
                     <div class="task-card-body" :class="{ 'is-disabled': !scheduleSettings.postMarket.enabled }">
                       <div class="task-field">
                         <span class="field-label">执行时间</span>
+                        <div class="task-time-row">
+                          <input
+                            type="time"
+                            class="task-time-input"
+                            :value="getSectionTimeValue('postMarket')"
+                            :disabled="!scheduleSettings.postMarket.enabled"
+                            @input="handleTimeInput('postMarket', $event)"
+                          />
+                          <span class="field-tip">支持自定义 HH:MM，下面的按钮可快速填入常用时间。</span>
+                        </div>
                         <div class="choice-chip-group" :class="{ 'is-disabled': !scheduleSettings.postMarket.enabled }">
                           <button
                             v-for="option in fixedTaskTimeOptions.postMarket.options"
@@ -169,6 +199,57 @@
                           rows="3"
                           @input="autoResizeTextarea($event)"
                           :disabled="!scheduleSettings.postMarket.enabled"
+                        ></textarea>
+                      </div>
+                    </div>
+                  </article>
+
+                  <!-- 夜间分析 -->
+                  <article class="task-card" :class="{ 'is-active': scheduleSettings.night.enabled }">
+                    <div class="task-card-header">
+                      <div class="task-card-meta">
+                        <h4 class="task-card-name">夜间分析</h4>
+                        <p class="task-card-desc">盘后资讯消化与次日关注方向梳理</p>
+                      </div>
+                      <label class="switch">
+                        <input type="checkbox" v-model="scheduleSettings.night.enabled" />
+                        <span class="switch-track"></span>
+                      </label>
+                    </div>
+                    <div class="task-card-body" :class="{ 'is-disabled': !scheduleSettings.night.enabled }">
+                      <div class="task-field">
+                        <span class="field-label">执行时间</span>
+                        <div class="task-time-row">
+                          <input
+                            type="time"
+                            class="task-time-input"
+                            :value="getSectionTimeValue('night')"
+                            :disabled="!scheduleSettings.night.enabled"
+                            @input="handleTimeInput('night', $event)"
+                          />
+                          <span class="field-tip">支持自定义 HH:MM，下面的按钮可快速填入常用时间。</span>
+                        </div>
+                        <div class="choice-chip-group" :class="{ 'is-disabled': !scheduleSettings.night.enabled }">
+                          <button
+                            v-for="option in fixedTaskTimeOptions.night.options"
+                            :key="`night-${option.label}`"
+                            type="button"
+                            class="choice-chip"
+                            :class="{ 'is-active': scheduleSettings.night.hour === option.hour && scheduleSettings.night.minute === option.minute }"
+                            :disabled="!scheduleSettings.night.enabled"
+                            @click="setFixedTaskTime('night', option)"
+                          >
+                            {{ option.label }}
+                          </button>
+                        </div>
+                      </div>
+                      <div class="task-field">
+                        <span class="field-label">提示词 <small>{{ scheduleSettings.night.prompt.length }}字</small></span>
+                        <textarea 
+                          v-model="scheduleSettings.night.prompt" 
+                          rows="3"
+                          @input="autoResizeTextarea($event)"
+                          :disabled="!scheduleSettings.night.enabled"
                         ></textarea>
                       </div>
                     </div>
@@ -293,10 +374,20 @@ const {
   syncFromSchedules,
   buildPayload,
   setFixedTaskTime,
+  getSectionTimeValue,
+  setSectionTimeValue,
   autoResizeTextarea,
   getMorningRunTimes,
   getAfternoonRunTimes,
 } = useScheduleForm()
+
+function handleTimeInput(section: 'preMarket' | 'midday' | 'postMarket' | 'night', event: Event) {
+  const target = event.target as HTMLInputElement | null
+  if (!target) {
+    return
+  }
+  setSectionTimeValue(section, target.value)
+}
 
 async function saveScheduleSettings() {
   await store.saveSchedule(buildPayload(schedules.value))
