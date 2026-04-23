@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 import logging
+import time
 from typing import Any
 
 import httpx
@@ -108,16 +109,37 @@ class Jin10NewsService:
         seen_keys: set[str] = set()
         next_before: str | None = None
         request_count = 0
-        last_total: int | None = None
+        max_retries = 3
+        retry_delay = 1.0
 
         while True:
             page_params = dict(params)
             if next_before:
                 page_params["before"] = next_before
 
-            response = httpx.get(url, params=page_params, timeout=timeout_seconds)
-            response.raise_for_status()
-            payload = response.json()
+            payload = None
+            for attempt in range(max_retries):
+                try:
+                    response = httpx.get(
+                        url, params=page_params, timeout=timeout_seconds
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+                    break
+                except (httpx.RequestError, httpx.HTTPStatusError) as exc:
+                    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 500:
+                        raise
+                    if attempt < max_retries - 1:
+                        logger.warning(
+                            "Jin10 请求失败，准备重试 (%s/%s): %s",
+                            attempt + 1,
+                            max_retries,
+                            exc,
+                        )
+                        time.sleep(retry_delay)
+                    else:
+                        raise
+
             request_count += 1
             if not isinstance(payload, dict):
                 raise RuntimeError("Jin10 响应格式无效")

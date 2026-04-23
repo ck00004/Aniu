@@ -4,6 +4,7 @@ import inspect
 import json
 import logging
 import queue
+import re
 import secrets
 import time
 import traceback
@@ -75,6 +76,17 @@ ANALYSIS_SELF_SELECT_GUIDANCE = """[分析执行要求]
 6. 对现有自选股中逻辑证伪、催化结束、关注价值下降、流动性明显不足或风险收益比恶化的股票，调用 mx_manage_self_select 从自选股移除。
 7. 如果没有找到合适的新标的，可以不新增；如果现有自选股仍应继续观察，可以不移除，但必须明确说明检查结论。
 8. 最终输出必须单独说明：新增自选股、移除自选股、继续保留观察的自选股，以及每只股票的跟踪理由与后续观察信号。"""
+SELF_SELECT_CONSISTENCY_FOLLOWUP_PROMPT = """你刚才的最终结论里提到了自选股新增或移除，但当前工具执行记录没有对应的 mx_manage_self_select 操作。
+
+请立即进行一致性修正，且只能二选一：
+1. 如果你确认本轮确实应该新增或移除自选股，请立刻调用 mx_manage_self_select 完成实际操作，然后再给出最终结论。
+2. 如果你不打算实际执行自选股变更，请重写最终结论，明确说明本轮没有实际新增或移除任何自选股，不能再声称“已新增”“已移除”。
+
+注意：最终自然语言结论必须与真实工具执行结果完全一致。"""
+SELF_SELECT_CONSISTENCY_WARNING = (
+    "\n\n[系统一致性提示] 本轮最终结论提到了自选股变更，但系统未实际调用 "
+    "mx_manage_self_select，因此未发生系统内自选股新增或移除。请以“本轮自选股变更”和工具执行记录为准。"
+)
 
 
 @dataclass
@@ -1911,6 +1923,21 @@ class AniuService:
                         emit=_emit,
                     )
                 )
+                (
+                    decision,
+                    llm_request,
+                    llm_response,
+                    runtime_trace,
+                    executed_actions,
+                ) = self._enforce_self_select_consistency(
+                    settings=settings,
+                    client=client,
+                    decision=decision,
+                    llm_request=llm_request,
+                    llm_response=llm_response,
+                    runtime_trace=runtime_trace,
+                    emit=_emit,
+                )
             finally:
                 client.close()
 
@@ -1920,7 +1947,6 @@ class AniuService:
                 "runtime_trace": runtime_trace,
                 "prefetched_context": prefetched_context_meta,
             }
-            executed_actions = self._extract_executed_actions(tool_calls)
             persisted_trade_orders = [
                 {
                     "symbol": action.get("symbol"),
@@ -2391,6 +2417,335 @@ class AniuService:
                 entry["symbol"] = str(executed_action.get("query") or "")
             executed_actions.append(entry)
         return executed_actions
+
+    def _clean_self_select_target(self, raw_target: Any) -> str:
+        text = str(raw_target or "").strip()
+        if not text:
+            return ""
+        text = re.sub(r"^(把|将)", "", text)
+        text = re.sub(r"(加入|添加到?|放入|纳入|移除|移出|删除|去掉).+$", "", text)
+        text = re.sub(r"^(从)", "", text)
+        text = re.sub(r"(我的)?自选(股|列表)?(中)?", "", text)
+        text = re.sub(r"[，。,；;:：]+$", "", text)
+        return text.strip()
+
+    def _parse_self_select_query_change(self, query: Any) -> dict[str, str] | None:
+        raw_query = str(query or "").strip()
+        if not raw_query:
+            return None
+
+        normalized = re.sub(r"\s+", "", raw_query)
+        removal_keywords = ("移除", "移出", "删除", "去掉")
+        addition_keywords = ("加入", "添加", "放入", "纳入")
+        action: str | None
+        if any(keyword in normalized for keyword in removal_keywords):
+            action = "remove"
+        elif any(keyword in normalized for keyword in addition_keywords):
+            action = "add"
+        else:
+            action = None
+
+        if action is None:
+            return None
+
+        patterns: list[tuple[str, re.Pattern[str]]] = [
+            ("add", re.compile(r"(?:把|将)(.+?)(?:加入|添加到?|放入|纳入)(?:我的)?自选(?:股|列表)?")),
+            (
+                "remove",
+                re.compile(r"(?:把|将)(.+?)(?:从)?(?:我的)?自选(?:股|列表)?(?:中)?(?:删除|移除|移出|去掉)"),
+            ),
+            (
+                "remove",
+                re.compile(r"(?:把|将)(.+?)(?:删除|移除|移出|去掉)(?:出)?(?:我的)?自选(?:股|列表)?"),
+            ),
+            ("add", re.compile(r"(.+?)(?:加入|添加到?|放入|纳入)(?:我的)?自选(?:股|列表)?")),
+            (
+                "remove",
+                re.compile(r"(.+?)(?:从)?(?:我的)?自选(?:股|列表)?(?:中)?(?:删除|移除|移出|去掉)"),
+            ),
+        ]
+
+        capture = ""
+        for pattern_action, pattern in patterns:
+            if pattern_action != action:
+                continue
+            matched = pattern.search(raw_query)
+            if matched:
+                capture = matched.group(1)
+                break
+
+        target = self._clean_self_select_target(capture) or raw_query
+        return {
+            "action": action,
+            "target": target,
+            "raw_query": raw_query,
+        }
+
+    def _extract_stock_mentions(self, text: Any) -> set[str]:
+        content = str(text or "")
+        mentions: set[str] = set()
+        stopwords = {
+            "新增",
+            "移除",
+            "新增自选股",
+            "移除自选股",
+            "本轮新增",
+            "本轮移除",
+            "自选新增",
+            "自选移除",
+            "自选股",
+            "本轮",
+        }
+        for matched in re.findall(r"([A-Za-z\u4e00-\u9fa5\-*]{2,20})\s*[（(]\s*(\d{6})\s*[)）]", content):
+            name, code = matched
+            clean_name = self._clean_self_select_target(name)
+            if clean_name and clean_name not in stopwords:
+                mentions.add(clean_name)
+            mentions.add(code)
+
+        for code in re.findall(r"\b\d{6}\b", content):
+            mentions.add(code)
+
+        for name in re.findall(r"[\u4e00-\u9fa5A-Za-z]{2,20}", content):
+            clean_name = self._clean_self_select_target(name)
+            if clean_name and clean_name not in stopwords:
+                mentions.add(clean_name)
+        return mentions
+
+    def _extract_claimed_self_select_changes(self, final_answer: Any) -> list[dict[str, str]]:
+        text = str(final_answer or "").strip()
+        if not text:
+            return []
+
+        changes: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+
+        def _push(action: str, target: str, raw: str) -> None:
+            normalized_target = self._clean_self_select_target(target)
+            if not normalized_target:
+                return
+            key = (action, normalized_target)
+            if key in seen:
+                return
+            seen.add(key)
+            changes.append({"action": action, "target": normalized_target, "raw_query": raw})
+
+        current_action: str | None = None
+        for raw_line in text.splitlines():
+            line = str(raw_line or "").strip()
+            if not line:
+                continue
+
+            compact = re.sub(r"\s+", "", line)
+            if any(token in compact for token in ("新增自选股", "本轮新增", "自选新增")):
+                current_action = "add"
+                mentions = self._extract_stock_mentions(line)
+                for target in mentions:
+                    _push("add", target, line)
+                continue
+            if any(token in compact for token in ("移除自选股", "本轮移除", "自选移除")):
+                current_action = "remove"
+                mentions = self._extract_stock_mentions(line)
+                for target in mentions:
+                    _push("remove", target, line)
+                continue
+
+            if current_action and re.match(r"^[-*\d一二三四五六七八九十].*", line):
+                mentions = self._extract_stock_mentions(line)
+                for target in mentions:
+                    _push(current_action, target, line)
+
+        sentence_patterns: list[tuple[str, re.Pattern[str]]] = [
+            ("add", re.compile(r"(?:自选新增|新增自选股[:：]?|本轮新增[:：]?)([^。；;\n]+)")),
+            ("remove", re.compile(r"(?:自选移除|移除自选股[:：]?|本轮移除[:：]?)([^。；;\n]+)")),
+        ]
+        for action, pattern in sentence_patterns:
+            for matched in pattern.finditer(text):
+                segment = matched.group(1)
+                for target in self._extract_stock_mentions(segment):
+                    _push(action, target, segment)
+
+        return changes
+
+    def _extract_actual_self_select_changes(
+        self, executed_actions: list[dict[str, Any]] | Any
+    ) -> list[dict[str, str]]:
+        if not isinstance(executed_actions, list):
+            return []
+        changes: list[dict[str, str]] = []
+        for item in executed_actions:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("action") or "").upper() != "MANAGE_SELF_SELECT":
+                continue
+            parsed = self._parse_self_select_query_change(item.get("query") or item.get("symbol"))
+            if parsed is not None:
+                changes.append(parsed)
+        return changes
+
+    def _has_self_select_consistency_gap(
+        self, final_answer: Any, executed_actions: list[dict[str, Any]] | Any
+    ) -> bool:
+        claimed_changes = self._extract_claimed_self_select_changes(final_answer)
+        if not claimed_changes:
+            return False
+
+        actual_changes = self._extract_actual_self_select_changes(executed_actions)
+        if not actual_changes:
+            return True
+
+        actual_targets_by_action: dict[str, set[str]] = {"add": set(), "remove": set()}
+        for item in actual_changes:
+            action = item.get("action")
+            target = self._clean_self_select_target(item.get("target"))
+            if action in actual_targets_by_action and target:
+                actual_targets_by_action[action].add(target)
+                actual_targets_by_action[action].update(self._extract_stock_mentions(target))
+
+        for item in claimed_changes:
+            action = item.get("action")
+            target = self._clean_self_select_target(item.get("target"))
+            if action not in actual_targets_by_action:
+                continue
+            claimed_tokens = {target}
+            claimed_tokens.update(self._extract_stock_mentions(target))
+            if claimed_tokens.isdisjoint(actual_targets_by_action[action]):
+                return True
+        return False
+
+    def _finalize_self_select_consistency(
+        self, final_answer: Any, executed_actions: list[dict[str, Any]] | Any
+    ) -> str:
+        answer = str(final_answer or "").strip()
+        if not answer:
+            return answer
+        if not self._has_self_select_consistency_gap(answer, executed_actions):
+            return answer
+        if SELF_SELECT_CONSISTENCY_WARNING.strip() in answer:
+            return answer
+        return answer + SELF_SELECT_CONSISTENCY_WARNING
+
+    def _merge_llm_response_payloads(
+        self, first_payload: Any, second_payload: Any
+    ) -> dict[str, Any]:
+        first = first_payload if isinstance(first_payload, dict) else {}
+        second = second_payload if isinstance(second_payload, dict) else {}
+        merged = dict(first)
+        responses: list[Any] = []
+        first_responses = first.get("responses")
+        second_responses = second.get("responses")
+        if isinstance(first_responses, list):
+            responses.extend(first_responses)
+        if isinstance(second_responses, list):
+            responses.extend(second_responses)
+        if responses:
+            merged["responses"] = responses
+        if "final_message" in second:
+            merged["final_message"] = second.get("final_message")
+        return merged
+
+    def _enforce_self_select_consistency(
+        self,
+        *,
+        settings: Any,
+        client: MXClient,
+        decision: dict[str, Any],
+        llm_request: dict[str, Any],
+        llm_response: dict[str, Any],
+        runtime_trace: dict[str, Any],
+        emit: Any = None,
+    ) -> tuple[
+        dict[str, Any],
+        dict[str, Any],
+        dict[str, Any],
+        dict[str, Any],
+        list[dict[str, Any]],
+    ]:
+        _emit = emit if callable(emit) else (lambda *_a, **_kw: None)
+        tool_calls = decision.get("tool_calls")
+        executed_actions = self._extract_executed_actions(tool_calls)
+        final_answer = decision.get("final_answer")
+
+        if not self._has_self_select_consistency_gap(final_answer, executed_actions):
+            normalized_decision = dict(decision)
+            normalized_decision["final_answer"] = self._finalize_self_select_consistency(
+                final_answer,
+                executed_actions,
+            )
+            return (
+                normalized_decision,
+                llm_request,
+                llm_response,
+                runtime_trace,
+                executed_actions,
+            )
+
+        messages = runtime_trace.get("messages") if isinstance(runtime_trace, dict) else None
+        if not isinstance(messages, list) or not messages:
+            normalized_decision = dict(decision)
+            normalized_decision["final_answer"] = self._finalize_self_select_consistency(
+                final_answer,
+                executed_actions,
+            )
+            return normalized_decision, llm_request, llm_response, runtime_trace, executed_actions
+
+        _emit(
+            "stage",
+            stage="llm",
+            message="检测到自选股结论与实际执行不一致，正在请求模型纠正",
+        )
+        followup_messages = [dict(item) for item in messages]
+        followup_messages.append(
+            {
+                "role": "user",
+                "content": SELF_SELECT_CONSISTENCY_FOLLOWUP_PROMPT,
+            }
+        )
+        followup_decision, followup_request, followup_response, followup_runtime_trace = (
+            llm_service.run_agent_with_messages(
+                app_settings=settings,
+                client=client,
+                messages=followup_messages,
+                emit=emit,
+            )
+        )
+
+        combined_tool_calls: list[dict[str, Any]] = []
+        if isinstance(tool_calls, list):
+            combined_tool_calls.extend(tool_calls)
+        followup_tool_calls = followup_decision.get("tool_calls")
+        if isinstance(followup_tool_calls, list):
+            combined_tool_calls.extend(followup_tool_calls)
+
+        merged_decision = dict(followup_decision)
+        merged_decision["tool_calls"] = combined_tool_calls
+        merged_executed_actions = self._extract_executed_actions(combined_tool_calls)
+        merged_decision["final_answer"] = self._finalize_self_select_consistency(
+            followup_decision.get("final_answer"),
+            merged_executed_actions,
+        )
+
+        merged_runtime_trace = (
+            dict(followup_runtime_trace) if isinstance(followup_runtime_trace, dict) else {}
+        )
+        merged_runtime_trace["messages"] = (
+            followup_runtime_trace.get("messages")
+            if isinstance(followup_runtime_trace, dict)
+            else followup_messages
+        )
+
+        merged_llm_request = {
+            "initial_request": llm_request,
+            "consistency_followup_request": followup_request,
+        }
+        merged_llm_response = self._merge_llm_response_payloads(llm_response, followup_response)
+        return (
+            merged_decision,
+            merged_llm_request,
+            merged_llm_response,
+            merged_runtime_trace,
+            merged_executed_actions,
+        )
 
     def _build_analysis_summary(self, final_answer: Any) -> str | None:
         text = str(final_answer or "").strip()

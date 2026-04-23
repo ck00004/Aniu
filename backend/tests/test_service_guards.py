@@ -130,6 +130,46 @@ def test_safe_prompt_budget_tracks_85_percent_of_max_context() -> None:
     assert aniu_service._safe_prompt_budget(settings) == int(131072 * 0.85)
 
 
+def test_extract_claimed_self_select_changes_detects_added_stock_from_final_answer() -> None:
+    final_answer = """
+七、自选股维护结论
+1. 新增自选股
+- 光迅科技（002281）
+
+十、本轮自选维护汇总
+新增自选股：光迅科技（002281）
+"""
+
+    changes = aniu_service._extract_claimed_self_select_changes(final_answer)
+
+    assert {item["action"] for item in changes} == {"add"}
+    assert any(item["target"] == "光迅科技" for item in changes)
+    assert any(item["target"] == "002281" for item in changes)
+
+
+def test_finalize_self_select_consistency_appends_warning_when_claim_has_no_action() -> None:
+    final_answer = "新增自选股：光迅科技（002281）"
+
+    result = aniu_service._finalize_self_select_consistency(final_answer, [])
+
+    assert "系统一致性提示" in result
+    assert "mx_manage_self_select" in result
+
+
+def test_finalize_self_select_consistency_keeps_answer_when_action_exists() -> None:
+    final_answer = "新增自选股：光迅科技（002281）"
+    executed_actions = [
+        {
+            "action": "MANAGE_SELF_SELECT",
+            "query": "将光迅科技（002281）加入自选股",
+        }
+    ]
+
+    result = aniu_service._finalize_self_select_consistency(final_answer, executed_actions)
+
+    assert result == final_answer
+
+
 def test_jin10_news_service_fetches_and_formats_context(monkeypatch) -> None:
     service = Jin10NewsService()
 

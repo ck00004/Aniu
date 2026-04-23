@@ -217,8 +217,8 @@ def test_run_stream_endpoint_passes_manual_trade_run_type(monkeypatch, tmp_path)
     captured: dict[str, object] = {}
 
     def fake_start_run_async(**kwargs):
-    captured.update(kwargs)
-    return 99
+        captured.update(kwargs)
+        return 99
 
     monkeypatch.setattr(aniu_service, "start_run_async", fake_start_run_async)
     monkeypatch.setenv("APP_LOGIN_PASSWORD", "release-pass")
