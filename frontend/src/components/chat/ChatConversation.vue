@@ -10,11 +10,6 @@
       </div>
     </header>
 
-    <div v-if="summaryText" class="chat-session-summary">
-      <div class="chat-session-summary-label">滚动摘要</div>
-      <pre class="chat-session-summary-content">{{ summaryText }}</pre>
-    </div>
-
     <div v-if="errorMessage" class="error-banner">{{ errorMessage }}</div>
 
     <div ref="scrollRef" class="chat-message-list" @scroll="handleScroll">
@@ -85,7 +80,6 @@ const props = defineProps<{
   canSend: boolean
   errorMessage: string
   readOnly?: boolean
-  summaryText?: string | null
   ensureSessionReady: () => Promise<number | null>
   loadOlderMessages: () => Promise<void>
 }>()

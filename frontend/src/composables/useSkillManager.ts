@@ -16,7 +16,14 @@ type SkillApiClient = Pick<
 
 function mergeSkill(skills: SkillListItem[], nextSkill: SkillListItem): SkillListItem[] {
   const filtered = skills.filter((item) => item.id !== nextSkill.id)
-  return [...filtered, nextSkill].sort((left, right) => {
+  return sortSkills([...filtered, nextSkill])
+}
+
+function sortSkills(skills: SkillListItem[]): SkillListItem[] {
+  return [...skills].sort((left, right) => {
+    if (left.layer !== right.layer) {
+      return left.layer === 'runtime' ? -1 : 1
+    }
     if (left.source !== right.source) {
       return left.source === 'builtin' ? -1 : 1
     }
@@ -31,24 +38,26 @@ export function useSkillManager(client: SkillApiClient = api) {
   const busy = ref(false)
   const errorMessage = ref('')
 
-  const builtinCount = computed(() => skills.value.filter((item) => item.source === 'builtin').length)
+  const runtimeSkills = computed(() => skills.value.filter((item) => item.layer === 'runtime'))
+  const standardSkills = computed(() => skills.value.filter((item) => item.layer === 'standard'))
+  const runtimeCount = computed(() => runtimeSkills.value.length)
+  const standardCount = computed(() => standardSkills.value.length)
   const enabledCount = computed(() => skills.value.filter((item) => item.enabled).length)
-  const workspaceCount = computed(() => skills.value.filter((item) => item.source === 'workspace').length)
-  const enabledBuiltinCount = computed(() => (
-    skills.value.filter((item) => item.enabled && item.source === 'builtin').length
+  const enabledRuntimeCount = computed(() => (
+    runtimeSkills.value.filter((item) => item.enabled).length
   ))
-  const enabledWorkspaceCount = computed(() => (
-    skills.value.filter((item) => item.enabled && item.source === 'workspace').length
+  const enabledStandardCount = computed(() => (
+    standardSkills.value.filter((item) => item.enabled).length
   ))
   const installedOverview = computed(() => ({
     total: skills.value.length,
-    builtin: builtinCount.value,
-    workspace: workspaceCount.value,
+    runtime: runtimeCount.value,
+    standard: standardCount.value,
   }))
   const enabledOverview = computed(() => ({
     total: enabledCount.value,
-    builtin: enabledBuiltinCount.value,
-    workspace: enabledWorkspaceCount.value,
+    runtime: enabledRuntimeCount.value,
+    standard: enabledStandardCount.value,
   }))
 
   async function loadSkills() {
@@ -56,6 +65,7 @@ export function useSkillManager(client: SkillApiClient = api) {
     errorMessage.value = ''
     try {
       skills.value = await client.listSkills()
+      skills.value = sortSkills(skills.value)
       return skills.value
     } catch (error) {
       errorMessage.value = (error as Error).message
@@ -132,6 +142,7 @@ export function useSkillManager(client: SkillApiClient = api) {
     errorMessage.value = ''
     try {
       skills.value = await client.reloadSkills()
+      skills.value = sortSkills(skills.value)
       return skills.value
     } catch (error) {
       errorMessage.value = (error as Error).message
@@ -178,9 +189,11 @@ export function useSkillManager(client: SkillApiClient = api) {
     selectedArchive,
     busy,
     errorMessage,
-    builtinCount,
+    runtimeSkills,
+    standardSkills,
+    runtimeCount,
+    standardCount,
     enabledCount,
-    workspaceCount,
     installedOverview,
     enabledOverview,
     loadSkills,

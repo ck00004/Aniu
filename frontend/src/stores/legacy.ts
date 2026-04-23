@@ -37,6 +37,7 @@ const defaultSettings = (): SettingsPayload => ({
   llm_api_key: '',
   llm_model: 'gpt-4o-mini',
   system_prompt: '你是跨越完整牛熊周期的顶尖私募投资机构老将与极度理性的专业交易员，你深谙A股政策驱动、外资流动与资金博弈机制。你必须持续运行以下自我驱动循环，监控经济、政策、盘面数据及资金流向，研判周期位置与市场情绪，寻找共识与预期差，定性博弈逻辑，自主决策执行交易操作。你的唯一目标是追求收益最大化。',
+  automation_context_window_tokens: 131072,
 })
 
 const defaultAccount = (): AccountOverview => ({
@@ -214,6 +215,7 @@ export const useAppStore = defineStore('app', () => {
     settings.llm_api_key = payload.llm_api_key ?? ''
     settings.llm_model = payload.llm_model
     settings.system_prompt = payload.system_prompt
+    settings.automation_context_window_tokens = payload.automation_context_window_tokens ?? 131072
   }
 
   function applySchedules(payload: ScheduleConfig[]) {

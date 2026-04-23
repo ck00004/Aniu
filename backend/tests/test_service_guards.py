@@ -124,6 +124,12 @@ def test_build_persistent_session_user_content_skips_self_select_guidance_for_tr
     assert "mx_manage_self_select" not in content
 
 
+def test_safe_prompt_budget_tracks_85_percent_of_max_context() -> None:
+    settings = SimpleNamespace(automation_context_window_tokens=131072)
+
+    assert aniu_service._safe_prompt_budget(settings) == int(131072 * 0.85)
+
+
 def test_jin10_news_service_fetches_and_formats_context(monkeypatch) -> None:
     service = Jin10NewsService()
 

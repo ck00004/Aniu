@@ -33,7 +33,6 @@
           :can-send="persistentSelected ? false : canSend"
           :error-message="persistentSelected ? persistentErrorMessage : errorMessage"
           :read-only="persistentSelected"
-          :summary-text="persistentSelected ? (persistentSession?.archived_summary ?? null) : null"
           :ensure-session-ready="ensureSessionReady"
           :load-older-messages="persistentSelected ? loadOlderPersistentMessages : loadOlderMessages"
           @submit="handleSubmit"

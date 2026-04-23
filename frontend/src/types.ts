@@ -7,6 +7,7 @@ export interface AppSettings {
   llm_api_key: string | null
   llm_model: string
   system_prompt: string
+  automation_context_window_tokens?: number | null
   created_at: string
   updated_at: string
 }
@@ -301,6 +302,7 @@ export interface LoginResponse {
 }
 
 export type SkillCompatibilityLevel = 'native' | 'prompt_only' | 'needs_attention'
+export type SkillLayer = 'runtime' | 'standard'
 
 export interface SkillListItem {
   id: string
@@ -308,6 +310,11 @@ export interface SkillListItem {
   description: string
   source: 'builtin' | 'workspace'
   enabled: boolean
+  layer: SkillLayer
+  can_toggle: boolean
+  can_delete: boolean
+  policy_label: string
+  policy_summary: string
 }
 
 export interface SkillInfo {
@@ -317,6 +324,11 @@ export interface SkillInfo {
   location: string
   source: 'builtin' | 'workspace'
   enabled: boolean
+  layer: SkillLayer
+  can_toggle: boolean
+  can_delete: boolean
+  policy_label: string
+  policy_summary: string
   has_handler: boolean
   tool_names: string[]
   run_types: string[]

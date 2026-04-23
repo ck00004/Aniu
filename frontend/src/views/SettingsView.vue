@@ -48,6 +48,16 @@
               <textarea v-model="settings.system_prompt" rows="8" />
               <p class="field-help">指导大模型行为的系统提示词，会影响 AI 的分析和决策方式。</p>
             </label>
+            <label class="field">
+              <span>最大上下文</span>
+              <input
+                v-model.number="settings.automation_context_window_tokens"
+                type="number"
+                min="4096"
+                step="1024"
+              />
+              <p class="field-help">默认 128K。后端会按该值的 85% 自动作为上下文压缩触发预算。</p>
+            </label>
           </div>
         </div>
 
@@ -86,16 +96,16 @@
             <span class="meta-label">已安装技能</span>
             <strong>总数 {{ installedOverview.total }}</strong>
             <div class="skills-overview-breakdown">
-              <span>系统技能 {{ installedOverview.builtin }}</span>
-              <span>用户技能 {{ installedOverview.workspace }}</span>
+              <span>运行时技能 {{ installedOverview.runtime }}</span>
+              <span>标准技能 {{ installedOverview.standard }}</span>
             </div>
           </div>
           <div class="skills-overview-card">
             <span class="meta-label">已启用技能</span>
             <strong>总数 {{ enabledOverview.total }}</strong>
             <div class="skills-overview-breakdown">
-              <span>系统技能 {{ enabledOverview.builtin }}</span>
-              <span>用户技能 {{ enabledOverview.workspace }}</span>
+              <span>运行时技能 {{ enabledOverview.runtime }}</span>
+              <span>标准技能 {{ enabledOverview.standard }}</span>
             </div>
           </div>
           <div class="skills-import-cluster">
@@ -144,61 +154,83 @@
 
         <div v-if="skillsErrorMessage" class="error-banner">{{ skillsErrorMessage }}</div>
 
-        <div v-if="skills.length" class="skill-card-list">
-          <article v-for="skill in skills" :key="skill.id" class="skill-card">
-            <div class="skill-card-copy">
-              <div class="skill-title-row">
-                <strong>{{ skill.name }}</strong>
-                <span
-                  class="skill-source-badge"
-                  :class="skill.source === 'builtin' ? 'is-system' : 'is-user'"
-                >
-                  {{ skill.source === 'builtin' ? '系统技能' : '用户技能' }}
-                </span>
+        <div v-if="skills.length" class="skill-group-list">
+          <section
+            v-for="section in skillSections"
+            :key="section.key"
+            class="skill-group-section"
+          >
+            <div class="skill-group-head">
+              <div>
+                <h3>{{ section.title }}</h3>
+                <p>{{ section.description }}</p>
               </div>
+              <span class="skill-group-count">{{ section.items.length }} 项</span>
+            </div>
 
-              <div class="skill-info-stack">
-                <div class="skill-info-block skill-info-description-block">
-                  <span class="meta-label">技能介绍</span>
-                  <p class="skill-card-description">
-                    {{ skill.description || '暂无技能描述。' }}
-                  </p>
+            <div class="skill-card-list">
+              <article v-for="skill in section.items" :key="skill.id" class="skill-card">
+                <div class="skill-card-copy">
+                  <div class="skill-title-row">
+                    <strong>{{ skill.name }}</strong>
+                    <div class="skill-badge-row">
+                      <span
+                        class="skill-source-badge"
+                        :class="skill.layer === 'runtime' ? 'is-runtime' : 'is-standard'"
+                      >
+                        {{ skill.layer === 'runtime' ? '运行时' : '标准技能' }}
+                      </span>
+                      <span
+                        class="skill-source-badge"
+                        :class="skill.source === 'builtin' ? 'is-system' : 'is-user'"
+                      >
+                        {{ skill.source === 'builtin' ? '系统内置' : '工作区' }}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div class="skill-info-stack">
+                    <div class="skill-info-block skill-info-description-block">
+                      <span class="meta-label">技能介绍</span>
+                      <p class="skill-card-description">
+                        {{ skill.description || '暂无技能描述。' }}
+                      </p>
+                    </div>
+                    <div class="skill-info-block skill-info-description-block">
+                      <span class="meta-label">管理策略</span>
+                      <p class="skill-card-description">
+                        <strong>{{ skill.policy_label }}</strong> · {{ skill.policy_summary }}
+                      </p>
+                    </div>
+                  </div>
                 </div>
-              </div>
-            </div>
 
-            <div class="skill-card-footer">
-              <button
-                v-if="skill.source === 'workspace'"
-                type="button"
-                class="button ghost small soft-header-button skill-delete-action"
-                :disabled="skillsBusy"
-                @click="deleteSkill(skill)"
-              >
-                删除
-              </button>
-              <button
-                v-else
-                type="button"
-                class="button ghost small soft-header-button skill-delete-action is-placeholder"
-                disabled
-              >
-                不可删除
-              </button>
-              <button
-                type="button"
-                class="skill-toggle"
-                :class="{ 'is-on': skill.enabled }"
-                :disabled="skillsBusy || !canToggleSkill(skill)"
-                role="switch"
-                :aria-checked="skill.enabled"
-                @click="toggleSkill(skill)"
-              >
-                <span class="skill-toggle-thumb" aria-hidden="true"></span>
-                {{ skill.enabled ? '启用' : '停用' }}
-              </button>
+                <div class="skill-card-footer">
+                  <button
+                    type="button"
+                    class="button ghost small soft-header-button skill-delete-action"
+                    :class="{ 'is-placeholder': !skill.can_delete }"
+                    :disabled="skillsBusy || !skill.can_delete"
+                    @click="deleteSkill(skill)"
+                  >
+                    {{ skill.can_delete ? '删除' : '不可删除' }}
+                  </button>
+                  <button
+                    type="button"
+                    class="skill-toggle"
+                    :class="{ 'is-on': skill.enabled }"
+                    :disabled="skillsBusy || !canToggleSkill(skill)"
+                    role="switch"
+                    :aria-checked="skill.enabled"
+                    @click="toggleSkill(skill)"
+                  >
+                    <span class="skill-toggle-thumb" aria-hidden="true"></span>
+                    {{ skill.can_toggle ? (skill.enabled ? '启用' : '停用') : '始终启用' }}
+                  </button>
+                </div>
+              </article>
             </div>
-          </article>
+          </section>
         </div>
 
         <div v-else class="empty-state">
@@ -210,7 +242,7 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { storeToRefs } from 'pinia'
 
 import { useSkillManager } from '@/composables/useSkillManager'
@@ -226,6 +258,8 @@ const {
   selectedArchive,
   busy: skillsBusy,
   errorMessage: skillsErrorMessage,
+  runtimeSkills,
+  standardSkills,
   installedOverview,
   enabledOverview,
   loadSkills,
@@ -236,6 +270,23 @@ const {
   deleteSkill: deleteManagedSkill,
 } = useSkillManager()
 const skillArchiveInputRef = ref<HTMLInputElement | null>(null)
+const skillSections = computed(() => {
+  const sections = [
+    {
+      key: 'runtime',
+      title: '运行时技能',
+      description: '为所有技能和任务提供共享工具执行能力。',
+      items: runtimeSkills.value,
+    },
+    {
+      key: 'standard',
+      title: '标准技能',
+      description: '业务技能、策略技能与工作区扩展技能。',
+      items: standardSkills.value,
+    },
+  ]
+  return sections.filter((section) => section.items.length > 0)
+})
 
 function openImportFileDialog() {
   if (skillArchiveInputRef.value) {
@@ -283,14 +334,14 @@ async function toggleSkill(skill: SkillListItem) {
 }
 
 async function deleteSkill(skill: SkillListItem) {
-  if (skill.source !== 'workspace') {
+  if (!skill.can_delete) {
     return
   }
   await deleteManagedSkill(skill)
 }
 
 function canToggleSkill(skill: SkillListItem) {
-  return skill.id !== 'builtin_utils'
+  return skill.can_toggle
 }
 
 onMounted(async () => {

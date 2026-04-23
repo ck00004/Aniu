@@ -11,6 +11,11 @@ function createSkillListItem(overrides: Partial<SkillListItem> = {}): SkillListI
     description: 'desc',
     source: 'builtin',
     enabled: true,
+    layer: 'runtime',
+    can_toggle: false,
+    can_delete: false,
+    policy_label: '运行时底座',
+    policy_summary: '始终启用，不允许停用或删除。',
     ...overrides,
   }
 }
@@ -39,7 +44,16 @@ test('loadSkills populates skill list and counters', async () => {
   const manager = useSkillManager({
     listSkills: async () => [
       createSkillListItem(),
-      createSkillListItem({ id: 'prompt-skill', source: 'workspace', enabled: false }),
+      createSkillListItem({
+        id: 'prompt-skill',
+        source: 'workspace',
+        layer: 'standard',
+        enabled: false,
+        can_toggle: true,
+        can_delete: true,
+        policy_label: '工作区技能',
+        policy_summary: '支持启停管理，也允许从工作区删除。',
+      }),
     ],
     importSkillHubSkill: async () => createSkill(),
     importSkillArchive: async () => createSkill(),
@@ -53,17 +67,19 @@ test('loadSkills populates skill list and counters', async () => {
 
   assert.equal(manager.skills.value.length, 2)
   assert.equal(manager.enabledCount.value, 1)
-  assert.equal(manager.workspaceCount.value, 1)
+  assert.equal(manager.standardCount.value, 1)
   assert.deepEqual(manager.installedOverview.value, {
     total: 2,
-    builtin: 1,
-    workspace: 1,
+    runtime: 1,
+    standard: 1,
   })
   assert.deepEqual(manager.enabledOverview.value, {
     total: 1,
-    builtin: 1,
-    workspace: 0,
+    runtime: 1,
+    standard: 0,
   })
+  assert.equal(manager.runtimeSkills.value.length, 1)
+  assert.equal(manager.standardSkills.value.length, 1)
 })
 
 test('importFromSkillHub trims input and keeps imported skill disabled', async () => {
@@ -71,10 +87,15 @@ test('importFromSkillHub trims input and keeps imported skill disabled', async (
     id: 'newsnow-v2',
     name: 'NewsNow V2',
     source: 'workspace',
+    layer: 'standard',
     enabled: false,
     has_handler: false,
     compatibility_level: 'needs_attention',
     clawhub_slug: 'newsnow-v2',
+    can_toggle: true,
+    can_delete: true,
+    policy_label: '工作区技能',
+    policy_summary: '支持启停管理，也允许从工作区删除。',
   })
   let capturedInput = ''
 
@@ -104,7 +125,12 @@ test('importSkill prefers selected zip archive over SkillHub input', async () =>
     id: 'uploaded-skill',
     name: 'Uploaded Skill',
     source: 'workspace',
+    layer: 'standard',
     enabled: false,
+    can_toggle: true,
+    can_delete: true,
+    policy_label: '工作区技能',
+    policy_summary: '支持启停管理，也允许从工作区删除。',
   })
   const file = new File(['demo'], 'uploaded-skill.zip', { type: 'application/zip' })
   let archiveCalls = 0
@@ -177,20 +203,30 @@ test('toggleSkill keeps same-source skills in name order after disabling', async
       id: skillId,
       name: 'Alpha Skill',
       source: 'workspace',
+      layer: 'standard',
       enabled: true,
+      can_toggle: true,
+      can_delete: true,
+      policy_label: '工作区技能',
+      policy_summary: '支持启停管理，也允许从工作区删除。',
     }),
     disableSkill: async (skillId: string) => createSkill({
       id: skillId,
       name: 'Alpha Skill',
       source: 'workspace',
+      layer: 'standard',
       enabled: false,
+      can_toggle: true,
+      can_delete: true,
+      policy_label: '工作区技能',
+      policy_summary: '支持启停管理，也允许从工作区删除。',
     }),
     deleteSkill: async () => undefined,
   })
 
   manager.skills.value = [
-    createSkill({ id: 'alpha-skill', name: 'Alpha Skill', source: 'workspace', enabled: true }),
-    createSkill({ id: 'beta-skill', name: 'Beta Skill', source: 'workspace', enabled: true }),
+    createSkill({ id: 'alpha-skill', name: 'Alpha Skill', source: 'workspace', layer: 'standard', enabled: true, can_toggle: true, can_delete: true, policy_label: '工作区技能', policy_summary: '支持启停管理，也允许从工作区删除。' }),
+    createSkill({ id: 'beta-skill', name: 'Beta Skill', source: 'workspace', layer: 'standard', enabled: true, can_toggle: true, can_delete: true, policy_label: '工作区技能', policy_summary: '支持启停管理，也允许从工作区删除。' }),
   ]
 
   await manager.toggleSkill(manager.skills.value[0])
@@ -219,11 +255,45 @@ test('deleteSkill removes workspace skill', async () => {
 
   manager.skills.value = [
     createSkill(),
-    createSkill({ id: 'uploaded-skill', name: 'Uploaded Skill', source: 'workspace', enabled: false }),
+    createSkill({ id: 'uploaded-skill', name: 'Uploaded Skill', source: 'workspace', layer: 'standard', enabled: false, can_toggle: true, can_delete: true, policy_label: '工作区技能', policy_summary: '支持启停管理，也允许从工作区删除。' }),
   ]
 
   await manager.deleteSkill(manager.skills.value[1])
 
   assert.equal(deleteCalls, 1)
   assert.equal(manager.skills.value.some((item) => item.id === 'uploaded-skill'), false)
+})
+
+test('runtime skills stay ahead of standard skills after merge sorting', async () => {
+  const manager = useSkillManager({
+    listSkills: async () => [],
+    importSkillHubSkill: async () => createSkill(),
+    importSkillArchive: async () => createSkill(),
+    reloadSkills: async () => [],
+    enableSkill: async (skillId: string) => createSkill({
+      id: skillId,
+      name: 'Alpha Standard',
+      source: 'workspace',
+      layer: 'standard',
+      enabled: true,
+      can_toggle: true,
+      can_delete: true,
+      policy_label: '工作区技能',
+      policy_summary: '支持启停管理，也允许从工作区删除。',
+    }),
+    disableSkill: async () => createSkill({ enabled: false }),
+    deleteSkill: async () => undefined,
+  })
+
+  manager.skills.value = [
+    createSkillListItem({ id: 'builtin-utils', name: 'Runtime Core', layer: 'runtime', source: 'builtin', enabled: true }),
+    createSkillListItem({ id: 'alpha-standard', name: 'Alpha Standard', layer: 'standard', source: 'workspace', enabled: false, can_toggle: true, can_delete: true, policy_label: '工作区技能', policy_summary: '支持启停管理，也允许从工作区删除。' }),
+  ]
+
+  await manager.toggleSkill(manager.skills.value[1])
+
+  assert.deepEqual(
+    manager.skills.value.map((item) => item.layer),
+    ['runtime', 'standard'],
+  )
 })

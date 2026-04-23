@@ -66,6 +66,10 @@ def test_skills_endpoint_lists_builtin_skills(monkeypatch, tmp_path) -> None:
     builtin_utils = next(item for item in payload if item["id"] == "builtin_utils")
     assert builtin_utils["name"] == "builtin_utils"
     assert builtin_utils["source"] == "builtin"
+    assert builtin_utils["layer"] == "runtime"
+    assert builtin_utils["can_toggle"] is False
+    assert builtin_utils["can_delete"] is False
+    assert builtin_utils["policy_label"] == "运行时底座"
     assert "location" not in builtin_utils
     assert "support_files" not in builtin_utils
     assert "tool_names" not in builtin_utils
@@ -189,7 +193,10 @@ This skill should only appear in the prompt supplement after it is enabled.
         assert Path(payload["location"]).name == "fancy-skill"
         assert Path(payload["location"]).parent.name == "skills"
         assert payload["source"] == "workspace"
+        assert payload["layer"] == "standard"
         assert payload["enabled"] is False
+        assert payload["can_toggle"] is True
+        assert payload["can_delete"] is True
         assert payload["compatibility_level"] == "needs_attention"
 
         target_skill = (
@@ -289,7 +296,9 @@ This skill comes from a local zip file.
         assert payload["id"] == "uploaded-skill"
         assert payload["name"] == "Uploaded Skill"
         assert payload["source"] == "workspace"
+        assert payload["layer"] == "standard"
         assert payload["enabled"] is False
+        assert payload["can_delete"] is True
 
         target_skill = (
             tmp_path / "skill_workspace" / "skills" / "uploaded-skill" / "SKILL.md"

@@ -7,7 +7,7 @@ from typing import Any, Callable, Iterable
 import httpx
 
 from app.services.mx_service import MXClient
-from app.skills import skill_registry
+from app.services.skill_stack_service import skill_stack_service
 
 _LLM_TEMPERATURE = 0.2
 _MAX_TOOL_ITERATIONS = 100
@@ -255,7 +255,7 @@ class LLMService:
         chat_tool_context = {**(tool_context or {}), "run_type": "chat"}
 
         def _chat_tool_executor(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-            return skill_registry.execute_tool(
+            return skill_stack_service.runtime.execute_tool(
                 tool_name=tool_name,
                 arguments=arguments,
                 context=chat_tool_context,
@@ -287,7 +287,7 @@ class LLMService:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": getattr(app_settings, "task_prompt", "")},
             ],
-            "tools": skill_registry.build_tools(run_type=run_type),
+            "tools": skill_stack_service.runtime.build_tools(run_type=run_type),
             "tool_choice": "auto",
         }
 
@@ -310,7 +310,7 @@ class LLMService:
             "model": app_settings.llm_model,
             "temperature": _LLM_TEMPERATURE,
             "messages": payload_messages,
-            "tools": skill_registry.build_tools(run_type=run_type),
+            "tools": skill_stack_service.runtime.build_tools(run_type=run_type),
             "tool_choice": "auto",
         }
 
@@ -320,7 +320,9 @@ class LLMService:
         *,
         run_type: str | None = None,
     ) -> str:
-        supplement = skill_registry.build_prompt_supplement(run_type=run_type)
+        supplement = skill_stack_service.context.build_prompt_supplement(
+            run_type=run_type
+        )
         prompt_parts = [
             str(base_prompt or "").strip(),
             str(supplement or "").strip(),
@@ -365,7 +367,7 @@ class LLMService:
         run_type = str(getattr(app_settings, "run_type", "analysis") or "analysis")
 
         def _run_tool_executor(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-            return skill_registry.execute_tool(
+            return skill_stack_service.runtime.execute_tool(
                 tool_name=tool_name,
                 arguments=arguments,
                 context={
@@ -424,7 +426,7 @@ class LLMService:
                 "model": model,
                 "temperature": _LLM_TEMPERATURE,
                 "messages": messages,
-                "tools": skill_registry.build_tools(run_type=run_type),
+                "tools": skill_stack_service.runtime.build_tools(run_type=run_type),
                 "tool_choice": "auto",
             }
             _emit("llm_request", iteration=iteration + 1, model=model)

@@ -57,8 +57,10 @@ ACCOUNT_PREFETCH_TOOL_NAMES = (
 ACCOUNT_OVERVIEW_CACHE_MAX_WORKERS = 3
 AUTOMATION_SESSION_SLUG = "automation-default"
 AUTOMATION_SESSION_TITLE = "自动化交易会话"
-AUTOMATION_DEFAULT_CONTEXT_WINDOW_TOKENS = 65536
-AUTOMATION_DEFAULT_TARGET_PROMPT_TOKENS = 24000
+AUTOMATION_DEFAULT_CONTEXT_WINDOW_TOKENS = 131072
+AUTOMATION_DEFAULT_TARGET_PROMPT_TOKENS = int(
+    AUTOMATION_DEFAULT_CONTEXT_WINDOW_TOKENS * 0.85
+)
 AUTOMATION_DEFAULT_RECENT_MESSAGE_LIMIT = 24
 AUTOMATION_DEFAULT_IDLE_SUMMARY_HOURS = 12
 AUTOMATION_RESERVED_OUTPUT_TOKENS = 4000
@@ -2681,25 +2683,35 @@ class AniuService:
         recent_limit: int,
     ) -> list[ChatMessageRecord]:
         limit = max(4, int(recent_limit or AUTOMATION_DEFAULT_RECENT_MESSAGE_LIMIT))
+        records = self._list_unarchived_persistent_session_records(
+            db=db,
+            session_id=session_id,
+        )
+        if len(records) <= limit:
+            return records
+        return records[-limit:]
+
+    def _list_unarchived_persistent_session_records(
+        self,
+        *,
+        db: Session,
+        session_id: int,
+    ) -> list[ChatMessageRecord]:
         session = db.get(ChatSession, session_id)
         last_compacted_message_id = int(
             getattr(session, "last_compacted_message_id", 0) or 0
         )
         stmt = (
             select(ChatMessageRecord)
-            .where(ChatMessageRecord.session_id == session_id)
+            .where(
+                ChatMessageRecord.session_id == session_id,
+                ChatMessageRecord.message_kind == "live_turn",
+            )
             .order_by(ChatMessageRecord.id.desc())
-            .limit(limit)
         )
         if last_compacted_message_id > 0:
             stmt = stmt.where(ChatMessageRecord.id > last_compacted_message_id)
-        records = (
-            db.execute(
-                stmt
-            )
-            .scalars()
-            .all()
-        )
+        records = db.execute(stmt).scalars().all()
         records.reverse()
         return records
 
@@ -2738,18 +2750,8 @@ class AniuService:
     ) -> int:
         estimate = estimate_messages_tokens(messages)
         estimate += estimate_text_tokens(getattr(settings, "system_prompt", None))
-        estimate += estimate_text_tokens(session.archived_summary)
+        del session
         return estimate
-
-    def _build_persistent_session_context_system_message(
-        self,
-        *,
-        session: ChatSession,
-    ) -> dict[str, Any] | None:
-        archived_summary = str(session.archived_summary or "").strip()
-        if not archived_summary:
-            return None
-        return {"role": "system", "content": "[上下文压缩摘要]\n" + archived_summary}
 
     def _build_persistent_session_prompt_messages(
         self,
@@ -2759,11 +2761,7 @@ class AniuService:
         memory_messages: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
-        context_message = self._build_persistent_session_context_system_message(
-            session=session,
-        )
-        if context_message is not None:
-            messages.append(context_message)
+        del session
         messages.extend(memory_messages)
         messages.extend(history_messages)
         return messages
@@ -2798,22 +2796,44 @@ class AniuService:
         )
         return "\n".join(lines)
 
+    def _merge_compacted_summary(
+        self,
+        *,
+        existing_summary: str | None,
+        incremental_summary: str | None,
+    ) -> str | None:
+        previous = str(existing_summary or "").strip()
+        current = str(incremental_summary or "").strip()
+        if not previous:
+            return current or None
+        if not current:
+            return previous
+        return previous + "\n\n[增量归档]\n" + current
+
     def _safe_prompt_budget(self, settings: Any) -> int:
         context_window = int(
             getattr(settings, "automation_context_window_tokens", 0)
             or AUTOMATION_DEFAULT_CONTEXT_WINDOW_TOKENS
         )
-        safe_budget = max(
-            2048,
-            context_window
-            - AUTOMATION_RESERVED_OUTPUT_TOKENS
-            - AUTOMATION_SAFETY_BUFFER_TOKENS,
+        return max(2048, int(context_window * 0.85))
+
+    def _persist_persistent_session_compaction_message(
+        self,
+        *,
+        db: Session,
+        session: ChatSession,
+        content: str,
+    ) -> ChatMessageRecord:
+        record = ChatMessageRecord(
+            session_id=session.id,
+            role="system",
+            content=content,
+            source="automation_compaction",
+            message_kind="context_compaction_summary",
         )
-        configured_target = int(
-            getattr(settings, "automation_target_prompt_tokens", 0)
-            or AUTOMATION_DEFAULT_TARGET_PROMPT_TOKENS
-        )
-        return min(configured_target, int(safe_budget * 0.7))
+        db.add(record)
+        db.flush()
+        return record
 
     def _should_compact_automation_session(
         self,
@@ -2851,18 +2871,13 @@ class AniuService:
         settings: Any,
         estimated_tokens: int,
     ) -> tuple[str | None, int | None]:
-        records = (
-            db.execute(
-                select(ChatMessageRecord)
-                .where(ChatMessageRecord.session_id == session.id)
-                .order_by(ChatMessageRecord.id.asc())
-            )
-            .scalars()
-            .all()
+        active_records = self._list_unarchived_persistent_session_records(
+            db=db,
+            session_id=session.id,
         )
         if not self._should_compact_automation_session(
             session=session,
-            records=records,
+            records=active_records,
             settings=settings,
             estimated_tokens=estimated_tokens,
         ):
@@ -2876,8 +2891,8 @@ class AniuService:
             )
             // 2,
         )
-        compact_cutoff = max(0, len(records) - recent_limit)
-        compact_candidates = records[:compact_cutoff]
+        compact_cutoff = max(0, len(active_records) - recent_limit)
+        compact_candidates = active_records[:compact_cutoff]
         if len(compact_candidates) < 2:
             return session.archived_summary, session.summary_revision
         if len(compact_candidates) % 2 == 1:
@@ -2885,7 +2900,11 @@ class AniuService:
         if len(compact_candidates) < 2:
             return session.archived_summary, session.summary_revision
 
-        summary = self._build_compacted_summary_text(compact_candidates)
+        incremental_summary = self._build_compacted_summary_text(compact_candidates)
+        summary = self._merge_compacted_summary(
+            existing_summary=session.archived_summary,
+            incremental_summary=incremental_summary,
+        )
         if not summary:
             return session.archived_summary, session.summary_revision
 
@@ -2896,6 +2915,12 @@ class AniuService:
         session.last_compacted_run_id = int(last_run_id) if last_run_id else None
         session.summary_revision = int(session.summary_revision or 0) + 1
         db.add(session)
+        if incremental_summary:
+            self._persist_persistent_session_compaction_message(
+                db=db,
+                session=session,
+                content="[上下文压缩摘要]\n" + incremental_summary,
+            )
         return session.archived_summary, session.summary_revision
 
     def _compute_next_run_at(

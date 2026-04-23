@@ -75,11 +75,11 @@ def _ensure_app_settings_columns(engine) -> None:
         statements.append("ALTER TABLE app_settings ADD COLUMN automation_session_id INTEGER")
     if "automation_context_window_tokens" not in columns:
         statements.append(
-            "ALTER TABLE app_settings ADD COLUMN automation_context_window_tokens INTEGER DEFAULT 65536"
+            "ALTER TABLE app_settings ADD COLUMN automation_context_window_tokens INTEGER DEFAULT 131072"
         )
     if "automation_target_prompt_tokens" not in columns:
         statements.append(
-            "ALTER TABLE app_settings ADD COLUMN automation_target_prompt_tokens INTEGER DEFAULT 24000"
+            "ALTER TABLE app_settings ADD COLUMN automation_target_prompt_tokens INTEGER DEFAULT 111411"
         )
     if "automation_recent_message_limit" not in columns:
         statements.append(
@@ -110,8 +110,12 @@ def _ensure_app_settings_columns(engine) -> None:
             connection.execute(text(statement))
         connection.execute(
             text(
-                "UPDATE app_settings SET automation_context_window_tokens = COALESCE(automation_context_window_tokens, 65536), "
-                "automation_target_prompt_tokens = COALESCE(automation_target_prompt_tokens, 24000), "
+                "UPDATE app_settings SET automation_context_window_tokens = CASE "
+                "WHEN automation_context_window_tokens IS NULL OR automation_context_window_tokens = 65536 THEN 131072 "
+                "ELSE automation_context_window_tokens END, "
+                "automation_target_prompt_tokens = CASE "
+                "WHEN automation_target_prompt_tokens IS NULL OR automation_target_prompt_tokens = 24000 THEN 111411 "
+                "ELSE automation_target_prompt_tokens END, "
                 "automation_recent_message_limit = COALESCE(automation_recent_message_limit, 24), "
                 "automation_enable_auto_compaction = COALESCE(automation_enable_auto_compaction, 1), "
                 "automation_idle_summary_hours = COALESCE(automation_idle_summary_hours, 12), "

@@ -1,6 +1,7 @@
 from pathlib import Path
 import sys
 from types import SimpleNamespace
+from datetime import datetime, timezone
 
 from fastapi.testclient import TestClient
 
@@ -15,6 +16,7 @@ from app.main import create_app
 from app.services.aniu_service import aniu_service
 from app.services.llm_service import llm_service
 from app.services.scheduler_service import scheduler_service
+from app.services.token_estimator import estimate_messages_tokens, estimate_text_tokens
 from app.services.trading_calendar_service import trading_calendar_service
 
 
@@ -69,6 +71,27 @@ def _fake_run_result(final_answer: str, tool_calls=None):
         {"responses": [], "final_message": {"content": final_answer}},
         {"messages": []},
     )
+
+
+def _append_session_message(
+    db,
+    *,
+    session_id: int,
+    role: str,
+    content: str,
+    run_id: int,
+) -> ChatMessageRecord:
+    record = ChatMessageRecord(
+        session_id=session_id,
+        role=role,
+        content=content,
+        source="automation_run",
+        run_id=run_id,
+        message_kind="live_turn",
+    )
+    db.add(record)
+    db.flush()
+    return record
 
 
 def test_schedule_runs_share_single_automation_session(monkeypatch, tmp_path) -> None:
@@ -299,5 +322,248 @@ def test_chat_session_list_excludes_automation_sessions(monkeypatch, tmp_path) -
         assert len(payload) == 1
         assert payload[0]["title"] == "User"
         assert payload[0]["kind"] == "user"
+
+    reset_db_state()
+
+
+def test_automation_context_estimate_does_not_double_count_archived_summary(
+    monkeypatch, tmp_path
+) -> None:
+    with create_test_client(monkeypatch, tmp_path):
+        with session_scope() as db:
+            settings = aniu_service.get_or_create_settings(db)
+            settings.system_prompt = "系统提示"
+            session = ChatSession(
+                title="Automation",
+                kind="automation",
+                slug="automation-default",
+                archived_summary="已归档摘要",
+            )
+            db.add(session)
+            db.flush()
+
+            messages = aniu_service._build_persistent_session_prompt_messages(
+                session=session,
+                history_messages=[{"role": "user", "content": "本轮任务"}],
+                memory_messages=[],
+            )
+            assert messages == [{"role": "user", "content": "本轮任务"}]
+            estimate = aniu_service._estimate_persistent_session_context_tokens(
+                session=session,
+                settings=settings,
+                messages=messages,
+            )
+
+            assert estimate == estimate_messages_tokens(messages) + estimate_text_tokens(
+                settings.system_prompt
+            )
+
+    reset_db_state()
+
+
+def test_auto_compaction_ignores_already_archived_history_until_new_messages_accumulate(
+    monkeypatch, tmp_path
+) -> None:
+    with create_test_client(monkeypatch, tmp_path):
+        with session_scope() as db:
+            settings = aniu_service.get_or_create_settings(db)
+            settings.automation_enable_auto_compaction = True
+            settings.automation_recent_message_limit = 4
+            settings.automation_idle_summary_hours = 999
+            session = ChatSession(
+                title="Automation",
+                kind="automation",
+                slug="automation-default",
+                archived_summary="历史摘要",
+                summary_revision=1,
+                last_message_at=datetime.now(timezone.utc),
+            )
+            db.add(session)
+            db.flush()
+
+            old_records: list[ChatMessageRecord] = []
+            for run_id in range(1, 4):
+                old_records.append(
+                    _append_session_message(
+                        db,
+                        session_id=session.id,
+                        role="user",
+                        content=f"旧任务 {run_id}",
+                        run_id=run_id,
+                    )
+                )
+                old_records.append(
+                    _append_session_message(
+                        db,
+                        session_id=session.id,
+                        role="assistant",
+                        content=f"旧结论 {run_id}",
+                        run_id=run_id,
+                    )
+                )
+
+            session.last_compacted_message_id = old_records[-1].id
+            session.last_compacted_run_id = old_records[-1].run_id
+            db.add(session)
+            db.flush()
+
+            new_user = _append_session_message(
+                db,
+                session_id=session.id,
+                role="user",
+                content="新任务 4",
+                run_id=4,
+            )
+            new_assistant = _append_session_message(
+                db,
+                session_id=session.id,
+                role="assistant",
+                content="新结论 4",
+                run_id=4,
+            )
+            session.last_message_at = datetime.now(timezone.utc)
+            db.add(session)
+            db.flush()
+
+            history_records = aniu_service._list_persistent_session_history_records(
+                db=db,
+                session_id=session.id,
+                recent_limit=4,
+            )
+            assert [record.id for record in history_records] == [
+                new_user.id,
+                new_assistant.id,
+            ]
+
+            original_last_compacted_message_id = session.last_compacted_message_id
+            summary, version = aniu_service._maybe_compact_persistent_session(
+                db=db,
+                session=session,
+                settings=settings,
+                estimated_tokens=0,
+            )
+
+            assert summary == "历史摘要"
+            assert version == 1
+            assert session.summary_revision == 1
+            assert session.last_compacted_message_id == original_last_compacted_message_id
+
+            summary_messages = (
+                db.query(ChatMessageRecord)
+                .filter(ChatMessageRecord.session_id == session.id)
+                .filter(ChatMessageRecord.message_kind == "context_compaction_summary")
+                .all()
+            )
+            assert summary_messages == []
+
+    reset_db_state()
+
+
+def test_repeated_compaction_only_archives_new_history_and_preserves_previous_summary(
+    monkeypatch, tmp_path
+) -> None:
+    with create_test_client(monkeypatch, tmp_path):
+        with session_scope() as db:
+            settings = aniu_service.get_or_create_settings(db)
+            settings.automation_enable_auto_compaction = True
+            settings.automation_recent_message_limit = 8
+            settings.automation_idle_summary_hours = 999
+            session = ChatSession(
+                title="Automation",
+                kind="automation",
+                slug="automation-default",
+                archived_summary="历史摘要",
+                summary_revision=1,
+                last_message_at=datetime.now(timezone.utc),
+            )
+            db.add(session)
+            db.flush()
+
+            old_records: list[ChatMessageRecord] = []
+            for run_id in range(1, 3):
+                old_records.append(
+                    _append_session_message(
+                        db,
+                        session_id=session.id,
+                        role="user",
+                        content=f"旧任务 {run_id}",
+                        run_id=run_id,
+                    )
+                )
+                old_records.append(
+                    _append_session_message(
+                        db,
+                        session_id=session.id,
+                        role="assistant",
+                        content=f"旧结论 {run_id}",
+                        run_id=run_id,
+                    )
+                )
+
+            session.last_compacted_message_id = old_records[-1].id
+            session.last_compacted_run_id = old_records[-1].run_id
+            db.add(session)
+            db.flush()
+
+            new_records: list[ChatMessageRecord] = []
+            for offset in range(5):
+                run_id = 100 + offset
+                new_records.append(
+                    _append_session_message(
+                        db,
+                        session_id=session.id,
+                        role="user",
+                        content=f"新任务 {run_id}",
+                        run_id=run_id,
+                    )
+                )
+                new_records.append(
+                    _append_session_message(
+                        db,
+                        session_id=session.id,
+                        role="assistant",
+                        content=f"新的分析结论 {run_id}",
+                        run_id=run_id,
+                    )
+                )
+
+            session.last_message_at = datetime.now(timezone.utc)
+            db.add(session)
+            db.flush()
+
+            summary, version = aniu_service._maybe_compact_persistent_session(
+                db=db,
+                session=session,
+                settings=settings,
+                estimated_tokens=0,
+            )
+
+            assert version == 2
+            assert session.summary_revision == 2
+            assert summary is not None
+            assert "历史摘要" in summary
+            assert "run_id 100" in summary
+            assert session.last_compacted_message_id == new_records[1].id
+
+            summary_messages = (
+                db.query(ChatMessageRecord)
+                .filter(ChatMessageRecord.session_id == session.id)
+                .filter(ChatMessageRecord.message_kind == "context_compaction_summary")
+                .order_by(ChatMessageRecord.id.asc())
+                .all()
+            )
+            assert len(summary_messages) == 1
+            assert summary_messages[0].role == "system"
+            assert summary_messages[0].content.startswith("[上下文压缩摘要]\n")
+            assert "run_id 100" in summary_messages[0].content
+
+            history_records = aniu_service._list_persistent_session_history_records(
+                db=db,
+                session_id=session.id,
+                recent_limit=8,
+            )
+            assert [record.id for record in history_records] == [
+                record.id for record in new_records[2:]
+            ]
 
     reset_db_state()

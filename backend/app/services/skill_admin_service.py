@@ -5,7 +5,6 @@ import re
 import shutil
 import tempfile
 import zipfile
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -16,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_skill_workspace_skills_dir
 from app.db.models import AppSettings
+from app.services.skill_stack_service import skill_stack_service
 from app.skills import skill_registry
 
 
@@ -34,11 +34,6 @@ _SKILLHUB_DOMAINS = {
     "www.skillhub.cn",
     "skillhub.tencent.com",
     "www.skillhub.tencent.com",
-}
-_IGNORED_SUPPORT_FILES = {
-    "SKILL.md",
-    "_meta.json",
-    "__pycache__",
 }
 
 
@@ -129,119 +124,11 @@ class SkillAdminService:
         skill_registry.reload()
         self.apply_persisted_state(db)
 
-    def _extract_run_types(self, pkg: Any) -> list[str]:
-        return list(getattr(pkg, "run_types", []) or [])
-
-    def _extract_category(self, pkg: Any) -> str | None:
-        meta = pkg.metadata.get("metadata")
-        if not isinstance(meta, dict):
-            return None
-        for key in ("aniu", "openclaw"):
-            payload = meta.get(key)
-            if isinstance(payload, dict):
-                category = payload.get("category")
-                if isinstance(category, str) and category.strip():
-                    return category.strip()
-        return None
-
-    def _list_support_files(self, pkg: Any) -> list[str]:
-        files: list[str] = []
-        for path in pkg.path.rglob("*"):
-            if not path.is_file():
-                continue
-            relative = path.relative_to(pkg.path).as_posix()
-            if relative in _IGNORED_SUPPORT_FILES:
-                continue
-            files.append(relative)
-        return sorted(files)[:12]
-
-    def _build_compatibility(self, pkg: Any) -> tuple[str, str, list[str]]:
-        if self._is_system_runtime(pkg):
-            return "native", "System runtime tools that stay enabled to support all skills.", []
-
-        issues: list[str] = []
-        requires = getattr(pkg, "requires", {}) or {}
-        bins = requires.get("bins") if isinstance(requires.get("bins"), list) else []
-        envs = requires.get("env") if isinstance(requires.get("env"), list) else []
-
-        if bins:
-            issues.append(
-                "Declared external binary dependencies: "
-                + ", ".join(str(item) for item in bins if str(item).strip())
-                + "; please ensure these commands are available before execution."
-            )
-        if envs:
-            issues.append(
-                "Declared environment variable dependencies: "
-                + ", ".join(str(item) for item in envs if str(item).strip())
-                + "; please configure these variables before execution."
-            )
-
-        if pkg.skill is not None and not issues:
-            return "native", "Native Aniu skill with directly callable tools.", issues
-        if pkg.skill is not None:
-            return "needs_attention", "Skill can be loaded, but there are extra runtime prerequisites to verify.", issues
-        if issues:
-            return "needs_attention", "Prompt-style skill is supported, but runtime prerequisites still need attention.", issues
-        return "prompt_only", "No Python handler was found; the skill will run through the shared skill runtime tools.", issues
-
     def _build_skill_info(self, pkg: Any, *, enabled: bool) -> dict[str, Any]:
-        meta_payload = _read_json_file(pkg.path / "_meta.json")
-        compatibility_level, compatibility_summary, issues = self._build_compatibility(pkg)
-        published_at = meta_payload.get("publishedAt")
-        published_at_value = None
-        if isinstance(published_at, (int, float)) and published_at > 0:
-            published_at_value = datetime.fromtimestamp(published_at / 1000, tz=UTC)
-
-        clawhub_slug = meta_payload.get("slug")
-        clawhub_slug_value = (
-            str(clawhub_slug).strip() if isinstance(clawhub_slug, str) and clawhub_slug.strip() else None
-        )
-        source_url = meta_payload.get("source_url")
-        source_url_value = (
-            str(source_url).strip() if isinstance(source_url, str) and source_url.strip() else None
-        )
-        return {
-            "id": pkg.id,
-            "name": pkg.name,
-            "description": pkg.description,
-            "location": str(pkg.path.resolve()),
-            "source": pkg.source,
-            "enabled": enabled,
-            "has_handler": pkg.skill is not None,
-            "tool_names": sorted(pkg.tool_names()),
-            "run_types": self._extract_run_types(pkg),
-            "category": self._extract_category(pkg),
-            "compatibility_level": compatibility_level,
-            "compatibility_summary": compatibility_summary,
-            "issues": issues,
-            "support_files": self._list_support_files(pkg),
-            "clawhub_slug": clawhub_slug_value,
-            "clawhub_version": (
-                str(meta_payload.get("version")).strip()
-                if meta_payload.get("version") is not None
-                else None
-            ),
-            "clawhub_url": (
-                source_url_value
-                if source_url_value
-                else (
-                    f"https://clawhub.ai/skills/{clawhub_slug_value}"
-                    if clawhub_slug_value
-                    else None
-                )
-            ),
-            "published_at": published_at_value,
-        }
+        return skill_stack_service.catalog.build_skill_info(pkg, enabled=enabled)
 
     def _build_skill_list_item(self, pkg: Any, *, enabled: bool) -> dict[str, Any]:
-        return {
-            "id": pkg.id,
-            "name": pkg.name,
-            "description": pkg.description,
-            "source": pkg.source,
-            "enabled": enabled,
-        }
+        return skill_stack_service.catalog.build_skill_list_item(pkg, enabled=enabled)
 
     def _sorted_packages(self) -> list[Any]:
         return sorted(

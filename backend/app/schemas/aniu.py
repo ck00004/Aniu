@@ -23,8 +23,8 @@ class AppSettingsBase(BaseModel):
     llm_model: str = Field(default="gpt-4o-mini", max_length=128)
     system_prompt: str = Field(max_length=20000)
     automation_session_id: int | None = None
-    automation_context_window_tokens: int | None = Field(default=65536, ge=4096)
-    automation_target_prompt_tokens: int | None = Field(default=24000, ge=1024)
+    automation_context_window_tokens: int | None = Field(default=131072, ge=4096)
+    automation_target_prompt_tokens: int | None = Field(default=111411, ge=1024)
     automation_recent_message_limit: int = Field(default=24, ge=4, le=200)
     automation_enable_auto_compaction: bool = True
     automation_idle_summary_hours: int = Field(default=12, ge=1, le=168)
@@ -54,6 +54,11 @@ class SkillListItemRead(BaseModel):
     description: str
     source: Literal["builtin", "workspace"]
     enabled: bool
+    layer: Literal["runtime", "standard"]
+    can_toggle: bool
+    can_delete: bool
+    policy_label: str
+    policy_summary: str
 
 
 class SkillInfoRead(SkillListItemRead):
