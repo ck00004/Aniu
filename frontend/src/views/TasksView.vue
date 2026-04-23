@@ -310,6 +310,22 @@
                  <div v-else-if="renderedOutputLoading" class="detail-empty-state">
                    正在渲染分析输出...
                  </div>
+                 <div v-else-if="displaySplitOutputVisible" class="output-panels">
+                   <section class="output-panel output-panel-original">
+                     <header class="output-panel-head">
+                       <span class="output-panel-eyebrow">一致性修正前</span>
+                       <h3 class="output-panel-title">原始分析</h3>
+                     </header>
+                     <div class="markdown-content output-panel-body" v-html="renderedOriginalOutputHtml"></div>
+                   </section>
+                   <section class="output-panel output-panel-revised">
+                     <header class="output-panel-head">
+                       <span class="output-panel-eyebrow">一致性修正后</span>
+                       <h3 class="output-panel-title">修正后结论</h3>
+                     </header>
+                     <div class="markdown-content output-panel-body" v-html="renderedRevisedOutputHtml"></div>
+                   </section>
+                 </div>
                  <div v-else class="markdown-content" v-html="renderedOutputHtml"></div>
                </div>
               </div>
@@ -370,6 +386,8 @@ const {
   selectedDate,
   errorMessage: analysisError,
   renderedOutputHtml,
+  renderedOriginalOutputHtml,
+  renderedRevisedOutputHtml,
   renderedOutputLoading,
   loadInitialRuns,
   selectRun,
@@ -652,6 +670,14 @@ const displaySelfSelectChangesVisible = computed(
 const displaySelfSelectAdditions = computed(() => selectedRun.value?.selfSelectAdditions ?? [])
 
 const displaySelfSelectRemovals = computed(() => selectedRun.value?.selfSelectRemovals ?? [])
+
+const displaySplitOutputVisible = computed(() =>
+  !liveVisible.value
+  && !activePreview.value
+  && !!selectedRun.value?.hasConsistencyRevision
+  && !!selectedRun.value?.originalOutput
+  && !!selectedRun.value?.revisedOutput,
+)
 
 const displayStatusDotClass = computed(() => {
   if (liveVisible.value) {
@@ -1195,6 +1221,63 @@ onBeforeUnmount(() => {
   background: rgba(15, 23, 42, 0.4);
 }
 
+.output-panels {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.output-panel {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid rgba(145, 170, 214, 0.14);
+  border-radius: 10px;
+  background: linear-gradient(180deg, rgba(17, 25, 40, 0.72), rgba(10, 15, 27, 0.62));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+}
+
+.output-panel-original {
+  border-color: rgba(148, 163, 184, 0.2);
+}
+
+.output-panel-revised {
+  border-color: rgba(56, 189, 248, 0.22);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.04),
+    0 0 0 1px rgba(56, 189, 248, 0.06);
+}
+
+.output-panel-head {
+  padding: 12px 14px 10px;
+  border-bottom: 1px solid rgba(145, 170, 214, 0.12);
+}
+
+.output-panel-eyebrow {
+  display: inline-block;
+  margin-bottom: 4px;
+  color: #8fb4df;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.output-panel-title {
+  margin: 0;
+  color: #eef6ff;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+
+.output-panel-body {
+  padding: 14px;
+}
+
 .markdown-content {
   flex: 1 1 auto;
   min-height: 0;
@@ -1276,6 +1359,12 @@ onBeforeUnmount(() => {
 .output-surface > .detail-empty-state {
   flex: 1 1 auto;
   min-height: 0;
+}
+
+@media (max-width: 1180px) {
+  .output-panels {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 .jin10-diagnostic-section {

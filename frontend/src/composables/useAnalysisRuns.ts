@@ -18,6 +18,9 @@ export interface AnalysisRunViewModel {
   rawToolPreviews: RawToolPreview[]
   tradeDetails: TradeDetail[]
   output: string | null
+  originalOutput: string | null
+  revisedOutput: string | null
+  hasConsistencyRevision: boolean
   summary: string
   detailLoaded: boolean
   jin10BaseUrl: string | null
@@ -33,6 +36,7 @@ export interface SelfSelectChange {
 }
 
 const RUNS_PAGE_SIZE = 100
+const CONSISTENCY_REVISION_MARKER = '[一致性检查修正说明]'
 
 function formatTokenValue(value: number | null | undefined) {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? String(value) : '--'
@@ -123,6 +127,38 @@ function getJin10SourceInfo(detail: RunDetail) {
   return {
     jin10BaseUrl: baseUrl ?? fullUrl,
     jin10SourceSummary: summary,
+  }
+}
+
+function getConsistencyOutputSections(detail: RunDetail) {
+  const decisionPayload = isRecord(detail.decision_payload) ? detail.decision_payload : null
+  const originalFromDecision = getStringValue(decisionPayload?.original_final_answer)
+  const finalAnswer = getStringValue(detail.final_answer)
+  const outputMarkdown = getStringValue(detail.output_markdown)
+  const errorMessage = getStringValue(detail.error_message)
+  const analysisSummary = getStringValue(detail.analysis_summary)
+  const fallbackOutput = outputMarkdown || finalAnswer || analysisSummary || errorMessage || '暂无分析输出'
+
+  if (!finalAnswer || !finalAnswer.includes(CONSISTENCY_REVISION_MARKER)) {
+    return {
+      output: fallbackOutput,
+      originalOutput: null,
+      revisedOutput: null,
+      hasConsistencyRevision: false,
+    }
+  }
+
+  const [beforeMarker, ...afterMarkerParts] = finalAnswer.split(CONSISTENCY_REVISION_MARKER)
+  const derivedOriginal = getStringValue(beforeMarker)
+  const revisedCandidate = getStringValue(afterMarkerParts.join(CONSISTENCY_REVISION_MARKER))
+  const originalOutput = originalFromDecision || derivedOriginal
+  const revisedOutput = revisedCandidate || finalAnswer
+
+  return {
+    output: fallbackOutput,
+    originalOutput,
+    revisedOutput,
+    hasConsistencyRevision: !!(originalOutput && revisedOutput),
   }
 }
 
@@ -422,6 +458,9 @@ function mapRunSummaryToViewModel(summary: RunSummary): AnalysisRunViewModel {
     rawToolPreviews: [],
     tradeDetails: [],
     output: null,
+    originalOutput: null,
+    revisedOutput: null,
+    hasConsistencyRevision: false,
     summary: summary.analysis_summary || '--',
     detailLoaded: false,
     jin10BaseUrl: null,
@@ -436,7 +475,7 @@ function mapRunDetailToViewModel(detail: RunDetail): AnalysisRunViewModel {
   const apiDetails = detail.api_details?.length ? detail.api_details : mapApiDetails(detail)
   const rawToolPreviews = Array.isArray(detail.raw_tool_previews) ? detail.raw_tool_previews : []
   const tradeDetails = detail.trade_details?.length ? detail.trade_details : mapTradeDetails(detail.trade_orders, detail.executed_actions)
-  const output = detail.output_markdown || detail.final_answer || detail.analysis_summary || detail.error_message || '暂无分析输出'
+  const outputSections = getConsistencyOutputSections(detail)
   const jin10SourceInfo = getJin10SourceInfo(detail)
   const selfSelectChanges = getSelfSelectChanges(detail)
 
@@ -455,7 +494,10 @@ function mapRunDetailToViewModel(detail: RunDetail): AnalysisRunViewModel {
     apiDetails,
     rawToolPreviews,
     tradeDetails,
-    output,
+    output: outputSections.output,
+    originalOutput: outputSections.originalOutput,
+    revisedOutput: outputSections.revisedOutput,
+    hasConsistencyRevision: outputSections.hasConsistencyRevision,
     summary: detail.analysis_summary || '--',
     detailLoaded: true,
     jin10BaseUrl: jin10SourceInfo.jin10BaseUrl,
@@ -492,6 +534,8 @@ export function useAnalysisRuns(options: {
   const selectedRun = ref<AnalysisRunViewModel | null>(null)
   const selectedRunLoading = ref(false)
   const renderedOutputHtml = ref('')
+  const renderedOriginalOutputHtml = ref('')
+  const renderedRevisedOutputHtml = ref('')
   const renderedOutputLoading = ref(false)
   const todayRuns = ref<AnalysisRunViewModel[]>([])
   const historyRuns = ref<AnalysisRunViewModel[]>([])
@@ -702,34 +746,50 @@ export function useAnalysisRuns(options: {
     return markdownRendererPromise
   }
 
-  async function renderSelectedOutput(content: string | null) {
+  async function renderMarkdownContent(content: string | null) {
     if (!content) {
-      renderedOutputHtml.value = ''
-      renderedOutputLoading.value = false
-      return
+      return ''
     }
 
     const cached = markdownCache.get(content)
     if (cached) {
-      renderedOutputHtml.value = cached
+      return cached
+    }
+
+    const renderMarkdown = await getMarkdownRenderer()
+    const sanitized = renderMarkdown(content)
+    markdownCache.set(content, sanitized)
+    return sanitized
+  }
+
+  async function renderSelectedOutput(run: AnalysisRunViewModel | null) {
+    if (!run) {
+      renderedOutputHtml.value = ''
+      renderedOriginalOutputHtml.value = ''
+      renderedRevisedOutputHtml.value = ''
       renderedOutputLoading.value = false
       return
     }
 
     renderedOutputLoading.value = true
-    const renderMarkdown = await getMarkdownRenderer()
-    const sanitized = renderMarkdown(content)
-    markdownCache.set(content, sanitized)
-    if (selectedRun.value?.output === content) {
-      renderedOutputHtml.value = sanitized
+    const [outputHtml, originalHtml, revisedHtml] = await Promise.all([
+      renderMarkdownContent(run.output),
+      renderMarkdownContent(run.originalOutput),
+      renderMarkdownContent(run.revisedOutput),
+    ])
+
+    if (selectedRun.value?.id === run.id) {
+      renderedOutputHtml.value = outputHtml
+      renderedOriginalOutputHtml.value = originalHtml
+      renderedRevisedOutputHtml.value = revisedHtml
       renderedOutputLoading.value = false
     }
   }
 
   watch(
-    () => selectedRun.value?.output ?? null,
-    (content) => {
-      void renderSelectedOutput(content)
+    () => selectedRun.value,
+    (run) => {
+      void renderSelectedOutput(run)
     },
     { immediate: true },
   )
@@ -760,6 +820,8 @@ export function useAnalysisRuns(options: {
     loading,
     errorMessage,
     renderedOutputHtml,
+    renderedOriginalOutputHtml,
+    renderedRevisedOutputHtml,
     renderedOutputLoading,
     loadInitialRuns,
     selectRun,

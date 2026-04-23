@@ -2625,6 +2625,30 @@ class AniuService:
             return answer
         return answer + SELF_SELECT_CONSISTENCY_WARNING
 
+    def _merge_consistency_followup_final_answer(
+        self,
+        original_final_answer: Any,
+        revised_final_answer: Any,
+    ) -> str:
+        original = str(original_final_answer or "").strip()
+        revised = str(revised_final_answer or "").strip()
+        if not original:
+            return revised
+        if not revised:
+            return original
+        if original == revised:
+            return revised
+        if revised in original:
+            return original
+        if original in revised:
+            return revised
+        return (
+            f"{original}\n\n"
+            "[一致性检查修正说明]\n"
+            "以下内容为系统在一致性检查后生成的修正版结论，请以修正版中的自选股变更结果和工具执行记录为准。\n\n"
+            f"{revised}"
+        )
+
     def _merge_llm_response_payloads(
         self, first_payload: Any, second_payload: Any
     ) -> dict[str, Any]:
@@ -2720,9 +2744,14 @@ class AniuService:
         merged_decision = dict(followup_decision)
         merged_decision["tool_calls"] = combined_tool_calls
         merged_executed_actions = self._extract_executed_actions(combined_tool_calls)
-        merged_decision["final_answer"] = self._finalize_self_select_consistency(
+        merged_decision["original_final_answer"] = str(final_answer or "").strip() or None
+        revised_final_answer = self._finalize_self_select_consistency(
             followup_decision.get("final_answer"),
             merged_executed_actions,
+        )
+        merged_decision["final_answer"] = self._merge_consistency_followup_final_answer(
+            final_answer,
+            revised_final_answer,
         )
 
         merged_runtime_trace = (

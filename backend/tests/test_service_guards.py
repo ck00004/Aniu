@@ -170,6 +170,26 @@ def test_finalize_self_select_consistency_keeps_answer_when_action_exists() -> N
     assert result == final_answer
 
 
+def test_merge_consistency_followup_final_answer_preserves_original_analysis() -> None:
+    original = "一、行情判断\n今天市场偏强。\n\n七、自选股维护结论\n新增自选股：光迅科技（002281）"
+    revised = "一、行情判断\n今天市场偏强。\n\n七、自选股维护结论\n本轮没有实际新增或移除任何自选股。"
+
+    result = aniu_service._merge_consistency_followup_final_answer(original, revised)
+
+    assert "今天市场偏强" in result
+    assert "[一致性检查修正说明]" in result
+    assert "本轮没有实际新增或移除任何自选股" in result
+
+
+def test_merge_consistency_followup_final_answer_keeps_revised_when_original_is_contained() -> None:
+    original = "今天市场偏强。"
+    revised = "今天市场偏强。\n\n补充结论：本轮没有实际新增或移除任何自选股。"
+
+    result = aniu_service._merge_consistency_followup_final_answer(original, revised)
+
+    assert result == revised
+
+
 def test_jin10_news_service_fetches_and_formats_context(monkeypatch) -> None:
     service = Jin10NewsService()
 

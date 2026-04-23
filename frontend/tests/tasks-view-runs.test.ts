@@ -15,7 +15,7 @@ test('tasks view does not render load-more buttons for today or history runs', (
 test('tasks view keeps the today run group visible while a live placeholder card exists', () => {
   const source = readFileSync(new URL('../src/views/TasksView.vue', import.meta.url), 'utf-8')
 
-  assert.match(source, /todayRuns\.length \|\| todaySuccessCount \|\| todayFailedCount \|\| livePlaceholderVisible/)
+  assert.match(source, /todayRuns\.length \|\| livePlaceholderVisible/)
 })
 
 test('analysis runs composable loads up to 100 runs per request without load-more pagination', () => {
@@ -25,4 +25,15 @@ test('analysis runs composable loads up to 100 runs per request without load-mor
   assert.match(source, /listRunsPage\(\{ limit: RUNS_PAGE_SIZE \}\)/)
   assert.doesNotMatch(source, /async function loadMoreTodayRuns/)
   assert.doesNotMatch(source, /async function loadMoreHistoryRuns/)
+})
+
+test('tasks view renders original and revised analysis panels after consistency correction', () => {
+  const viewSource = readFileSync(new URL('../src/views/TasksView.vue', import.meta.url), 'utf-8')
+  const composableSource = readFileSync(new URL('../src/composables/useAnalysisRuns.ts', import.meta.url), 'utf-8')
+
+  assert.match(viewSource, /原始分析/)
+  assert.match(viewSource, /修正后结论/)
+  assert.match(viewSource, /displaySplitOutputVisible/)
+  assert.match(composableSource, /original_final_answer/)
+  assert.match(composableSource, /CONSISTENCY_REVISION_MARKER/)
 })
