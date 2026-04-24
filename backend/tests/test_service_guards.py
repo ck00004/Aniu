@@ -9,6 +9,7 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from app.db.database import init_db
 from app.db.models import StrategySchedule
+from app.schemas.aniu import ScheduleUpdate
 from app.services.aniu_service import aniu_service
 from app.services.jin10_news_service import Jin10NewsService
 from app.services.mx_skill_service import mx_skill_service
@@ -118,10 +119,89 @@ def test_build_persistent_session_user_content_skips_self_select_guidance_for_tr
 
     assert "请根据持仓执行交易" in content
     assert "[Jin10 当天新闻参考]" in content
-    assert "mx_get_self_selects" not in content
-    assert "mx_search_news" not in content
-    assert "mx_screen_stocks" not in content
     assert "mx_manage_self_select" not in content
+    assert "mx_moni_trade" in content
+    assert "本轮未实际交易" in content
+
+
+def test_schedule_update_defaults_task_prompt_by_run_type() -> None:
+    analysis_payload = ScheduleUpdate(name="盘前分析", run_type="analysis")
+    trade_payload = ScheduleUpdate(name="上午运行1号", run_type="trade")
+
+    assert "自选股" in analysis_payload.task_prompt
+    assert "本轮未实际交易" in trade_payload.task_prompt
+
+
+def test_resolve_manual_run_profile_uses_run_type_specific_defaults() -> None:
+    analysis_settings = SimpleNamespace(task_prompt="")
+
+    analysis_run_type, analysis_prompt = aniu_service._resolve_manual_run_profile(
+        settings=analysis_settings,
+        manual_run_type=None,
+    )
+    trade_run_type, trade_prompt = aniu_service._resolve_manual_run_profile(
+        settings=analysis_settings,
+        manual_run_type="trade",
+    )
+
+    assert analysis_run_type == "analysis"
+    assert "自选股" in analysis_prompt
+    assert "模拟交易" not in analysis_prompt
+    assert trade_run_type == "trade"
+    assert "本轮未实际交易" in trade_prompt
+
+
+def test_list_schedules_upgrades_legacy_task_prompts(monkeypatch, tmp_path) -> None:
+    from app.core.config import get_settings
+    from app.db import database as database_module
+    from app.db.database import session_scope
+    from app.services.trading_calendar_service import trading_calendar_service
+
+    monkeypatch.setenv("SQLITE_DB_PATH", str(tmp_path / "guards-schedules.db"))
+    monkeypatch.setattr(
+        trading_calendar_service,
+        "warm_up_months",
+        lambda current: None,
+    )
+    get_settings.cache_clear()
+    database_module._engine = None
+    database_module._session_local = None
+    init_db()
+
+    with session_scope() as db:
+        db.add_all(
+            [
+                StrategySchedule(
+                    name="盘前分析",
+                    run_type="analysis",
+                    cron_expression="45 8 * * 1-5",
+                    task_prompt="请根据当前市场和持仓情况生成交易决策。",
+                    timeout_seconds=1800,
+                    enabled=False,
+                ),
+                StrategySchedule(
+                    name="上午运行1号",
+                    run_type="trade",
+                    cron_expression="30 9 * * 1-5",
+                    task_prompt="你正在执行盘中交易操作，你的唯一目标是追求收益最大化。",
+                    timeout_seconds=1800,
+                    enabled=False,
+                ),
+            ]
+        )
+
+    with session_scope() as db:
+        schedules = aniu_service.list_schedules(db)
+
+    analysis_schedule = next(item for item in schedules if item.run_type == "analysis")
+    trade_schedule = next(item for item in schedules if item.run_type == "trade")
+
+    assert "自选股" in str(analysis_schedule.task_prompt)
+    assert "本轮未实际交易" in str(trade_schedule.task_prompt)
+
+    database_module._engine = None
+    database_module._session_local = None
+    get_settings.cache_clear()
 
 
 def test_safe_prompt_budget_tracks_85_percent_of_max_context() -> None:
@@ -145,6 +225,22 @@ def test_extract_claimed_self_select_changes_detects_added_stock_from_final_answ
     assert {item["action"] for item in changes} == {"add"}
     assert any(item["target"] == "光迅科技" for item in changes)
     assert any(item["target"] == "002281" for item in changes)
+
+
+def test_extract_claimed_self_select_changes_treats_new_candidates_as_additions() -> None:
+    final_answer = """
+五、条件选股筛选后的新增候选结论
+其中，我认为今天最值得重点跟踪的新增候选只有3个：
+1. 亨通光电
+2. 三环集团
+3. 中船防务
+"""
+
+    changes = aniu_service._extract_claimed_self_select_changes(final_answer)
+
+    assert any(item["action"] == "add" and item["target"] == "亨通光电" for item in changes)
+    assert any(item["action"] == "add" and item["target"] == "三环集团" for item in changes)
+    assert any(item["action"] == "add" and item["target"] == "中船防务" for item in changes)
 
 
 def test_finalize_self_select_consistency_appends_warning_when_claim_has_no_action() -> None:
@@ -188,6 +284,31 @@ def test_merge_consistency_followup_final_answer_keeps_revised_when_original_is_
     result = aniu_service._merge_consistency_followup_final_answer(original, revised)
 
     assert result == revised
+
+
+def test_finalize_trade_consistency_appends_warning_when_claim_has_no_trade_action() -> None:
+    final_answer = "执行：卖出立讯精密 5000股"
+
+    result = aniu_service._finalize_trade_consistency(final_answer, [])
+
+    assert "系统一致性提示" in result
+    assert "mx_moni_trade" in result
+
+
+def test_finalize_trade_consistency_keeps_answer_when_trade_action_exists() -> None:
+    final_answer = "执行：卖出立讯精密 5000股"
+    executed_actions = [
+        {
+            "action": "SELL",
+            "symbol": "002475",
+            "name": "立讯精密",
+            "quantity": 5000,
+        }
+    ]
+
+    result = aniu_service._finalize_trade_consistency(final_answer, executed_actions)
+
+    assert result == final_answer
 
 
 def test_jin10_news_service_fetches_and_formats_context(monkeypatch) -> None:

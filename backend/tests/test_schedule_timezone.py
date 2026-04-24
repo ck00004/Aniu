@@ -287,6 +287,7 @@ def test_execute_run_failure_advances_schedule_window(monkeypatch, tmp_path) -> 
         lambda db: type("StubSettings", (), {
             "id": 1,
             "mx_api_key": "demo-key",
+            "jin10_api_base_url": None,
             "llm_base_url": "https://example.com/v1",
             "llm_api_key": "token",
             "llm_model": "demo-model",
@@ -369,6 +370,7 @@ def test_execute_run_failure_stops_retry_after_third_retry(monkeypatch, tmp_path
         lambda db: type("StubSettings", (), {
             "id": 1,
             "mx_api_key": "demo-key",
+            "jin10_api_base_url": None,
             "llm_base_url": "https://example.com/v1",
             "llm_api_key": "token",
             "llm_model": "demo-model",
@@ -437,6 +439,7 @@ def test_manual_failure_does_not_increment_retry_count(monkeypatch, tmp_path) ->
         lambda db: type("StubSettings", (), {
             "id": 1,
             "mx_api_key": "demo-key",
+            "jin10_api_base_url": None,
             "llm_base_url": "https://example.com/v1",
             "llm_api_key": "token",
             "llm_model": "demo-model",
@@ -666,6 +669,11 @@ def test_execute_run_rolls_back_partial_trade_orders_when_order_persist_fails(
 
     monkeypatch.setattr(aniu_service_module, "MXClient", StubClient)
     monkeypatch.setattr(
+        aniu_service_module.aniu_service,
+        "_prefetch_analysis_context",
+        lambda settings, emit=None: ("", None),
+    )
+    monkeypatch.setattr(
         aniu_service_module.llm_service,
         "run_agent_with_messages",
         fake_run_agent_with_messages,
@@ -679,6 +687,7 @@ def test_execute_run_rolls_back_partial_trade_orders_when_order_persist_fails(
             {
                 "id": 1,
                 "mx_api_key": "demo-key",
+                "jin10_api_base_url": None,
                 "llm_base_url": "https://example.com/v1",
                 "llm_api_key": "token",
                 "llm_model": "demo-model",
@@ -1178,6 +1187,7 @@ def test_execute_run_does_not_prefetch_account_before_agent(monkeypatch, tmp_pat
             {
                 "id": 1,
                 "mx_api_key": "demo-key",
+                "jin10_api_base_url": None,
                 "llm_base_url": "https://example.com/v1",
                 "llm_api_key": "token",
                 "llm_model": "demo-model",
@@ -1246,6 +1256,11 @@ def test_execute_run_does_not_prefetch_account_before_agent(monkeypatch, tmp_pat
 
     monkeypatch.setattr(aniu_service_module, "MXClient", StubClient)
     monkeypatch.setattr(
+        aniu_service_module.aniu_service,
+        "_prefetch_analysis_context",
+        lambda settings, emit=None: ("", None),
+    )
+    monkeypatch.setattr(
         aniu_service_module.llm_service,
         "run_agent_with_messages",
         fake_run_agent_with_messages,
@@ -1279,6 +1294,7 @@ def test_execute_run_passes_emit_when_run_agent_supports_it(monkeypatch, tmp_pat
             {
                 "id": 1,
                 "mx_api_key": "demo-key",
+                "jin10_api_base_url": None,
                 "llm_base_url": "https://example.com/v1",
                 "llm_api_key": "token",
                 "llm_model": "demo-model",
@@ -1343,6 +1359,7 @@ def test_manual_trade_run_overrides_default_run_type(monkeypatch, tmp_path) -> N
             {
                 "id": 1,
                 "mx_api_key": "demo-key",
+                "jin10_api_base_url": None,
                 "llm_base_url": "https://example.com/v1",
                 "llm_api_key": "token",
                 "llm_model": "demo-model",

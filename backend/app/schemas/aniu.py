@@ -5,6 +5,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.core.constants import normalize_schedule_task_prompt
+
 
 def _mask_key(value: str | None) -> str | None:
     if not value:
@@ -89,11 +91,17 @@ class ScheduleBase(BaseModel):
     name: str = Field(default="默认任务", max_length=64)
     run_type: Literal["analysis", "trade"] = "analysis"
     cron_expression: str = Field(default="*/30 * * * *", min_length=5, max_length=64)
-    task_prompt: str = Field(
-        default="请根据当前市场和持仓情况生成交易决策。", max_length=20000
-    )
+    task_prompt: str = Field(default="", max_length=20000)
     timeout_seconds: int = Field(default=1800, ge=5, le=3600)
     enabled: bool = False
+
+    @model_validator(mode="after")
+    def normalize_task_prompt(self) -> "ScheduleBase":
+        self.task_prompt = normalize_schedule_task_prompt(
+            self.run_type,
+            self.task_prompt,
+        )
+        return self
 
 
 class ScheduleRead(ScheduleBase):

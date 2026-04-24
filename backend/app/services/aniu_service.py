@@ -21,7 +21,11 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.core.auth import create_access_token
 from app.core.config import get_settings
-from app.core.constants import DEFAULT_SYSTEM_PROMPT
+from app.core.constants import (
+    DEFAULT_SYSTEM_PROMPT,
+    default_task_prompt,
+    normalize_schedule_task_prompt,
+)
 from app.db.database import session_scope
 from app.db.models import (
     AppSettings,
@@ -76,16 +80,34 @@ ANALYSIS_SELF_SELECT_GUIDANCE = """[分析执行要求]
 6. 对现有自选股中逻辑证伪、催化结束、关注价值下降、流动性明显不足或风险收益比恶化的股票，调用 mx_manage_self_select 从自选股移除。
 7. 如果没有找到合适的新标的，可以不新增；如果现有自选股仍应继续观察，可以不移除，但必须明确说明检查结论。
 8. 最终输出必须单独说明：新增自选股、移除自选股、继续保留观察的自选股，以及每只股票的跟踪理由与后续观察信号。"""
+TRADE_EXECUTION_GUIDANCE = """[交易执行要求]
+本轮属于交易任务，最终结论必须与真实交易执行完全一致：
+1. 必须先调用持仓、资产、委托或行情相关工具，再做买卖决策，不得跳过核验直接下结论。
+2. 如果你决定买入、卖出或撤单，必须调用 mx_moni_trade 或 mx_moni_cancel 执行实际操作，然后才能在最终结论中写“买入”“卖出”“撤单”“已执行”。
+3. 如果你没有实际调用交易工具，就不能在最终结论中声称已经下单、已经卖出、已经买入或已经撤单。
+4. 如果本轮只形成观察结论而不执行交易，必须明确写出“本轮未实际交易”。
+5. 最终输出必须单独说明：本轮实际交易动作、未执行原因、保留仓位与下一步观察条件。"""
 SELF_SELECT_CONSISTENCY_FOLLOWUP_PROMPT = """你刚才的最终结论里提到了自选股新增或移除，但当前工具执行记录没有对应的 mx_manage_self_select 操作。
 
 请立即进行一致性修正，且只能二选一：
 1. 如果你确认本轮确实应该新增或移除自选股，请立刻调用 mx_manage_self_select 完成实际操作，然后再给出最终结论。
-2. 如果你不打算实际执行自选股变更，请重写最终结论，明确说明本轮没有实际新增或移除任何自选股，不能再声称“已新增”“已移除”。
+2. 如果你不打算实际执行自选股变更，请重写最终结论，明确说明本轮没有实际新增或移除任何自选股，不能再声称“已新增”“已移除”，也不能把未加入自选的股票表述为“新增候选”“新增重点跟踪对象”或其他等价新增表述。
 
 注意：最终自然语言结论必须与真实工具执行结果完全一致。"""
 SELF_SELECT_CONSISTENCY_WARNING = (
     "\n\n[系统一致性提示] 本轮最终结论提到了自选股变更，但系统未实际调用 "
     "mx_manage_self_select，因此未发生系统内自选股新增或移除。请以“本轮自选股变更”和工具执行记录为准。"
+)
+TRADE_CONSISTENCY_FOLLOWUP_PROMPT = """你刚才的最终结论里提到了明确的买入、卖出或撤单动作，但当前工具执行记录没有对应的交易执行。
+
+请立即进行一致性修正，且只能二选一：
+1. 如果你确认本轮确实应该执行交易，请立刻调用 mx_moni_trade 或 mx_moni_cancel 完成实际操作，然后再给出最终结论。
+2. 如果你不打算实际执行交易，请重写最终结论，明确说明本轮未实际交易，不能再声称“已买入”“已卖出”“执行买入”“执行卖出”“执行撤单”。
+
+注意：最终自然语言结论必须与真实工具执行结果完全一致。"""
+TRADE_CONSISTENCY_WARNING = (
+    "\n\n[系统一致性提示] 本轮最终结论提到了交易执行，但系统未实际调用 "
+    "mx_moni_trade 或 mx_moni_cancel，因此未发生系统内实际下单或撤单。请以交易执行记录和工具调用结果为准。"
 )
 
 
@@ -262,20 +284,11 @@ class AniuService:
     ) -> tuple[str, str]:
         normalized = str(manual_run_type or "").strip().lower()
         if normalized == "trade":
-            return (
-                "trade",
-                "请根据当前市场、持仓和资金情况生成交易决策。"
-                "必要时调用妙想工具获取数据，并在满足条件时执行模拟交易。"
-                "最后用自然语言总结本次交易判断、依据和操作结果。",
-            )
+            return ("trade", default_task_prompt("trade"))
         task_prompt = str(getattr(settings, "task_prompt", "") or "").strip()
         if task_prompt:
             return ("analysis", task_prompt)
-        return (
-            "analysis",
-            "请先分析当前情况，必要时自行调用妙想工具获取数据，并在需要时执行模拟交易。"
-            "最后用自然语言总结本次判断、依据和操作结果。",
-        )
+        return ("analysis", default_task_prompt("analysis"))
 
     def _run_agent_supports_emit(self, run_agent: Any) -> bool:
         try:
@@ -364,8 +377,12 @@ class AniuService:
             if not schedule.cron_expression:
                 schedule.cron_expression = "*/30 * * * *"
                 mutated = True
-            if not schedule.task_prompt:
-                schedule.task_prompt = "请根据当前市场和持仓情况生成交易决策。"
+            normalized_task_prompt = normalize_schedule_task_prompt(
+                schedule.run_type,
+                schedule.task_prompt,
+            )
+            if schedule.task_prompt != normalized_task_prompt:
+                schedule.task_prompt = normalized_task_prompt
                 mutated = True
             if not schedule.timeout_seconds or schedule.timeout_seconds <= 0:
                 schedule.timeout_seconds = 1800
@@ -387,7 +404,7 @@ class AniuService:
                 name="默认任务",
                 run_type="analysis",
                 cron_expression="*/30 * * * *",
-                task_prompt="请根据当前市场和持仓情况生成交易决策。",
+                task_prompt=default_task_prompt("analysis"),
                 timeout_seconds=1800,
                 enabled=False,
             )
@@ -442,6 +459,11 @@ class AniuService:
 
             for field, value in data.items():
                 setattr(instance, field, value)
+
+            instance.task_prompt = normalize_schedule_task_prompt(
+                instance.run_type,
+                instance.task_prompt,
+            )
 
             if instance.run_type == "analysis" and instance.name in ANALYSIS_TASK_NAMES:
                 parsed_time = _extract_fixed_analysis_time(instance.cron_expression)
@@ -1938,6 +1960,21 @@ class AniuService:
                     runtime_trace=runtime_trace,
                     emit=_emit,
                 )
+                (
+                    decision,
+                    llm_request,
+                    llm_response,
+                    runtime_trace,
+                    executed_actions,
+                ) = self._enforce_trade_consistency(
+                    settings=settings,
+                    client=client,
+                    decision=decision,
+                    llm_request=llm_request,
+                    llm_response=llm_response,
+                    runtime_trace=runtime_trace,
+                    emit=_emit,
+                )
             finally:
                 client.close()
 
@@ -2549,6 +2586,15 @@ class AniuService:
                 for target in mentions:
                     _push("remove", target, line)
                 continue
+            if any(
+                token in compact
+                for token in ("新增候选", "新增关注", "新增重点跟踪", "重点跟踪的新增候选")
+            ):
+                current_action = "add"
+                mentions = self._extract_stock_mentions(line)
+                for target in mentions:
+                    _push("add", target, line)
+                continue
 
             if current_action and re.match(r"^[-*\d一二三四五六七八九十].*", line):
                 mentions = self._extract_stock_mentions(line)
@@ -2565,7 +2611,109 @@ class AniuService:
                 for target in self._extract_stock_mentions(segment):
                     _push(action, target, segment)
 
+        for matched in re.finditer(r"(?:新增候选|新增关注|新增重点跟踪对象?)[:：]?([^。；;\n]+)", text):
+            segment = matched.group(1)
+            for target in self._extract_stock_mentions(segment):
+                _push("add", target, segment)
+
         return changes
+
+    def _extract_claimed_trade_changes(self, final_answer: Any) -> list[dict[str, str]]:
+        text = str(final_answer or "").strip()
+        if not text:
+            return []
+
+        changes: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        conditional_markers = ("若", "如果", "如", "观察", "计划", "预案", "等待", "可能", "考虑")
+
+        def _push(action: str, target: str, raw: str) -> None:
+            normalized_target = self._clean_self_select_target(target)
+            if not normalized_target:
+                return
+            key = (action, normalized_target)
+            if key in seen:
+                return
+            seen.add(key)
+            changes.append({"action": action, "target": normalized_target, "raw_query": raw})
+
+        patterns: list[tuple[str, re.Pattern[str]]] = [
+            ("BUY", re.compile(r"(?:^|[：:\-\s]|执行[：:]?)((?:直接)?买入|加仓)\s*([A-Za-z\u4e00-\u9fa5]{2,20})(?:\s*[（(]\s*(\d{6})\s*[)）])?")),
+            ("SELL", re.compile(r"(?:^|[：:\-\s]|执行[：:]?)((?:直接)?卖出|先卖|优先卖|减仓)\s*([A-Za-z\u4e00-\u9fa5]{2,20})(?:\s*[（(]\s*(\d{6})\s*[)）])?")),
+            ("CANCEL", re.compile(r"(?:^|[：:\-\s]|执行[：:]?)((?:直接)?撤单|撤销)\s*([A-Za-z\u4e00-\u9fa5]{2,20})?")),
+        ]
+
+        for raw_line in text.splitlines():
+            line = str(raw_line or "").strip()
+            if not line:
+                continue
+            if any(marker in line for marker in conditional_markers):
+                continue
+            for action, pattern in patterns:
+                match = pattern.search(line)
+                if not match:
+                    continue
+                target = match.group(2) or "委托"
+                _push(action, target, line)
+                code = match.group(3)
+                if code:
+                    _push(action, code, line)
+
+        return changes
+
+    def _extract_actual_trade_changes(
+        self, executed_actions: list[dict[str, Any]] | Any
+    ) -> list[dict[str, str]]:
+        if not isinstance(executed_actions, list):
+            return []
+        changes: list[dict[str, str]] = []
+        for item in executed_actions:
+            if not isinstance(item, dict):
+                continue
+            action = str(item.get("action") or "").upper()
+            if action not in {"BUY", "SELL", "CANCEL"}:
+                continue
+            symbol = str(item.get("symbol") or "").strip()
+            name = str(item.get("name") or "").strip()
+            if symbol:
+                changes.append({"action": action, "target": symbol, "raw_query": symbol})
+            if name:
+                changes.append({"action": action, "target": name, "raw_query": name})
+        return changes
+
+    def _has_trade_consistency_gap(
+        self, final_answer: Any, executed_actions: list[dict[str, Any]] | Any
+    ) -> bool:
+        claimed_changes = self._extract_claimed_trade_changes(final_answer)
+        if not claimed_changes:
+            return False
+
+        actual_changes = self._extract_actual_trade_changes(executed_actions)
+        if not actual_changes:
+            return True
+
+        actual_targets_by_action: dict[str, set[str]] = {
+            "BUY": set(),
+            "SELL": set(),
+            "CANCEL": set(),
+        }
+        for item in actual_changes:
+            action = item.get("action")
+            target = self._clean_self_select_target(item.get("target"))
+            if action in actual_targets_by_action and target:
+                actual_targets_by_action[action].add(target)
+                actual_targets_by_action[action].update(self._extract_stock_mentions(target))
+
+        for item in claimed_changes:
+            action = item.get("action")
+            target = self._clean_self_select_target(item.get("target"))
+            if action not in actual_targets_by_action:
+                continue
+            claimed_tokens = {target}
+            claimed_tokens.update(self._extract_stock_mentions(target))
+            if claimed_tokens.isdisjoint(actual_targets_by_action[action]):
+                return True
+        return False
 
     def _extract_actual_self_select_changes(
         self, executed_actions: list[dict[str, Any]] | Any
@@ -2624,6 +2772,18 @@ class AniuService:
         if SELF_SELECT_CONSISTENCY_WARNING.strip() in answer:
             return answer
         return answer + SELF_SELECT_CONSISTENCY_WARNING
+
+    def _finalize_trade_consistency(
+        self, final_answer: Any, executed_actions: list[dict[str, Any]] | Any
+    ) -> str:
+        answer = str(final_answer or "").strip()
+        if not answer:
+            return answer
+        if not self._has_trade_consistency_gap(answer, executed_actions):
+            return answer
+        if TRADE_CONSISTENCY_WARNING.strip() in answer:
+            return answer
+        return answer + TRADE_CONSISTENCY_WARNING
 
     def _merge_consistency_followup_final_answer(
         self,
@@ -2685,6 +2845,11 @@ class AniuService:
         dict[str, Any],
         list[dict[str, Any]],
     ]:
+        if str(getattr(settings, "run_type", "analysis") or "analysis").strip() == "trade":
+            tool_calls = decision.get("tool_calls")
+            executed_actions = self._extract_executed_actions(tool_calls)
+            return dict(decision), llm_request, llm_response, runtime_trace, executed_actions
+
         _emit = emit if callable(emit) else (lambda *_a, **_kw: None)
         tool_calls = decision.get("tool_calls")
         executed_actions = self._extract_executed_actions(tool_calls)
@@ -2746,6 +2911,114 @@ class AniuService:
         merged_executed_actions = self._extract_executed_actions(combined_tool_calls)
         merged_decision["original_final_answer"] = str(final_answer or "").strip() or None
         revised_final_answer = self._finalize_self_select_consistency(
+            followup_decision.get("final_answer"),
+            merged_executed_actions,
+        )
+        merged_decision["final_answer"] = self._merge_consistency_followup_final_answer(
+            final_answer,
+            revised_final_answer,
+        )
+
+        merged_runtime_trace = (
+            dict(followup_runtime_trace) if isinstance(followup_runtime_trace, dict) else {}
+        )
+        merged_runtime_trace["messages"] = (
+            followup_runtime_trace.get("messages")
+            if isinstance(followup_runtime_trace, dict)
+            else followup_messages
+        )
+
+        merged_llm_request = {
+            "initial_request": llm_request,
+            "consistency_followup_request": followup_request,
+        }
+        merged_llm_response = self._merge_llm_response_payloads(llm_response, followup_response)
+        return (
+            merged_decision,
+            merged_llm_request,
+            merged_llm_response,
+            merged_runtime_trace,
+            merged_executed_actions,
+        )
+
+    def _enforce_trade_consistency(
+        self,
+        *,
+        settings: Any,
+        client: MXClient,
+        decision: dict[str, Any],
+        llm_request: dict[str, Any],
+        llm_response: dict[str, Any],
+        runtime_trace: dict[str, Any],
+        emit: Any = None,
+    ) -> tuple[
+        dict[str, Any],
+        dict[str, Any],
+        dict[str, Any],
+        dict[str, Any],
+        list[dict[str, Any]],
+    ]:
+        _emit = emit if callable(emit) else (lambda *_a, **_kw: None)
+        tool_calls = decision.get("tool_calls")
+        executed_actions = self._extract_executed_actions(tool_calls)
+        final_answer = decision.get("final_answer")
+
+        if not self._has_trade_consistency_gap(final_answer, executed_actions):
+            normalized_decision = dict(decision)
+            normalized_decision["final_answer"] = self._finalize_trade_consistency(
+                final_answer,
+                executed_actions,
+            )
+            return (
+                normalized_decision,
+                llm_request,
+                llm_response,
+                runtime_trace,
+                executed_actions,
+            )
+
+        messages = runtime_trace.get("messages") if isinstance(runtime_trace, dict) else None
+        if not isinstance(messages, list) or not messages:
+            normalized_decision = dict(decision)
+            normalized_decision["final_answer"] = self._finalize_trade_consistency(
+                final_answer,
+                executed_actions,
+            )
+            return normalized_decision, llm_request, llm_response, runtime_trace, executed_actions
+
+        _emit(
+            "stage",
+            stage="llm",
+            message="检测到交易结论与实际执行不一致，正在请求模型纠正",
+        )
+        followup_messages = [dict(item) for item in messages]
+        followup_messages.append(
+            {
+                "role": "user",
+                "content": TRADE_CONSISTENCY_FOLLOWUP_PROMPT,
+            }
+        )
+        followup_decision, followup_request, followup_response, followup_runtime_trace = (
+            llm_service.run_agent_with_messages(
+                app_settings=settings,
+                client=client,
+                messages=followup_messages,
+                emit=emit,
+            )
+        )
+
+        combined_tool_calls: list[dict[str, Any]] = []
+        if isinstance(tool_calls, list):
+            combined_tool_calls.extend(tool_calls)
+        followup_tool_calls = followup_decision.get("tool_calls")
+        if isinstance(followup_tool_calls, list):
+            combined_tool_calls.extend(followup_tool_calls)
+
+        merged_decision = dict(followup_decision)
+        merged_decision["tool_calls"] = combined_tool_calls
+        merged_executed_actions = self._extract_executed_actions(combined_tool_calls)
+        merged_decision["original_final_answer"] = str(final_answer or "").strip() or None
+        revised_final_answer = self._finalize_trade_consistency(
             followup_decision.get("final_answer"),
             merged_executed_actions,
         )
@@ -2945,16 +3218,19 @@ class AniuService:
         extra_context = str(prefetched_context or "").strip()
         if extra_context:
             lines.extend(["", extra_context])
-        analysis_guidance = self._build_analysis_self_select_guidance(run_type=run_type)
-        if analysis_guidance:
-            lines.extend(["", analysis_guidance])
+        run_type_guidance = self._build_run_type_guidance(run_type=run_type)
+        if run_type_guidance:
+            lines.extend(["", run_type_guidance])
         del settings, schedule_name
         return "\n".join(lines).strip()
 
-    def _build_analysis_self_select_guidance(self, *, run_type: str) -> str:
-        if str(run_type or "").strip() != "analysis":
-            return ""
-        return ANALYSIS_SELF_SELECT_GUIDANCE
+    def _build_run_type_guidance(self, *, run_type: str) -> str:
+        normalized = str(run_type or "").strip()
+        if normalized == "analysis":
+            return ANALYSIS_SELF_SELECT_GUIDANCE
+        if normalized == "trade":
+            return TRADE_EXECUTION_GUIDANCE
+        return ""
 
     def _build_persistent_session_assistant_content(
         self,

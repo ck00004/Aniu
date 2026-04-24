@@ -11,7 +11,7 @@ from app.core.config import get_settings
 from app.core.rate_limit import _limiter
 from app.db import database as database_module
 from app.db.database import session_scope
-from app.db.models import ChatMessageRecord, ChatSession, StrategyRun, StrategySchedule
+from app.db.models import ChatMessageRecord, ChatSession, StrategyRun, StrategySchedule, TradeOrder
 from app.main import create_app
 from app.services.aniu_service import aniu_service
 from app.services.llm_service import llm_service
@@ -219,6 +219,164 @@ def test_manual_runs_share_automation_session_with_scheduled_runs(monkeypatch, t
             assert len(messages) == 4
             assert [item.role for item in messages] == ["user", "assistant", "user", "assistant"]
             assert any(record.run_id == manual_run.id for record in messages)
+
+    reset_db_state()
+
+
+def test_analysis_schedule_followup_adds_self_select_when_new_candidates_are_claimed(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    captured_messages: list[list[dict[str, object]]] = []
+
+    def fake_run_agent_with_messages(*, messages, **kwargs):
+        del kwargs
+        captured_messages.append(messages)
+        if len(captured_messages) == 1:
+            return (
+                {
+                    "final_answer": (
+                        "五、条件选股筛选后的新增候选结论\n"
+                        "其中，我认为今天最值得重点跟踪的新增候选只有3个：\n"
+                        "1. 亨通光电\n2. 三环集团\n3. 中船防务"
+                    ),
+                    "tool_calls": [
+                        {"name": "mx_get_self_selects", "result": {"ok": True, "summary": "已查询自选股列表。"}},
+                        {"name": "mx_search_news", "result": {"ok": True, "summary": "已查询资讯。"}},
+                        {"name": "mx_screen_stocks", "result": {"ok": True, "summary": "已执行选股。"}},
+                    ],
+                },
+                {"messages": []},
+                {"responses": [], "final_message": {"content": "first"}},
+                {"messages": messages},
+            )
+        return (
+            {
+                "final_answer": "已将亨通光电加入自选，作为新增重点跟踪标的。",
+                "tool_calls": [
+                    {
+                        "name": "mx_manage_self_select",
+                        "result": {
+                            "ok": True,
+                            "summary": "已加入自选。",
+                            "executed_action": {
+                                "action": "MANAGE_SELF_SELECT",
+                                "query": "将亨通光电加入自选股",
+                            },
+                        },
+                    }
+                ],
+            },
+            {"messages": []},
+            {"responses": [], "final_message": {"content": "followup"}},
+            {"messages": messages},
+        )
+
+    monkeypatch.setattr(llm_service, "run_agent_with_messages", fake_run_agent_with_messages)
+    monkeypatch.setattr(
+        aniu_service,
+        "_prefetch_analysis_context",
+        lambda **kwargs: ("[Jin10 当天新闻参考]\n1. [09:30:00] 新闻A", {"ok": True}),
+    )
+
+    with create_test_client(monkeypatch, tmp_path):
+        with session_scope() as db:
+            settings = aniu_service.get_or_create_settings(db)
+            settings.mx_api_key = "mx-key"
+            settings.llm_base_url = "https://example.com/v1"
+            settings.llm_api_key = "llm-key"
+            settings.llm_model = "demo-model"
+            schedule = _prepare_schedule(db, name="盘前分析", run_type="analysis")
+            schedule_id = schedule.id
+
+        run = aniu_service.execute_run(trigger_source="schedule", schedule_id=schedule_id)
+
+        assert len(captured_messages) == 2
+        assert "新增候选" in str(captured_messages[1][-1].get("content") or "")
+        assert run.executed_actions is not None
+        assert any(str(item.get("action") or "") == "MANAGE_SELF_SELECT" for item in run.executed_actions)
+        assert run.decision_payload is not None
+        assert run.decision_payload.get("original_final_answer")
+        assert "一致性检查修正说明" in str(run.final_answer or "")
+
+    reset_db_state()
+
+
+def test_trade_schedule_followup_executes_trade_when_final_answer_claims_sell(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    captured_messages: list[list[dict[str, object]]] = []
+
+    def fake_run_agent_with_messages(*, messages, **kwargs):
+        del kwargs
+        captured_messages.append(messages)
+        if len(captured_messages) == 1:
+            return (
+                {
+                    "final_answer": "09:30这一轮直接结论：\n- 先卖立讯精密\n\n执行：\n- 卖出 立讯精密 5000股",
+                    "tool_calls": [],
+                },
+                {"messages": []},
+                {"responses": [], "final_message": {"content": "first"}},
+                {"messages": messages},
+            )
+        return (
+            {
+                "final_answer": "已实际提交卖出立讯精密 5000股委托。",
+                "tool_calls": [
+                    {
+                        "name": "mx_moni_trade",
+                        "result": {
+                            "ok": True,
+                            "summary": "已提交卖出委托。",
+                            "executed_action": {
+                                "action": "SELL",
+                                "symbol": "002475",
+                                "name": "立讯精密",
+                                "quantity": 5000,
+                                "price_type": "MARKET",
+                            },
+                            "result": {"order_id": "SELL-1"},
+                        },
+                    }
+                ],
+            },
+            {"messages": []},
+            {"responses": [], "final_message": {"content": "followup"}},
+            {"messages": messages},
+        )
+
+    monkeypatch.setattr(llm_service, "run_agent_with_messages", fake_run_agent_with_messages)
+    monkeypatch.setattr(
+        aniu_service,
+        "_prefetch_analysis_context",
+        lambda **kwargs: (None, None),
+    )
+
+    with create_test_client(monkeypatch, tmp_path):
+        with session_scope() as db:
+            settings = aniu_service.get_or_create_settings(db)
+            settings.mx_api_key = "mx-key"
+            settings.llm_base_url = "https://example.com/v1"
+            settings.llm_api_key = "llm-key"
+            settings.llm_model = "demo-model"
+            schedule = _prepare_schedule(db, name="上午运行1号", run_type="trade")
+            schedule_id = schedule.id
+
+        run = aniu_service.execute_run(trigger_source="schedule", schedule_id=schedule_id)
+
+        assert len(captured_messages) == 2
+        assert "未实际交易" in str(captured_messages[1][-1].get("content") or "")
+        assert run.executed_actions is not None
+        assert any(str(item.get("action") or "") == "SELL" for item in run.executed_actions)
+        with session_scope() as db:
+            stored_run = db.get(StrategyRun, run.id)
+            orders = db.query(TradeOrder).filter(TradeOrder.run_id == run.id).all()
+            assert stored_run is not None
+            assert len(orders) == 1
+            assert orders[0].action == "SELL"
+        assert "一致性检查修正说明" in str(run.final_answer or "")
 
     reset_db_state()
 
