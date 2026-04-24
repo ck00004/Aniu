@@ -25,8 +25,17 @@ export interface AnalysisRunViewModel {
   detailLoaded: boolean
   jin10BaseUrl: string | null
   jin10SourceSummary: string | null
+  jin10DiagnosisText: string | null
+  jin10Metrics: DiagnosticMetric[]
+  jin10FailureReason: string | null
   selfSelectAdditions: SelfSelectChange[]
   selfSelectRemovals: SelfSelectChange[]
+}
+
+export interface DiagnosticMetric {
+  label: string
+  value: string
+  tone?: 'default' | 'warning'
 }
 
 export interface SelfSelectChange {
@@ -58,6 +67,10 @@ function getNumberValue(value: unknown) {
   return value
 }
 
+function formatMetricNumber(value: number | null) {
+  return typeof value === 'number' ? String(value) : null
+}
+
 function normalizeJin10BaseUrl(url: string | null) {
   if (!url) {
     return null
@@ -82,6 +95,9 @@ function getJin10SourceInfo(detail: RunDetail) {
     return {
       jin10BaseUrl: null,
       jin10SourceSummary: null,
+      jin10DiagnosisText: null,
+      jin10Metrics: [],
+      jin10FailureReason: null,
     }
   }
 
@@ -92,10 +108,20 @@ function getJin10SourceInfo(detail: RunDetail) {
   const itemCount = getNumberValue(prefetchedContext.item_count)
   const total = getNumberValue(prefetchedContext.total)
   const hasMore = typeof prefetchedContext.has_more === 'boolean' ? prefetchedContext.has_more : null
+  const requestCount = getNumberValue(prefetchedContext.request_count)
   const params = isRecord(prefetchedContext.params) ? prefetchedContext.params : null
+  const analysisMeta = isRecord(prefetchedContext.analysis_meta)
+    ? prefetchedContext.analysis_meta
+    : null
   const date = getStringValue(params?.date)
   const startTime = getStringValue(params?.startTime)
   const endTime = getStringValue(params?.endTime)
+  const diagnosisText = getStringValue(prefetchedContext.analysis_text)
+  const analysisSummary = getStringValue(analysisMeta?.summary)
+  const analysisError = getStringValue(analysisMeta?.failure_reason) || getStringValue(analysisMeta?.error)
+  const chunkCount = getNumberValue(analysisMeta?.chunk_count)
+  const analysisStatus = getStringValue(analysisMeta?.status)
+  const fallbackUsed = typeof analysisMeta?.fallback_used === 'boolean' ? analysisMeta.fallback_used : null
 
   const segments: string[] = []
   if (date) {
@@ -115,18 +141,85 @@ function getJin10SourceInfo(detail: RunDetail) {
     segments.push(countText)
   }
 
+  const metrics: DiagnosticMetric[] = []
+  const fetchCountParts: string[] = []
+  const itemCountText = formatMetricNumber(itemCount)
+  if (itemCountText) {
+    fetchCountParts.push(itemCountText)
+  }
+  const totalText = formatMetricNumber(total)
+  if (totalText && totalText !== itemCountText) {
+    fetchCountParts.push(`总量 ${totalText}`)
+  }
+  if (fetchCountParts.length) {
+    metrics.push({
+      label: '抓取条数',
+      value: fetchCountParts.join(' / '),
+    })
+  }
+  const requestCountText = formatMetricNumber(requestCount)
+  if (requestCountText) {
+    metrics.push({
+      label: '分页请求数',
+      value: requestCountText,
+    })
+  }
+  const chunkCountText = formatMetricNumber(chunkCount)
+  if (chunkCountText) {
+    metrics.push({
+      label: '分块数',
+      value: chunkCountText,
+    })
+  }
+  if (analysisStatus) {
+    const statusLabelMap: Record<string, string> = {
+      ok: '诊断完成',
+      no_items: '无可用新闻',
+      fetch_failed: '抓取失败',
+      llm_unavailable: '模型未配置',
+      failed: '诊断失败',
+      fallback_raw_context: '诊断失败，已回退',
+    }
+    metrics.push({
+      label: '诊断状态',
+      value: statusLabelMap[analysisStatus] ?? analysisStatus,
+      tone: analysisStatus === 'ok' || analysisStatus === 'no_items' ? 'default' : 'warning',
+    })
+  }
+  if (fallbackUsed) {
+    metrics.push({
+      label: '回退策略',
+      value: '已回退为原始新闻摘录',
+      tone: 'warning',
+    })
+  }
+  if (hasMore === true) {
+    metrics.push({
+      label: '拉取完整性',
+      value: '仍有后续分页未合并',
+      tone: 'warning',
+    })
+  }
+
   let summary = '已注入 Jin10 新闻上下文'
   if (ok === false) {
     summary = error ? `拉取失败：${error}` : '拉取失败'
+  } else if (analysisError) {
+    summary = `已拉取 Jin10 新闻，但诊断失败：${analysisError}`
   } else if (ok === true && segments.length) {
     summary = segments.join('；')
   } else if (segments.length) {
     summary = segments.join('；')
   }
 
+  const finalDiagnosisText = diagnosisText || analysisSummary
+
   return {
     jin10BaseUrl: baseUrl ?? fullUrl,
     jin10SourceSummary: summary,
+    jin10DiagnosisText: finalDiagnosisText,
+    jin10Metrics: metrics,
+    jin10FailureReason: analysisError || (ok === false ? error : null),
   }
 }
 
@@ -465,6 +558,9 @@ function mapRunSummaryToViewModel(summary: RunSummary): AnalysisRunViewModel {
     detailLoaded: false,
     jin10BaseUrl: null,
     jin10SourceSummary: null,
+    jin10DiagnosisText: null,
+    jin10Metrics: [],
+    jin10FailureReason: null,
     selfSelectAdditions: [],
     selfSelectRemovals: [],
   }
@@ -502,6 +598,9 @@ function mapRunDetailToViewModel(detail: RunDetail): AnalysisRunViewModel {
     detailLoaded: true,
     jin10BaseUrl: jin10SourceInfo.jin10BaseUrl,
     jin10SourceSummary: jin10SourceInfo.jin10SourceSummary,
+    jin10DiagnosisText: jin10SourceInfo.jin10DiagnosisText,
+    jin10Metrics: jin10SourceInfo.jin10Metrics,
+    jin10FailureReason: jin10SourceInfo.jin10FailureReason,
     selfSelectAdditions: selfSelectChanges.additions,
     selfSelectRemovals: selfSelectChanges.removals,
   }

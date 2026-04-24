@@ -311,7 +311,7 @@ def test_finalize_trade_consistency_keeps_answer_when_trade_action_exists() -> N
     assert result == final_answer
 
 
-def test_jin10_news_service_fetches_and_formats_context(monkeypatch) -> None:
+def test_jin10_news_service_fetches_raw_news_items(monkeypatch) -> None:
     service = Jin10NewsService()
 
     class FakeResponse:
@@ -326,7 +326,6 @@ def test_jin10_news_service_fetches_and_formats_context(monkeypatch) -> None:
                         "time": "09:31:00",
                         "title": "央行公开市场操作",
                         "content": "今日净投放资金，市场流动性边际改善。",
-                        "analysis": "有助于提升风险偏好，券商和金融权重或受提振。",
                         "important": True,
                         "createdAt": 1776821460000,
                     }
@@ -345,7 +344,7 @@ def test_jin10_news_service_fetches_and_formats_context(monkeypatch) -> None:
 
     monkeypatch.setattr("app.services.jin10_news_service.httpx.get", fake_get)
 
-    context, meta = service.fetch_news_context(
+    items, meta = service.fetch_news_items(
         base_url="http://127.0.0.1:3000",
         target_day=date(2026, 4, 22),
         current_time=datetime(2026, 4, 22, 14, 30),
@@ -359,14 +358,15 @@ def test_jin10_news_service_fetches_and_formats_context(monkeypatch) -> None:
         "startTime": "00:00:00",
         "endTime": "14:30:00",
         "limit": "10",
-        "includeAnalysis": "1",
-        "importantOnly": "1",
     }
     assert captured["timeout"] == 3
-    assert context is not None
-    assert "Jin10 当天新闻参考" in context
-    assert "央行公开市场操作" in context
-    assert "Jin10解读" in context
+    assert items == [
+        {
+            "time": "09:31:00",
+            "title": "央行公开市场操作",
+            "content": "今日净投放资金，市场流动性边际改善。",
+        }
+    ]
     assert meta is not None
     assert meta["ok"] is True
 
@@ -398,7 +398,6 @@ def test_jin10_news_service_fetches_all_pages(monkeypatch) -> None:
                             "time": "09:31:00",
                             "title": "新闻A",
                             "content": "内容A",
-                            "analysis": "解读A",
                             "important": True,
                             "createdAt": 1776821460000,
                         },
@@ -407,7 +406,6 @@ def test_jin10_news_service_fetches_all_pages(monkeypatch) -> None:
                             "time": "09:25:00",
                             "title": "新闻B",
                             "content": "内容B",
-                            "analysis": "解读B",
                             "important": True,
                             "createdAt": 1776821100000,
                         },
@@ -424,7 +422,6 @@ def test_jin10_news_service_fetches_all_pages(monkeypatch) -> None:
                         "time": "09:10:00",
                         "title": "新闻C",
                         "content": "内容C",
-                        "analysis": "解读C",
                         "important": True,
                         "createdAt": 1776820200000,
                     }
@@ -436,7 +433,7 @@ def test_jin10_news_service_fetches_all_pages(monkeypatch) -> None:
 
     monkeypatch.setattr("app.services.jin10_news_service.httpx.get", fake_get)
 
-    context, meta = service.fetch_news_context(
+    items, meta = service.fetch_news_items(
         base_url="http://127.0.0.1:3000",
         target_day=date(2026, 4, 22),
         current_time=datetime(2026, 4, 22, 14, 30),
@@ -448,15 +445,60 @@ def test_jin10_news_service_fetches_all_pages(monkeypatch) -> None:
     assert calls[0]["params"]["limit"] == "2"
     assert "before" not in calls[0]["params"]
     assert calls[1]["params"]["before"] == "1776821100000"
-    assert context is not None
-    assert "新闻A" in context
-    assert "新闻B" in context
-    assert "新闻C" in context
+    assert [item["title"] for item in items] == ["新闻A", "新闻B", "新闻C"]
     assert meta is not None
     assert meta["ok"] is True
     assert meta["item_count"] == 3
     assert meta["total"] == 3
     assert meta["has_more"] is False
+
+
+def test_analyze_jin10_news_builds_diagnosis(monkeypatch) -> None:
+    captured_messages: list[list[dict[str, str]]] = []
+
+    def fake_generate_text(**kwargs):
+        captured_messages.append(kwargs["messages"])
+        return (
+            "市场总览：政策偏暖，风险偏好修复。\nA股重点方向：券商；金融市场联动：汇率压力缓和。\n交易观察：关注成交量验证。\n风险提示：海外扰动仍在。",
+            {"messages": kwargs["messages"]},
+            {"choices": [{"message": {"content": "ok"}}]},
+        )
+
+    monkeypatch.setattr(llm_service, "generate_text", fake_generate_text)
+
+    text, meta = aniu_service._analyze_jin10_news(
+        settings=SimpleNamespace(
+            llm_model="demo-model",
+            llm_base_url="https://example.com/v1",
+            llm_api_key="llm-key",
+            timeout_seconds=60,
+        ),
+        items=[
+            {
+                "time": "09:30:00",
+                "title": "央行公开市场操作",
+                "content": "流动性边际改善。",
+            },
+            {
+                "time": "10:00:00",
+                "title": "科技政策推进",
+                "content": "自主可控方向继续强化。",
+            },
+        ],
+        target_day=date(2026, 4, 22),
+        current_time=datetime(2026, 4, 22, 14, 30),
+        emit=None,
+    )
+
+    assert text is not None
+    assert "市场总览" in text
+    assert meta is not None
+    assert meta["ok"] is True
+    assert meta["status"] == "ok"
+    assert meta["item_count"] == 2
+    assert meta["chunk_count"] == 1
+    assert len(captured_messages) == 1
+    assert "Jin10 新闻原文" in str(captured_messages[0][0]["content"])
 
 
 def test_infer_run_type_recovers_trade_runs_from_schedule_name() -> None:

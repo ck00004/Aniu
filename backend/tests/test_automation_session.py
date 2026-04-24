@@ -381,6 +381,88 @@ def test_trade_schedule_followup_executes_trade_when_final_answer_claims_sell(
     reset_db_state()
 
 
+def test_schedule_run_injects_jin10_news_diagnosis_into_messages_and_payload(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    captured_messages: list[list[dict[str, object]]] = []
+
+    def fake_run_agent_with_messages(*, messages, **kwargs):
+        del kwargs
+        captured_messages.append(messages)
+        return _fake_run_result("scheduled decision")
+
+    def fake_fetch_news_items(**kwargs):
+        del kwargs
+        return (
+            [
+                {
+                    "time": "09:31:00",
+                    "title": "央行公开市场操作",
+                    "content": "流动性边际改善。",
+                },
+                {
+                    "time": "10:02:00",
+                    "title": "科技产业政策推进",
+                    "content": "自主可控方向继续强化。",
+                },
+            ],
+            {
+                "ok": True,
+                "url": "http://127.0.0.1:3000/api/news",
+                "params": {
+                    "date": "2026-04-22",
+                    "startTime": "00:00:00",
+                    "endTime": "14:30:00",
+                    "limit": "30",
+                },
+                "item_count": 2,
+                "total": 2,
+                "has_more": False,
+            },
+        )
+
+    def fake_generate_text(**kwargs):
+        del kwargs
+        return (
+            "市场总览：政策偏暖，风险偏好改善。\nA股重点方向：券商、科技自主可控。\n金融市场联动：汇率压力缓和。\n交易观察：关注量价验证。\n风险提示：海外波动。",
+            {"messages": []},
+            {"choices": [{"message": {"content": "ok"}}]},
+        )
+
+    monkeypatch.setattr(llm_service, "run_agent_with_messages", fake_run_agent_with_messages)
+    monkeypatch.setattr(
+        "app.services.jin10_news_service.jin10_news_service.fetch_news_items",
+        fake_fetch_news_items,
+    )
+    monkeypatch.setattr(llm_service, "generate_text", fake_generate_text)
+
+    with create_test_client(monkeypatch, tmp_path):
+        with session_scope() as db:
+            settings = aniu_service.get_or_create_settings(db)
+            settings.mx_api_key = "mx-key"
+            settings.llm_base_url = "https://example.com/v1"
+            settings.llm_api_key = "llm-key"
+            settings.llm_model = "demo-model"
+            schedule = _prepare_schedule(db, name="盘前分析", run_type="analysis")
+            schedule_id = schedule.id
+
+        run = aniu_service.execute_run(trigger_source="schedule", schedule_id=schedule_id)
+
+        assert len(captured_messages) == 1
+        assert any(
+            "[Jin10 新闻诊断]" in str(msg.get("content") or "")
+            for msg in captured_messages[0]
+        )
+        assert run.skill_payloads is not None
+        prefetched = run.skill_payloads.get("prefetched_context")
+        assert isinstance(prefetched, dict)
+        assert "analysis_text" in prefetched
+        assert "A股重点方向" in str(prefetched.get("analysis_text") or "")
+
+    reset_db_state()
+
+
 def test_scheduled_runs_can_read_prior_manual_history(monkeypatch, tmp_path) -> None:
     captured_messages: list[list[dict[str, object]]] = []
 

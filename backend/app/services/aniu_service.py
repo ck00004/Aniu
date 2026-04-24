@@ -109,6 +109,19 @@ TRADE_CONSISTENCY_WARNING = (
     "\n\n[系统一致性提示] 本轮最终结论提到了交易执行，但系统未实际调用 "
     "mx_moni_trade 或 mx_moni_cancel，因此未发生系统内实际下单或撤单。请以交易执行记录和工具调用结果为准。"
 )
+JIN10_NEWS_ANALYSIS_SYSTEM_PROMPT = """你是负责盘前/盘中情报研判的专业市场策略分析师。
+你的任务是只基于给定的 Jin10 新闻原文，提炼对 A股市场和金融市场最重要的影响。
+严格要求：
+1. 只能依据输入新闻做归纳，不得编造未出现的信息。
+2. 优先关注宏观政策、监管、产业政策、汇率利率、大宗商品、海外市场联动、券商银行、科技制造、地产链、消费、军工与风险偏好变化。
+3. 输出必须服务于后续分析任务和交易任务，强调“可能影响哪些板块/资产、为何影响、还需验证什么”。
+4. 若新闻噪音较多，要主动去噪，只保留真正可能影响 A股或金融市场定价的信号。"""
+JIN10_NEWS_ANALYSIS_OUTPUT_FORMAT = """请严格使用以下结构输出：
+市场总览：用 3-5 句概括今日新闻流对 A股与金融市场的主导影响。
+A股重点方向：列出 3-5 个最值得关注的方向或板块，并写明驱动原因。
+金融市场联动：说明对利率、汇率、商品、港股、美股或风险偏好的联动影响；若不明显请明确写“不明显”。
+交易观察：给出 3-5 条可供后续分析/交易任务直接使用的观察点，强调需要结合盘口、量价、公告或持仓验证。
+风险提示：指出最值得警惕的 2-3 个不确定性或反转风险。"""
 
 
 @dataclass
@@ -1879,7 +1892,7 @@ class AniuService:
             return None, None
 
         _emit("stage", stage="news", message="正在获取 Jin10 当天新闻")
-        context_text, meta = jin10_news_service.fetch_news_context(
+        items, meta = jin10_news_service.fetch_news_items(
             base_url=str(base_url),
             target_day=current_time.date(),
             current_time=current_time,
@@ -1888,9 +1901,237 @@ class AniuService:
                 getattr(settings, "jin10_api_timeout_seconds", 5) or 5
             ),
         )
-        if context_text:
-            _emit("stage", stage="news", message="已注入 Jin10 当天新闻")
-        return context_text, meta
+        if not meta or meta.get("ok") is False:
+            if isinstance(meta, dict):
+                meta = dict(meta)
+                meta["analysis_meta"] = {
+                    "ok": False,
+                    "status": "fetch_failed",
+                    "item_count": 0,
+                    "chunk_count": 0,
+                    "fallback_used": False,
+                    "failure_reason": meta.get("error"),
+                }
+            return None, meta
+
+        analysis_text, analysis_meta = self._analyze_jin10_news(
+            settings=settings,
+            items=items,
+            target_day=current_time.date(),
+            current_time=current_time,
+            emit=emit,
+        )
+        combined_meta = dict(meta)
+        combined_meta["analysis_text"] = analysis_text
+        combined_meta["analysis_meta"] = dict(analysis_meta or {})
+
+        if analysis_text:
+            combined_meta["analysis_meta"]["status"] = "ok"
+            combined_meta["analysis_meta"]["fallback_used"] = False
+            context_text = self._build_jin10_analysis_context_text(
+                analysis_text=analysis_text,
+                item_count=len(items),
+                target_day=current_time.date(),
+                current_time=current_time,
+            )
+            _emit("stage", stage="news", message="已注入 Jin10 新闻诊断")
+            return context_text, combined_meta
+
+        raw_context = jin10_news_service.build_raw_context_text(
+            items,
+            target_day=current_time.date(),
+            current_time=current_time,
+        )
+        combined_meta["analysis_meta"]["fallback_used"] = bool(raw_context)
+        if raw_context and combined_meta["analysis_meta"].get("status") not in {
+            "no_items",
+            "fetch_failed",
+        }:
+            combined_meta["analysis_meta"]["status"] = "fallback_raw_context"
+        if raw_context:
+            _emit("stage", stage="news", message="Jin10 新闻诊断失败，已回退为原始新闻摘录")
+        return raw_context, combined_meta
+
+    def _analyze_jin10_news(
+        self,
+        *,
+        settings: Any,
+        items: list[dict[str, str]],
+        target_day: date,
+        current_time: datetime,
+        emit: Any,
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        _emit = emit if callable(emit) else (lambda *_a, **_kw: None)
+        if not items:
+            return None, {
+                "ok": True,
+                "status": "no_items",
+                "item_count": 0,
+                "chunk_count": 0,
+                "fallback_used": False,
+                "failure_reason": None,
+                "summary": "当天暂无可用于诊断的 Jin10 新闻。",
+            }
+        if not getattr(settings, "llm_base_url", None) or not getattr(
+            settings,
+            "llm_api_key",
+            None,
+        ):
+            return None, {
+                "ok": False,
+                "status": "llm_unavailable",
+                "item_count": len(items),
+                "chunk_count": 0,
+                "fallback_used": False,
+                "failure_reason": "未配置大模型接口，无法生成 Jin10 新闻诊断。",
+                "error": "未配置大模型接口，无法生成 Jin10 新闻诊断。",
+            }
+
+        chunks = jin10_news_service.build_analysis_chunks(items)
+        chunk_outputs: list[str] = []
+        try:
+            for index, chunk in enumerate(chunks, start=1):
+                _emit(
+                    "stage",
+                    stage="news",
+                    message=f"正在分析 Jin10 新闻（{index}/{len(chunks)}）",
+                )
+                chunk_text, _request_payload, _response_payload = llm_service.generate_text(
+                    model=str(getattr(settings, "llm_model", "") or ""),
+                    base_url=str(getattr(settings, "llm_base_url", "") or ""),
+                    api_key=str(getattr(settings, "llm_api_key", "") or ""),
+                    system_prompt=JIN10_NEWS_ANALYSIS_SYSTEM_PROMPT,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": self._build_jin10_chunk_analysis_prompt(
+                                chunk_text=chunk,
+                                chunk_index=index,
+                                chunk_total=len(chunks),
+                                item_count=len(items),
+                                target_day=target_day,
+                                current_time=current_time,
+                            ),
+                        }
+                    ],
+                    timeout_seconds=int(getattr(settings, "timeout_seconds", 60) or 60),
+                    run_type=None,
+                    emit=None,
+                )
+                chunk_outputs.append(chunk_text)
+
+            if len(chunk_outputs) == 1:
+                final_text = chunk_outputs[0]
+            else:
+                _emit("stage", stage="news", message="正在汇总 Jin10 新闻诊断")
+                final_text, _request_payload, _response_payload = llm_service.generate_text(
+                    model=str(getattr(settings, "llm_model", "") or ""),
+                    base_url=str(getattr(settings, "llm_base_url", "") or ""),
+                    api_key=str(getattr(settings, "llm_api_key", "") or ""),
+                    system_prompt=JIN10_NEWS_ANALYSIS_SYSTEM_PROMPT,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": self._build_jin10_merge_analysis_prompt(
+                                chunk_outputs=chunk_outputs,
+                                item_count=len(items),
+                                target_day=target_day,
+                                current_time=current_time,
+                            ),
+                        }
+                    ],
+                    timeout_seconds=int(getattr(settings, "timeout_seconds", 60) or 60),
+                    run_type=None,
+                    emit=None,
+                )
+
+            final_summary = self._summarize_jin10_analysis(final_text)
+            return final_text, {
+                "ok": True,
+                "status": "ok",
+                "item_count": len(items),
+                "chunk_count": len(chunks),
+                "fallback_used": False,
+                "failure_reason": None,
+                "summary": final_summary,
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("jin10 news analysis failed: %s", exc)
+            return None, {
+                "ok": False,
+                "status": "failed",
+                "item_count": len(items),
+                "chunk_count": len(chunks),
+                "fallback_used": False,
+                "failure_reason": str(exc),
+                "error": str(exc),
+            }
+
+    def _build_jin10_chunk_analysis_prompt(
+        self,
+        *,
+        chunk_text: str,
+        chunk_index: int,
+        chunk_total: int,
+        item_count: int,
+        target_day: date,
+        current_time: datetime,
+    ) -> str:
+        return (
+            f"以下是 {target_day.isoformat()} 截至 {current_time.strftime('%H:%M:%S')} 的 Jin10 新闻原文"
+            f"（第 {chunk_index}/{chunk_total} 批，共 {item_count} 条新闻的一部分）。\n\n"
+            f"{chunk_text}\n\n"
+            "请只基于这些新闻原文，提炼这批新闻对 A股市场和金融市场的影响。\n"
+            f"{JIN10_NEWS_ANALYSIS_OUTPUT_FORMAT}"
+        )
+
+    def _build_jin10_merge_analysis_prompt(
+        self,
+        *,
+        chunk_outputs: list[str],
+        item_count: int,
+        target_day: date,
+        current_time: datetime,
+    ) -> str:
+        parts = []
+        for index, output in enumerate(chunk_outputs, start=1):
+            parts.append(f"第 {index} 批诊断：\n{output}")
+        joined = "\n\n".join(parts)
+        return (
+            f"以下是 {target_day.isoformat()} 截至 {current_time.strftime('%H:%M:%S')} 的 Jin10 新闻分批诊断结果。"
+            f"请合并为一份最终结论，共对应 {item_count} 条新闻。\n\n"
+            f"{joined}\n\n"
+            "请去重、消除矛盾，保留真正对 A股和金融市场有定价意义的信息。\n"
+            f"{JIN10_NEWS_ANALYSIS_OUTPUT_FORMAT}"
+        )
+
+    def _build_jin10_analysis_context_text(
+        self,
+        *,
+        analysis_text: str,
+        item_count: int,
+        target_day: date,
+        current_time: datetime,
+    ) -> str:
+        return (
+            "[Jin10 新闻诊断]\n"
+            f"日期：{target_day.isoformat()}，截至 {current_time.strftime('%H:%M:%S')}，"
+            f"系统已全量扫描 {item_count} 条 Jin10 新闻原文（time/title/content）并完成预分析。\n"
+            "以下诊断优先从 A股市场与金融市场角度提炼影响，请继续结合行情、盘口、公告、持仓和工具结果交叉验证：\n\n"
+            f"{str(analysis_text or '').strip()}"
+        ).strip()
+
+    def _summarize_jin10_analysis(self, analysis_text: Any) -> str | None:
+        text = str(analysis_text or "").strip()
+        if not text:
+            return None
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if not lines:
+            return None
+        summary = "；".join(lines[:2])
+        if len(summary) <= 160:
+            return summary
+        return summary[:157].rstrip() + "..."
 
     def _run_body(
         self,

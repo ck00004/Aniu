@@ -274,6 +274,48 @@ class LLMService:
         )
         return result["final_answer"] or "模型本轮未返回可展示内容。"
 
+    def generate_text(
+        self,
+        *,
+        model: str,
+        base_url: str,
+        api_key: str,
+        system_prompt: str | None,
+        messages: list[dict[str, str]],
+        timeout_seconds: int = 60,
+        run_type: str | None = None,
+        emit: Any = None,
+        cancel_event: threading.Event | None = None,
+    ) -> tuple[str, dict[str, Any], dict[str, Any]]:
+        payload_messages: list[dict[str, Any]] = []
+        effective_system_prompt = self._augment_system_prompt(
+            system_prompt,
+            run_type=run_type,
+        )
+        if effective_system_prompt:
+            payload_messages.append(
+                {"role": "system", "content": effective_system_prompt}
+            )
+        payload_messages.extend(dict(message) for message in messages)
+
+        payload = {
+            "model": model,
+            "temperature": _LLM_TEMPERATURE,
+            "messages": payload_messages,
+        }
+        response_payload = self._call_llm_stream(
+            base_url=base_url,
+            api_key=api_key,
+            payload=payload,
+            timeout_seconds=timeout_seconds,
+            emit=emit,
+            cancel_event=cancel_event,
+        )
+        choices = response_payload.get("choices") or []
+        message = choices[0].get("message") if choices and isinstance(choices[0], dict) else {}
+        final_text = _to_text_content(message.get("content")) or "模型本轮未返回可展示内容。"
+        return final_text, payload, response_payload
+
     def build_initial_request_payload(self, app_settings: Any) -> dict[str, Any]:
         run_type = str(getattr(app_settings, "run_type", "analysis") or "analysis")
         system_prompt = self._augment_system_prompt(

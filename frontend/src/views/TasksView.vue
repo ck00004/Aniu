@@ -242,6 +242,25 @@
                   <span class="source-diagnostic-label">本轮 Jin10 新闻来源</span>
                   <span class="source-diagnostic-value" :title="displayJin10SourceSummary">{{ displayJin10SourceSummary }}</span>
                 </div>
+                <div v-if="displayJin10Metrics.length" class="source-diagnostic-metrics">
+                  <div
+                    v-for="metric in displayJin10Metrics"
+                    :key="`${metric.label}-${metric.value}`"
+                    class="source-diagnostic-metric"
+                    :class="metric.tone === 'warning' ? 'warning' : ''"
+                  >
+                    <span class="source-diagnostic-metric-label">{{ metric.label }}</span>
+                    <span class="source-diagnostic-metric-value">{{ metric.value }}</span>
+                  </div>
+                </div>
+                <div v-if="displayJin10FailureReason" class="source-diagnostic-block source-diagnostic-failure">
+                  <div class="source-diagnostic-label block">诊断失败原因</div>
+                  <div class="source-diagnostic-text">{{ displayJin10FailureReason }}</div>
+                </div>
+                <div v-if="displayJin10DiagnosisText" class="source-diagnostic-block">
+                  <div class="source-diagnostic-label block">本轮 Jin10 新闻诊断</div>
+                  <div class="source-diagnostic-text">{{ displayJin10DiagnosisText }}</div>
+                </div>
               </div>
             </div>
 
@@ -656,12 +675,24 @@ const displayOutputTokens = computed(() => displayTokenSource.value?.outputToken
 const displayTotalTokens = computed(() => displayTokenSource.value?.totalTokens ?? '--')
 
 const displayJin10SourceVisible = computed(
-  () => !liveVisible.value && (!!selectedRun.value?.jin10BaseUrl || !!selectedRun.value?.jin10SourceSummary),
+  () => !liveVisible.value && (
+    !!selectedRun.value?.jin10BaseUrl
+    || !!selectedRun.value?.jin10SourceSummary
+    || !!selectedRun.value?.jin10DiagnosisText
+    || !!selectedRun.value?.jin10FailureReason
+    || !!selectedRun.value?.jin10Metrics.length
+  ),
 )
 
 const displayJin10BaseUrl = computed(() => selectedRun.value?.jin10BaseUrl ?? '')
 
 const displayJin10SourceSummary = computed(() => selectedRun.value?.jin10SourceSummary ?? '')
+
+const displayJin10DiagnosisText = computed(() => selectedRun.value?.jin10DiagnosisText ?? '')
+
+const displayJin10Metrics = computed(() => selectedRun.value?.jin10Metrics ?? [])
+
+const displayJin10FailureReason = computed(() => selectedRun.value?.jin10FailureReason ?? '')
 
 const displaySelfSelectChangesVisible = computed(
   () => !liveVisible.value && !!selectedRun.value?.detailLoaded,
@@ -1378,11 +1409,50 @@ onBeforeUnmount(() => {
   background: rgba(15, 23, 42, 0.32);
 }
 
+.source-diagnostic-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.source-diagnostic-metric {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  border-radius: 12px;
+  background: rgba(58, 80, 120, 0.24);
+  border: 1px solid rgba(145, 170, 214, 0.1);
+}
+
+.source-diagnostic-metric.warning {
+  background: rgba(120, 74, 40, 0.2);
+  border-color: rgba(245, 158, 11, 0.2);
+}
+
+.source-diagnostic-metric-label {
+  color: #8ea4c5;
+  font-size: 10px;
+  line-height: 1.2;
+}
+
+.source-diagnostic-metric-value {
+  color: #f8fafc;
+  font-size: 12px;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
 .source-diagnostic-title {
   margin-bottom: 8px;
   color: #dbeafe;
   font-size: 11px;
   font-weight: 600;
+
+.source-diagnostic-failure {
+  border-top-color: rgba(245, 158, 11, 0.18);
+}
   letter-spacing: 0.06em;
 }
 
@@ -1396,16 +1466,34 @@ onBeforeUnmount(() => {
   margin-top: 8px;
 }
 
+.source-diagnostic-block {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(145, 170, 214, 0.12);
+}
+
 .source-diagnostic-label {
   color: #8ea4c5;
   font-size: 10px;
   line-height: 1.2;
 }
 
+.source-diagnostic-label.block {
+  margin-bottom: 6px;
+}
+
 .source-diagnostic-value {
   color: #f8fafc;
   font-size: 11px;
   line-height: 1.45;
+  word-break: break-word;
+}
+
+.source-diagnostic-text {
+  color: #e2e8f0;
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: pre-wrap;
   word-break: break-word;
 }
 

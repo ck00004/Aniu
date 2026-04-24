@@ -37,3 +37,20 @@ test('tasks view renders original and revised analysis panels after consistency 
   assert.match(composableSource, /original_final_answer/)
   assert.match(composableSource, /CONSISTENCY_REVISION_MARKER/)
 })
+
+test('tasks view renders Jin10 diagnosis text from prefetched analysis metadata', () => {
+  const viewSource = readFileSync(new URL('../src/views/TasksView.vue', import.meta.url), 'utf-8')
+  const composableSource = readFileSync(new URL('../src/composables/useAnalysisRuns.ts', import.meta.url), 'utf-8')
+
+  assert.match(viewSource, /本轮 Jin10 新闻诊断/)
+  assert.match(viewSource, /displayJin10DiagnosisText/)
+  assert.match(viewSource, /诊断失败原因/)
+  assert.match(viewSource, /displayJin10Metrics/)
+  assert.match(viewSource, /source-diagnostic-metric-label/)
+  assert.match(composableSource, /analysis_text/)
+  assert.match(composableSource, /analysis_meta/)
+  assert.match(composableSource, /label: '抓取条数'/)
+  assert.match(composableSource, /request_count/)
+  assert.match(composableSource, /chunk_count/)
+  assert.match(composableSource, /jin10FailureReason/)
+})

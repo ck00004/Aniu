@@ -13,10 +13,12 @@ logger = logging.getLogger(__name__)
 _DEFAULT_TIMEOUT_SECONDS = 5.0
 _DEFAULT_LIMIT = 30
 _MAX_PAGE_SIZE = 200
-_MAX_FETCH_ITEMS = 1000
+_RAW_NEWS_ITEM_MAX_CHARS = 4000
 _CONTENT_PREVIEW_MAX_CHARS = 180
 _ANALYSIS_PREVIEW_MAX_CHARS = 160
 _CONTEXT_MAX_ITEMS = 200
+_ANALYSIS_CHUNK_MAX_CHARS = 24000
+_RAW_CONTEXT_MAX_ITEMS = 80
 
 
 def _compact_text(value: Any, *, limit: int) -> str:
@@ -27,7 +29,7 @@ def _compact_text(value: Any, *, limit: int) -> str:
 
 
 class Jin10NewsService:
-    def fetch_news_context(
+    def fetch_news_items(
         self,
         *,
         base_url: str | None,
@@ -35,10 +37,10 @@ class Jin10NewsService:
         current_time: datetime,
         limit: int = _DEFAULT_LIMIT,
         timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
-    ) -> tuple[str | None, dict[str, Any] | None]:
+    ) -> tuple[list[dict[str, str]], dict[str, Any] | None]:
         endpoint_base = str(base_url or "").strip().rstrip("/")
         if not endpoint_base:
-            return None, None
+            return [], None
 
         page_size = max(1, min(int(limit or _DEFAULT_LIMIT), _MAX_PAGE_SIZE))
         params = {
@@ -46,8 +48,6 @@ class Jin10NewsService:
             "startTime": "00:00:00",
             "endTime": current_time.strftime("%H:%M:%S"),
             "limit": str(page_size),
-            "includeAnalysis": "1",
-            "importantOnly": "1",
         }
         url = endpoint_base + "/api/news"
 
@@ -59,7 +59,7 @@ class Jin10NewsService:
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("jin10 news fetch failed: %s", exc)
-            return None, {
+            return [], {
                 "ok": False,
                 "url": url,
                 "error": str(exc),
@@ -69,34 +69,86 @@ class Jin10NewsService:
         items = payload.get("items") if isinstance(payload, dict) else None
         if not isinstance(items, list):
             logger.warning("jin10 news payload missing items list")
-            return None, {
+            return [], {
                 "ok": False,
                 "url": url,
                 "error": "响应缺少 items 列表",
                 "params": params,
             }
 
-        usable_items: list[dict[str, Any]] = []
+        usable_items: list[dict[str, str]] = []
         for item in items:
             if not isinstance(item, dict):
                 continue
             if item.get("skipped") or item.get("deleted"):
                 continue
-            usable_items.append(item)
+            normalized = self._normalize_item(item)
+            if normalized is None:
+                continue
+            usable_items.append(normalized)
 
-        context = self._build_context_text(
-            usable_items,
-            target_day=target_day,
-            current_time=current_time,
-        )
-        return context, {
+        return usable_items, {
             "ok": True,
             "url": url,
             "params": params,
             "item_count": len(usable_items),
             "total": payload.get("total") if isinstance(payload, dict) else None,
             "has_more": payload.get("hasMore") if isinstance(payload, dict) else None,
+            "request_count": payload.get("requestCount") if isinstance(payload, dict) else None,
         }
+
+    def build_analysis_chunks(self, items: list[dict[str, str]]) -> list[str]:
+        chunks: list[str] = []
+        current_lines: list[str] = []
+        current_chars = 0
+
+        for index, item in enumerate(items, start=1):
+            line = self._format_analysis_item_line(item, index=index)
+            if current_lines and current_chars + len(line) + 1 > _ANALYSIS_CHUNK_MAX_CHARS:
+                chunks.append("\n\n".join(current_lines))
+                current_lines = []
+                current_chars = 0
+            current_lines.append(line)
+            current_chars += len(line) + 2
+
+        if current_lines:
+            chunks.append("\n\n".join(current_lines))
+
+        return chunks
+
+    def build_raw_context_text(
+        self,
+        items: list[dict[str, str]],
+        *,
+        target_day: date,
+        current_time: datetime,
+    ) -> str | None:
+        if not items:
+            return None
+
+        lines = [
+            "[Jin10 当天新闻原文摘录]",
+            (
+                f"日期：{target_day.isoformat()}，截至"
+                f" {current_time.strftime('%H:%M:%S')}，"
+                f"共拉取 {len(items)} 条新闻。"
+            ),
+            "以下为 Jin10 原始新闻摘录，请结合市场数据和量价信号交叉验证。",
+            "",
+        ]
+
+        for index, item in enumerate(items[:_RAW_CONTEXT_MAX_ITEMS], start=1):
+            lines.append(self._format_raw_context_item(item, index=index))
+
+        if len(items) > _RAW_CONTEXT_MAX_ITEMS:
+            lines.extend(
+                [
+                    "",
+                    f"其余 {len(items) - _RAW_CONTEXT_MAX_ITEMS} 条原始新闻已省略。",
+                ]
+            )
+
+        return "\n\n".join(lines).strip()
 
     def _fetch_all_pages(
         self,
@@ -109,6 +161,7 @@ class Jin10NewsService:
         seen_keys: set[str] = set()
         next_before: str | None = None
         request_count = 0
+        last_total: int | None = None
         max_retries = 3
         retry_delay = 1.0
 
@@ -156,8 +209,6 @@ class Jin10NewsService:
                     continue
                 seen_keys.add(item_key)
                 aggregated_items.append(item)
-                if len(aggregated_items) >= _MAX_FETCH_ITEMS:
-                    break
 
             total_value = payload.get("total")
             if isinstance(total_value, int):
@@ -166,7 +217,7 @@ class Jin10NewsService:
                 last_total = int(total_value)
 
             page_has_more = bool(payload.get("hasMore"))
-            if len(aggregated_items) >= _MAX_FETCH_ITEMS or not page_has_more:
+            if not page_has_more:
                 break
 
             next_cursor = self._extract_before_cursor(items)
@@ -212,45 +263,38 @@ class Jin10NewsService:
                 return str(numeric)
         return None
 
-    def _build_context_text(
-        self,
-        items: list[dict[str, Any]],
-        *,
-        target_day: date,
-        current_time: datetime,
-    ) -> str | None:
-        if not items:
+    def _normalize_item(self, item: dict[str, Any]) -> dict[str, str] | None:
+        time_text = str(item.get("time") or "--").strip() or "--"
+        title = " ".join(str(item.get("title") or "").split()).strip()
+        content = " ".join(str(item.get("content") or "").split()).strip()
+        if not title and not content:
             return None
+        merged = content
+        if len(merged) > _RAW_NEWS_ITEM_MAX_CHARS:
+            merged = merged[: _RAW_NEWS_ITEM_MAX_CHARS - 3] + "..."
+        return {
+            "time": time_text,
+            "title": title,
+            "content": merged,
+        }
 
-        lines = [
-            "[Jin10 当天新闻参考]",
-            (
-                f"日期：{target_day.isoformat()}，截至"
-                f" {current_time.strftime('%H:%M:%S')}，"
-                f"共获取 {len(items)} 条重要新闻。"
-            ),
-            "以下新闻仅作为辅助参考，请结合市场数据、行情、持仓和量价信号综合判断。",
-            "",
-        ]
+    def _format_analysis_item_line(self, item: dict[str, str], *, index: int) -> str:
+        title = item.get("title") or item.get("content") or "--"
+        content = item.get("content") or title
+        if title == content:
+            return f"{index}. [{item.get('time') or '--'}] {title}"
+        return (
+            f"{index}. [{item.get('time') or '--'}] 标题：{title}\n"
+            f"正文：{content}"
+        )
 
-        for index, item in enumerate(items[:_CONTEXT_MAX_ITEMS], start=1):
-            time_text = str(item.get("time") or "--").strip()
-            title = _compact_text(item.get("title") or item.get("content") or "", limit=120)
-            content = _compact_text(item.get("content") or "", limit=_CONTENT_PREVIEW_MAX_CHARS)
-            lines.append(f"{index}. [{time_text}] {title}")
-            if content and content != title:
-                lines.append(f"   内容：{content}")
-            analysis = _compact_text(item.get("analysis") or "", limit=_ANALYSIS_PREVIEW_MAX_CHARS)
-            if analysis:
-                lines.append(f"   Jin10解读：{analysis}")
-
-        if len(items) > _CONTEXT_MAX_ITEMS:
-            lines.append("")
-            lines.append(
-                f"其余 {len(items) - _CONTEXT_MAX_ITEMS} 条新闻已省略，请优先关注已列出的重要资讯。"
-            )
-
-        return "\n".join(lines).strip()
+    def _format_raw_context_item(self, item: dict[str, str], *, index: int) -> str:
+        title = _compact_text(item.get("title") or item.get("content") or "", limit=120)
+        content = _compact_text(item.get("content") or "", limit=_CONTENT_PREVIEW_MAX_CHARS)
+        lines = [f"{index}. [{item.get('time') or '--'}] {title}"]
+        if content and content != title:
+            lines.append(f"内容：{content}")
+        return "\n".join(lines)
 
 
 jin10_news_service = Jin10NewsService()
