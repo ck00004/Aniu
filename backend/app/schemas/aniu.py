@@ -24,6 +24,7 @@ class AppSettingsBase(BaseModel):
     llm_api_key: str | None = Field(default=None, max_length=512)
     llm_model: str = Field(default="gpt-4o-mini", max_length=128)
     system_prompt: str = Field(max_length=20000)
+    prompt_templates: dict[str, str] = Field(default_factory=dict)
     automation_session_id: int | None = None
     automation_context_window_tokens: int | None = Field(default=131072, ge=4096)
     automation_target_prompt_tokens: int | None = Field(default=111411, ge=1024)
@@ -90,6 +91,7 @@ class SkillImportSkillHubRequest(BaseModel):
 class ScheduleBase(BaseModel):
     name: str = Field(default="默认任务", max_length=64)
     run_type: Literal["analysis", "trade"] = "analysis"
+    market_day_type: Literal["trading_day", "non_trading_day"] = "trading_day"
     cron_expression: str = Field(default="*/30 * * * *", min_length=5, max_length=64)
     task_prompt: str = Field(default="", max_length=20000)
     timeout_seconds: int = Field(default=1800, ge=5, le=3600)
@@ -97,6 +99,8 @@ class ScheduleBase(BaseModel):
 
     @model_validator(mode="after")
     def normalize_task_prompt(self) -> "ScheduleBase":
+        if self.market_day_type == "non_trading_day" and self.run_type != "analysis":
+            raise ValueError("非交易日定时任务只能配置分析任务。")
         self.task_prompt = normalize_schedule_task_prompt(
             self.run_type,
             self.task_prompt,

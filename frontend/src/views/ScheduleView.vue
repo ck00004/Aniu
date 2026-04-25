@@ -14,7 +14,7 @@
               <article v-for="task in activeScheduleCards" :key="task.id" class="schedule-overview-card">
                 <span class="overview-tag" :class="task.category === '交易任务' ? 'tag-trade' : 'tag-analysis'">{{ task.category }}</span>
                 <strong>{{ task.name }}</strong>
-                <p>交易日 {{ task.displayTime }}</p>
+                <p>{{ task.dayTypeLabel }} {{ task.displayTime }}</p>
               </article>
             </div>
             <div v-else class="empty-state">
@@ -255,6 +255,82 @@
                     </div>
                   </article>
                 </div>
+
+                <div class="task-grid non-trading-grid">
+                  <article class="task-card" :class="{ 'is-active': scheduleSettings.nonTradingFirst.enabled }">
+                    <div class="task-card-header">
+                      <div class="task-card-meta">
+                        <h4 class="task-card-name">非交易日分析1号</h4>
+                        <p class="task-card-desc">非交易日首个分析任务，结果会并入下个交易日首次分析</p>
+                      </div>
+                      <label class="switch">
+                        <input type="checkbox" v-model="scheduleSettings.nonTradingFirst.enabled" />
+                        <span class="switch-track"></span>
+                      </label>
+                    </div>
+                    <div class="task-card-body" :class="{ 'is-disabled': !scheduleSettings.nonTradingFirst.enabled }">
+                      <div class="task-field">
+                        <span class="field-label">执行时间</span>
+                        <div class="task-time-row">
+                          <input
+                            type="time"
+                            class="task-time-input"
+                            :value="getNonTradingSectionTimeValue('nonTradingFirst')"
+                            :disabled="!scheduleSettings.nonTradingFirst.enabled"
+                            @input="handleNonTradingTimeInput('nonTradingFirst', $event)"
+                          />
+                          <span class="field-tip">非交易日最多可配置两次分析任务。</span>
+                        </div>
+                      </div>
+                      <div class="task-field">
+                        <span class="field-label">提示词 <small>{{ scheduleSettings.nonTradingFirst.prompt.length }}字</small></span>
+                        <textarea
+                          v-model="scheduleSettings.nonTradingFirst.prompt"
+                          rows="3"
+                          @input="autoResizeTextarea($event)"
+                          :disabled="!scheduleSettings.nonTradingFirst.enabled"
+                        ></textarea>
+                      </div>
+                    </div>
+                  </article>
+
+                  <article class="task-card" :class="{ 'is-active': scheduleSettings.nonTradingSecond.enabled }">
+                    <div class="task-card-header">
+                      <div class="task-card-meta">
+                        <h4 class="task-card-name">非交易日分析2号</h4>
+                        <p class="task-card-desc">非交易日补充分析任务，用于承接新增消息和盘后变化</p>
+                      </div>
+                      <label class="switch">
+                        <input type="checkbox" v-model="scheduleSettings.nonTradingSecond.enabled" />
+                        <span class="switch-track"></span>
+                      </label>
+                    </div>
+                    <div class="task-card-body" :class="{ 'is-disabled': !scheduleSettings.nonTradingSecond.enabled }">
+                      <div class="task-field">
+                        <span class="field-label">执行时间</span>
+                        <div class="task-time-row">
+                          <input
+                            type="time"
+                            class="task-time-input"
+                            :value="getNonTradingSectionTimeValue('nonTradingSecond')"
+                            :disabled="!scheduleSettings.nonTradingSecond.enabled"
+                            @input="handleNonTradingTimeInput('nonTradingSecond', $event)"
+                          />
+                          <span class="field-tip">仅在非交易日执行，结果同样会汇入下个交易日首次分析。</span>
+                        </div>
+                      </div>
+                      <div class="task-field">
+                        <span class="field-label">提示词 <small>{{ scheduleSettings.nonTradingSecond.prompt.length }}字</small></span>
+                        <textarea
+                          v-model="scheduleSettings.nonTradingSecond.prompt"
+                          rows="3"
+                          @input="autoResizeTextarea($event)"
+                          :disabled="!scheduleSettings.nonTradingSecond.enabled"
+                        ></textarea>
+                      </div>
+                    </div>
+                  </article>
+                </div>
               </section>
 
               <section class="schedule-section">
@@ -376,6 +452,8 @@ const {
   setFixedTaskTime,
   getSectionTimeValue,
   setSectionTimeValue,
+  getNonTradingSectionTimeValue,
+  setNonTradingSectionTimeValue,
   autoResizeTextarea,
   getMorningRunTimes,
   getAfternoonRunTimes,
@@ -387,6 +465,14 @@ function handleTimeInput(section: 'preMarket' | 'midday' | 'postMarket' | 'night
     return
   }
   setSectionTimeValue(section, target.value)
+}
+
+function handleNonTradingTimeInput(section: 'nonTradingFirst' | 'nonTradingSecond', event: Event) {
+  const target = event.target as HTMLInputElement | null
+  if (!target) {
+    return
+  }
+  setNonTradingSectionTimeValue(section, target.value)
 }
 
 async function saveScheduleSettings() {

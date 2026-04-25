@@ -123,6 +123,23 @@ def test_compute_next_run_at_skips_weekend_to_next_trading_day() -> None:
     assert result.date().isoformat() == "2026-04-13"
 
 
+def test_compute_next_run_at_supports_non_trading_day_schedules() -> None:
+    shanghai = ZoneInfo("Asia/Shanghai")
+    start = datetime(2026, 4, 10, 21, 0, tzinfo=shanghai)
+
+    result = aniu_service._compute_next_run_at(
+        "0 9 * * *",
+        from_time=start,
+        market_day_type="non_trading_day",
+    )
+
+    assert result is not None
+    in_shanghai = result.astimezone(shanghai)
+    assert in_shanghai.date().isoformat() == "2026-04-11"
+    assert in_shanghai.hour == 9
+    assert in_shanghai.minute == 0
+
+
 def test_compute_next_run_at_skips_non_trading_holiday() -> None:
     from app.services import aniu_service as aniu_service_module
 
@@ -253,6 +270,44 @@ def test_process_due_schedule_recomputes_non_trading_due_task_without_running(
         assert saved.last_run_at is None
         assert saved.next_run_at is not None
         assert saved.next_run_at.date().isoformat() == "2026-10-09"
+
+
+def test_non_trading_analysis_handoff_context_is_included_for_first_trading_analysis(
+    monkeypatch, tmp_path
+) -> None:
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    shanghai = ZoneInfo("Asia/Shanghai")
+
+    with session_scope() as db:
+        db.add(
+            StrategyRun(
+                trigger_source="schedule",
+                run_type="analysis",
+                market_day_type="non_trading_day",
+                schedule_name="非交易日分析1号",
+                status="completed",
+                final_answer="周末结论：关注高股息与业绩修复方向。",
+                analysis_summary="周末结论：关注高股息与业绩修复方向。",
+                started_at=datetime(2026, 4, 11, 1, 30, tzinfo=timezone.utc),
+            )
+        )
+        db.flush()
+
+        context = aniu_service._build_non_trading_analysis_handoff_context(
+            db=db,
+            current_time=datetime(2026, 4, 13, 8, 45, tzinfo=shanghai),
+            run_type="analysis",
+            market_day_type="trading_day",
+            analysis_call_index=1,
+        )
+
+    assert context is not None
+    assert "最近非交易日分析结论" in context
+    assert "非交易日分析1号" in context
+    assert "关注高股息与业绩修复方向" in context
+
+    _reset_db_state()
 
 
 def test_execute_run_failure_advances_schedule_window(monkeypatch, tmp_path) -> None:

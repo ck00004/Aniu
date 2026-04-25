@@ -20,6 +20,7 @@ interface ScheduleOverviewItem {
   id: number
   name: string
   category: string
+  dayTypeLabel: string
   cronExpression: string
   displayTime: string
   nextRunAt: string | null
@@ -37,6 +38,7 @@ const defaultSettings = (): SettingsPayload => ({
   llm_api_key: '',
   llm_model: 'gpt-4o-mini',
   system_prompt: '你是跨越完整牛熊周期的顶尖私募投资机构老将与极度理性的专业交易员，你深谙A股政策驱动、外资流动与资金博弈机制。你必须持续运行以下自我驱动循环，监控经济、政策、盘面数据及资金流向，研判周期位置与市场情绪，寻找共识与预期差，定性博弈逻辑，自主决策执行交易操作。你的唯一目标是追求收益最大化。',
+  prompt_templates: {},
   automation_context_window_tokens: 131072,
 })
 
@@ -66,6 +68,7 @@ function createScheduleDraft(): ScheduleEditor {
     local_id: uid(),
     name: '默认任务',
     run_type: 'analysis',
+    market_day_type: 'trading_day',
     cron_expression: '*/30 * * * *',
     task_prompt: '请根据当前市场和持仓情况生成交易决策。',
     timeout_seconds: 1800,
@@ -176,10 +179,12 @@ export const useAppStore = defineStore('app', () => {
         const sortKey = hour * 60 + minute
         const displayName = item.name.replace(/#(\d+)$/, '$1号')
         const category = item.run_type === 'trade' ? '交易任务' : '分析任务'
+        const dayTypeLabel = item.market_day_type === 'non_trading_day' ? '非交易日' : '交易日'
         return {
           id: item.id,
           name: displayName,
           category,
+          dayTypeLabel,
           cronExpression: item.cron_expression,
           displayTime,
           nextRunAt: item.next_run_at,
@@ -215,6 +220,7 @@ export const useAppStore = defineStore('app', () => {
     settings.llm_api_key = payload.llm_api_key ?? ''
     settings.llm_model = payload.llm_model
     settings.system_prompt = payload.system_prompt
+    settings.prompt_templates = { ...(payload.prompt_templates ?? {}) }
     settings.automation_context_window_tokens = payload.automation_context_window_tokens ?? 131072
   }
 

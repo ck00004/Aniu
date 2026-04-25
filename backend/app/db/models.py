@@ -8,6 +8,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
 
 from app.core.constants import DEFAULT_SYSTEM_PROMPT
+from app.core.prompt_templates import encode_prompt_template_overrides, merge_prompt_templates
 
 
 class Base(DeclarativeBase):
@@ -33,6 +34,10 @@ class AppSettings(Base):
     system_prompt: Mapped[str] = mapped_column(
         Text,
         default=DEFAULT_SYSTEM_PROMPT,
+    )
+    prompt_templates_json: Mapped[str] = mapped_column(
+        Text,
+        default="{}",
     )
     analyst_prompt: Mapped[str] = mapped_column(
         Text,
@@ -75,6 +80,14 @@ class AppSettings(Base):
         DateTime, server_default=func.now(), onupdate=func.now()
     )
 
+    @property
+    def prompt_templates(self) -> dict[str, str]:
+        return merge_prompt_templates(self.prompt_templates_json)
+
+    @prompt_templates.setter
+    def prompt_templates(self, value: Any) -> None:
+        self.prompt_templates_json = encode_prompt_template_overrides(value)
+
 
 class StrategySchedule(Base):
     __tablename__ = "strategy_schedules"
@@ -82,6 +95,7 @@ class StrategySchedule(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(64), default="默认调度任务")
     run_type: Mapped[str] = mapped_column(String(32), default="analysis")
+    market_day_type: Mapped[str] = mapped_column(String(32), default="trading_day")
     interval_minutes: Mapped[int] = mapped_column(Integer, default=30)
     cron_expression: Mapped[str | None] = mapped_column(String(64), nullable=True)
     task_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -103,6 +117,7 @@ class StrategyRun(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     trigger_source: Mapped[str] = mapped_column(String(32), default="manual")
     run_type: Mapped[str] = mapped_column(String(32), default="analysis")
+    market_day_type: Mapped[str] = mapped_column(String(32), default="trading_day")
     schedule_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     schedule_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
     chat_session_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)

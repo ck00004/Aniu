@@ -18,7 +18,9 @@ test('analysis schedule cards provide custom time inputs', () => {
 
   const timeInputCount = source.match(/type="time"/g)?.length ?? 0
 
-  assert.equal(timeInputCount, 4)
+  assert.equal(timeInputCount, 6)
   assert.ok(source.includes('支持自定义 HH:MM'))
   assert.ok(source.includes('夜间分析'))
+  assert.ok(source.includes('非交易日分析1号'))
+  assert.ok(source.includes('非交易日分析2号'))
 })

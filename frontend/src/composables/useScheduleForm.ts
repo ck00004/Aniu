@@ -2,9 +2,10 @@ import { reactive } from 'vue'
 
 import type { ScheduleConfig } from '@/types'
 
-type ScheduleLike = Pick<ScheduleConfig, 'id' | 'name' | 'run_type' | 'cron_expression' | 'task_prompt' | 'timeout_seconds' | 'enabled'>
+type ScheduleLike = Pick<ScheduleConfig, 'id' | 'name' | 'run_type' | 'market_day_type' | 'cron_expression' | 'task_prompt' | 'timeout_seconds' | 'enabled'>
 
 type ScheduleKey = 'preMarket' | 'midday' | 'postMarket' | 'night'
+type NonTradingKey = 'nonTradingFirst' | 'nonTradingSecond'
 type SessionKey = 'morning' | 'afternoon'
 
 type FixedTaskTimeOption = {
@@ -55,6 +56,8 @@ export interface ScheduleFormState {
   postMarket: { enabled: boolean; hour: number; minute: number; prompt: string }
   midday: { enabled: boolean; hour: number; minute: number; prompt: string }
   night: { enabled: boolean; hour: number; minute: number; prompt: string }
+  nonTradingFirst: { enabled: boolean; hour: number; minute: number; prompt: string }
+  nonTradingSecond: { enabled: boolean; hour: number; minute: number; prompt: string }
   morning: { enabled: boolean; runCount: number; prompt: string }
   afternoon: { enabled: boolean; runCount: number; prompt: string }
 }
@@ -64,6 +67,11 @@ const FIXED_TASK_NAMES = {
   midday: '午间复盘',
   postMarket: '收盘分析',
   night: '夜间分析',
+} as const
+
+const NON_TRADING_TASK_NAMES = {
+  nonTradingFirst: '非交易日分析1号',
+  nonTradingSecond: '非交易日分析2号',
 } as const
 
 const SESSION_TASK_NAMES = {
@@ -78,6 +86,8 @@ const defaultState = (): ScheduleFormState => ({
   postMarket: { enabled: false, hour: 15, minute: 30, prompt: '你正在执行收盘分析任务，请对今日市场和交易操作进行全面复盘，总结今日市场和明日可能的走势。' },
   midday: { enabled: false, hour: 12, minute: 0, prompt: '你正在执行午间复盘任务，请对上午市场和交易操作进行复盘，做好下午市场走势预测，为你决策交易做好准备。' },
   night: { enabled: false, hour: 21, minute: 0, prompt: '你正在执行夜间分析任务，请结合收盘结果、盘后资讯、政策消息与题材演化，梳理次日重点方向、风险点和跟踪计划。' },
+  nonTradingFirst: { enabled: false, hour: 9, minute: 30, prompt: '你正在执行非交易日分析任务，请复盘最新市场环境、消息面与持仓状态，为下一个交易日的首次分析准备重点结论。' },
+  nonTradingSecond: { enabled: false, hour: 20, minute: 0, prompt: '你正在执行非交易日补充分析任务，请补充梳理非交易日新增信息、情绪变化和次日需要重点跟踪的交易线索。' },
   morning: { enabled: true, runCount: 2, prompt: '你正在执行盘中交易操作，你的唯一目标是追求收益最大化。' },
   afternoon: { enabled: true, runCount: 2, prompt: '你正在执行盘中交易操作，你的唯一目标是追求收益最大化。' },
 })
@@ -90,8 +100,8 @@ function parseCron(cronExpression: string) {
   }
 }
 
-function buildCron(hour: number, minute: number) {
-  return `${minute} ${hour} * * 1-5`
+function buildCron(hour: number, minute: number, marketDayType: 'trading_day' | 'non_trading_day' = 'trading_day') {
+  return `${minute} ${hour} * * ${marketDayType === 'trading_day' ? '1-5' : '*'}`
 }
 
 function isValidHourMinute(hour: number, minute: number) {
@@ -158,7 +168,22 @@ export function useScheduleForm() {
     Object.assign(scheduleSettings, defaultState())
 
     ;(Object.keys(FIXED_TASK_NAMES) as ScheduleKey[]).forEach((key) => {
-      const matched = schedules.find((item) => item.name === FIXED_TASK_NAMES[key])
+      const matched = schedules.find((item) => item.name === FIXED_TASK_NAMES[key] && item.market_day_type !== 'non_trading_day')
+      if (!matched) {
+        return
+      }
+
+      const { hour, minute } = parseCron(matched.cron_expression)
+      scheduleSettings[key].enabled = matched.enabled
+      if (isValidHourMinute(hour, minute)) {
+        scheduleSettings[key].hour = hour
+        scheduleSettings[key].minute = minute
+      }
+      scheduleSettings[key].prompt = matched.task_prompt || scheduleSettings[key].prompt
+    })
+
+    ;(Object.keys(NON_TRADING_TASK_NAMES) as NonTradingKey[]).forEach((key) => {
+      const matched = schedules.find((item) => item.name === NON_TRADING_TASK_NAMES[key] || (item.market_day_type === 'non_trading_day' && item.name === NON_TRADING_TASK_NAMES[key]))
       if (!matched) {
         return
       }
@@ -174,7 +199,7 @@ export function useScheduleForm() {
 
     ;(Object.keys(SESSION_TASK_NAMES) as SessionKey[]).forEach((key) => {
       const matched = schedules
-        .filter((item) => item.name.startsWith(SESSION_TASK_NAMES[key]))
+        .filter((item) => item.name.startsWith(SESSION_TASK_NAMES[key]) && item.market_day_type !== 'non_trading_day')
         .sort((a, b) => a.cron_expression.localeCompare(b.cron_expression))
 
       if (matched.length === 0) {
@@ -195,7 +220,23 @@ export function useScheduleForm() {
         id: existing?.id,
         name: FIXED_TASK_NAMES[key],
         run_type: 'analysis' as const,
-        cron_expression: buildCron(current.hour, current.minute),
+        market_day_type: 'trading_day' as const,
+        cron_expression: buildCron(current.hour, current.minute, 'trading_day'),
+        task_prompt: current.prompt,
+        timeout_seconds: existing?.timeout_seconds ?? DEFAULT_TIMEOUT,
+        enabled: current.enabled,
+      }
+    })
+
+    const nonTradingPayload = (Object.keys(NON_TRADING_TASK_NAMES) as NonTradingKey[]).map((key) => {
+      const existing = existingSchedules.find((item) => item.name === NON_TRADING_TASK_NAMES[key] || (item.market_day_type === 'non_trading_day' && item.name === NON_TRADING_TASK_NAMES[key]))
+      const current = scheduleSettings[key]
+      return {
+        id: existing?.id,
+        name: NON_TRADING_TASK_NAMES[key],
+        run_type: 'analysis' as const,
+        market_day_type: 'non_trading_day' as const,
+        cron_expression: buildCron(current.hour, current.minute, 'non_trading_day'),
         task_prompt: current.prompt,
         timeout_seconds: existing?.timeout_seconds ?? DEFAULT_TIMEOUT,
         enabled: current.enabled,
@@ -204,19 +245,20 @@ export function useScheduleForm() {
 
     const sessionPayload = (Object.keys(SESSION_TASK_NAMES) as SessionKey[]).flatMap((key) => {
       const current = scheduleSettings[key]
-      const existing = existingSchedules.filter((item) => item.name.startsWith(SESSION_TASK_NAMES[key]))
+      const existing = existingSchedules.filter((item) => item.name.startsWith(SESSION_TASK_NAMES[key]) && item.market_day_type !== 'non_trading_day')
       return getSessionTimes(key, current.runCount).map((time, index) => ({
         id: existing[index]?.id,
         name: `${SESSION_TASK_NAMES[key]}${index + 1}号`,
         run_type: 'trade' as const,
-        cron_expression: buildCron(time.hour, time.minute),
+        market_day_type: 'trading_day' as const,
+        cron_expression: buildCron(time.hour, time.minute, 'trading_day'),
         task_prompt: current.prompt,
         timeout_seconds: existing[index]?.timeout_seconds ?? DEFAULT_TIMEOUT,
         enabled: current.enabled,
       }))
     })
 
-    return [...fixedPayload, ...sessionPayload]
+    return [...fixedPayload, ...nonTradingPayload, ...sessionPayload]
   }
 
   function setFixedTaskTime(section: ScheduleKey, option: FixedTaskTimeOption) {
@@ -229,6 +271,19 @@ export function useScheduleForm() {
   }
 
   function setSectionTimeValue(section: ScheduleKey, value: string) {
+    const parsed = parseTimeValue(value)
+    if (!parsed) {
+      return
+    }
+    scheduleSettings[section].hour = parsed.hour
+    scheduleSettings[section].minute = parsed.minute
+  }
+
+  function getNonTradingSectionTimeValue(section: NonTradingKey) {
+    return formatTimeValue(scheduleSettings[section].hour, scheduleSettings[section].minute)
+  }
+
+  function setNonTradingSectionTimeValue(section: NonTradingKey, value: string) {
     const parsed = parseTimeValue(value)
     if (!parsed) {
       return
@@ -260,6 +315,8 @@ export function useScheduleForm() {
     setFixedTaskTime,
     getSectionTimeValue,
     setSectionTimeValue,
+    getNonTradingSectionTimeValue,
+    setNonTradingSectionTimeValue,
     autoResizeTextarea,
     getMorningRunTimes,
     getAfternoonRunTimes,

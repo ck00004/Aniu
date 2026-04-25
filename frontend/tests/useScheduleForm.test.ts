@@ -40,6 +40,8 @@ test('buildPayload preserves disabled session schedules', () => {
     {
       id: 11,
       name: '上午运行1号',
+      run_type: 'trade',
+      market_day_type: 'trading_day',
       cron_expression: '0 10 * * 1-5',
       task_prompt: 'session',
       timeout_seconds: 1800,
@@ -48,6 +50,8 @@ test('buildPayload preserves disabled session schedules', () => {
     {
       id: 12,
       name: '上午运行2号',
+      run_type: 'trade',
+      market_day_type: 'trading_day',
       cron_expression: '0 11 * * 1-5',
       task_prompt: 'session',
       timeout_seconds: 1800,
@@ -59,6 +63,8 @@ test('buildPayload preserves disabled session schedules', () => {
     {
       id: 11,
       name: '上午运行1号',
+      run_type: 'trade',
+      market_day_type: 'trading_day',
       cron_expression: '0 10 * * 1-5',
       task_prompt: 'session',
       timeout_seconds: 1800,
@@ -67,6 +73,8 @@ test('buildPayload preserves disabled session schedules', () => {
     {
       id: 12,
       name: '上午运行2号',
+      run_type: 'trade',
+      market_day_type: 'trading_day',
       cron_expression: '0 11 * * 1-5',
       task_prompt: 'session',
       timeout_seconds: 1800,
@@ -85,6 +93,8 @@ test('syncFromSchedules preserves custom pre-market times', () => {
     {
       id: 1,
       name: '盘前分析',
+      run_type: 'analysis',
+      market_day_type: 'trading_day',
       cron_expression: '30 7 * * 1-5',
       task_prompt: 'a',
       timeout_seconds: 1800,
@@ -110,6 +120,8 @@ test('syncFromSchedules preserves legacy pre-market time instead of forcing a fi
     {
       id: 9,
       name: '盘前分析',
+      run_type: 'analysis',
+      market_day_type: 'trading_day',
       cron_expression: '15 7 * * 1-5',
       task_prompt: 'legacy',
       timeout_seconds: 1800,
@@ -128,6 +140,8 @@ test('syncFromSchedules preserves custom midday times', () => {
     {
       id: 2,
       name: '午间复盘',
+      run_type: 'analysis',
+      market_day_type: 'trading_day',
       cron_expression: '45 11 * * 1-5',
       task_prompt: 'b',
       timeout_seconds: 1800,
@@ -146,6 +160,8 @@ test('syncFromSchedules preserves custom post-market times', () => {
     {
       id: 3,
       name: '收盘分析',
+      run_type: 'analysis',
+      market_day_type: 'trading_day',
       cron_expression: '15 16 * * 1-5',
       task_prompt: 'c',
       timeout_seconds: 1800,
@@ -164,6 +180,8 @@ test('syncFromSchedules preserves custom night analysis times', () => {
     {
       id: 4,
       name: '夜间分析',
+      run_type: 'analysis',
+      market_day_type: 'trading_day',
       cron_expression: '20 21 * * 1-5',
       task_prompt: 'night',
       timeout_seconds: 1800,
@@ -191,4 +209,35 @@ test('night analysis default display time is 21:00', () => {
 
   assert.equal(scheduleSettings.night.hour, 21)
   assert.equal(scheduleSettings.night.minute, 0)
+})
+
+test('buildPayload includes two non-trading analysis slots', () => {
+  const { buildPayload } = useScheduleForm()
+
+  const payload = buildPayload([])
+  const nonTradingRuns = payload.filter((item) => item.market_day_type === 'non_trading_day')
+
+  assert.equal(nonTradingRuns.length, 2)
+  assert.equal(nonTradingRuns.every((item) => item.run_type === 'analysis'), true)
+})
+
+test('syncFromSchedules preserves non-trading task times', () => {
+  const { scheduleSettings, syncFromSchedules } = useScheduleForm()
+
+  syncFromSchedules([
+    {
+      id: 21,
+      name: '非交易日分析1号',
+      run_type: 'analysis',
+      market_day_type: 'non_trading_day',
+      cron_expression: '45 9 * * *',
+      task_prompt: 'holiday',
+      timeout_seconds: 1800,
+      enabled: true,
+    },
+  ])
+
+  assert.equal(scheduleSettings.nonTradingFirst.hour, 9)
+  assert.equal(scheduleSettings.nonTradingFirst.minute, 45)
+  assert.equal(scheduleSettings.nonTradingFirst.prompt, 'holiday')
 })

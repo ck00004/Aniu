@@ -71,6 +71,10 @@ def _ensure_app_settings_columns(engine) -> None:
         statements.append(
             "ALTER TABLE app_settings ADD COLUMN disabled_skill_ids_json TEXT DEFAULT '[]'"
         )
+    if "prompt_templates_json" not in columns:
+        statements.append(
+            "ALTER TABLE app_settings ADD COLUMN prompt_templates_json TEXT DEFAULT '{}'"
+        )
     if "automation_session_id" not in columns:
         statements.append("ALTER TABLE app_settings ADD COLUMN automation_session_id INTEGER")
     if "automation_context_window_tokens" not in columns:
@@ -116,6 +120,7 @@ def _ensure_app_settings_columns(engine) -> None:
                 "automation_target_prompt_tokens = CASE "
                 "WHEN automation_target_prompt_tokens IS NULL OR automation_target_prompt_tokens = 24000 THEN 111411 "
                 "ELSE automation_target_prompt_tokens END, "
+                "prompt_templates_json = COALESCE(prompt_templates_json, '{}'), "
                 "automation_recent_message_limit = COALESCE(automation_recent_message_limit, 24), "
                 "automation_enable_auto_compaction = COALESCE(automation_enable_auto_compaction, 1), "
                 "automation_idle_summary_hours = COALESCE(automation_idle_summary_hours, 12), "
@@ -189,6 +194,7 @@ def _ensure_strategy_schedule_columns(engine) -> None:
 
     required_columns = {
         "run_type": "ALTER TABLE strategy_schedules ADD COLUMN run_type VARCHAR(32) DEFAULT 'analysis'",
+        "market_day_type": "ALTER TABLE strategy_schedules ADD COLUMN market_day_type VARCHAR(32) DEFAULT 'trading_day'",
         "cron_expression": "ALTER TABLE strategy_schedules ADD COLUMN cron_expression VARCHAR(64)",
         "task_prompt": "ALTER TABLE strategy_schedules ADD COLUMN task_prompt TEXT",
         "timeout_seconds": "ALTER TABLE strategy_schedules ADD COLUMN timeout_seconds INTEGER DEFAULT 1800",
@@ -214,6 +220,12 @@ def _backfill_schedule_run_types(engine) -> None:
         return
 
     with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE strategy_schedules SET market_day_type = 'trading_day' "
+                "WHERE market_day_type IS NULL OR trim(market_day_type) = ''"
+            )
+        )
         connection.execute(
             text(
                 "UPDATE strategy_schedules SET run_type = 'trade' "
@@ -245,8 +257,14 @@ def _backfill_strategy_run_types(engine) -> None:
     connection.row_factory = sqlite3.Row
     try:
         runs = connection.execute(
-            "SELECT id, run_type, schedule_name, executed_actions, skill_payloads, decision_payload FROM strategy_runs"
+            "SELECT id, run_type, market_day_type, schedule_name, schedule_id, executed_actions, skill_payloads, decision_payload FROM strategy_runs"
         ).fetchall()
+        schedule_day_types = {
+            int(row[0]): (str(row[1] or "").strip() or "trading_day")
+            for row in connection.execute(
+                "SELECT id, market_day_type FROM strategy_schedules"
+            ).fetchall()
+        }
         trade_order_counts = {
             int(row[0]): int(row[1])
             for row in connection.execute(
@@ -257,7 +275,9 @@ def _backfill_strategy_run_types(engine) -> None:
         for row in runs:
             schedule_name = str(row["schedule_name"] or "").strip()
             stored_run_type = str(row["run_type"] or "").strip()
+            stored_market_day_type = str(row["market_day_type"] or "").strip()
             inferred = "analysis"
+            inferred_market_day_type = "trading_day"
 
             if schedule_name.startswith("上午运行") or schedule_name.startswith("下午运行"):
                 inferred = "trade"
@@ -300,9 +320,18 @@ def _backfill_strategy_run_types(engine) -> None:
                     elif stored_run_type in {"analysis", "trade"}:
                         inferred = stored_run_type
 
+            schedule_id = row["schedule_id"]
+            if schedule_id is not None:
+                inferred_market_day_type = schedule_day_types.get(
+                    int(schedule_id),
+                    "trading_day",
+                )
+            elif stored_market_day_type in {"trading_day", "non_trading_day"}:
+                inferred_market_day_type = stored_market_day_type
+
             connection.execute(
-                "UPDATE strategy_runs SET run_type = ? WHERE id = ?",
-                (inferred, int(row["id"])),
+                "UPDATE strategy_runs SET run_type = ?, market_day_type = ? WHERE id = ?",
+                (inferred, inferred_market_day_type, int(row["id"])),
             )
 
         connection.commit()
@@ -319,6 +348,7 @@ def _ensure_strategy_run_columns(engine) -> None:
     required_columns = {
         "final_answer": "ALTER TABLE strategy_runs ADD COLUMN final_answer TEXT",
         "run_type": "ALTER TABLE strategy_runs ADD COLUMN run_type VARCHAR(32) DEFAULT 'analysis'",
+        "market_day_type": "ALTER TABLE strategy_runs ADD COLUMN market_day_type VARCHAR(32) DEFAULT 'trading_day'",
         "schedule_name": "ALTER TABLE strategy_runs ADD COLUMN schedule_name VARCHAR(64)",
         "schedule_id": "ALTER TABLE strategy_runs ADD COLUMN schedule_id INTEGER",
         "chat_session_id": "ALTER TABLE strategy_runs ADD COLUMN chat_session_id INTEGER",

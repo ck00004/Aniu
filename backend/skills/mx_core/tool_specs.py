@@ -176,10 +176,11 @@ TOOL_SPECS: list[MXToolSpec] = [
         description=(
             "通过自然语言添加或删除自选股。"
             "适合把待跟踪标的加入自选，或从自选中移除。"
+            "单次调用只能处理一只股票；如果需要增删多只股票，必须分多次调用。"
             "query 示例：'把贵州茅台加入自选股'、'把东方财富从自选中删除'。"
         ),
         parameters=query_parameters(
-            "自然语言管理指令，例如把贵州茅台添加到我的自选股列表。"
+            "自然语言管理指令。单次只能写一只股票，例如把贵州茅台添加到我的自选股列表。"
         ),
         category="zixuan",
         mutation=True,
@@ -189,6 +190,7 @@ TOOL_SPECS: list[MXToolSpec] = [
         description=(
             "执行A股模拟交易买入或卖出，仅用于模拟组合练习和策略验证，不涉及真实资金。"
             "支持市价和限价委托；股票代码必须是6位A股代码，数量必须是100的整数倍。"
+            "单次调用只能交易一只股票；若需处理多只股票，必须分多次调用。"
             "适合模拟建仓、减仓、调仓。"
         ),
         parameters={
@@ -201,7 +203,7 @@ TOOL_SPECS: list[MXToolSpec] = [
                 },
                 "symbol": {
                     "type": "string",
-                    "description": "6位A股股票代码，例如 600519、300059。",
+                    "description": "单只股票代码，例如 600519、300059；禁止一次传入多只股票。",
                 },
                 "name": {
                     "type": "string",
@@ -235,20 +237,20 @@ TOOL_SPECS: list[MXToolSpec] = [
         name="mx_moni_cancel",
         description=(
             "撤销A股模拟交易委托，仅用于模拟组合，不涉及真实资金。"
-            "支持一键撤销当日所有可撤委托，或按委托编号撤单。"
-            "按委托编号撤单前，通常应先调用 mx_get_orders 确认 order_id 和当前状态。"
+            "单次调用只能按委托编号撤销一笔委托，不允许 all 批量撤单。"
+            "撤单前，通常应先调用 mx_get_orders 确认 order_id 和当前状态。"
         ),
         parameters={
             "type": "object",
             "properties": {
                 "cancel_type": {
                     "type": "string",
-                    "enum": ["all", "order"],
-                    "description": "all 表示一键撤销当日所有可撤委托，order 表示按委托编号撤单。",
+                    "enum": ["order"],
+                    "description": "固定为 order，表示按委托编号单笔撤单。",
                 },
                 "order_id": {
                     "type": ["string", "null"],
-                    "description": "按委托编号撤单时必填，应来自 mx_get_orders 返回的委托编号。",
+                    "description": "必填，应来自 mx_get_orders 返回的单笔委托编号。",
                 },
                 "stock_code": {
                     "type": ["string", "null"],
@@ -259,7 +261,7 @@ TOOL_SPECS: list[MXToolSpec] = [
                     "description": "撤单原因，用于记录。",
                 },
             },
-            "required": ["cancel_type"],
+            "required": ["cancel_type", "order_id"],
             "additionalProperties": False,
         },
         category="moni",

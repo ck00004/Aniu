@@ -711,6 +711,7 @@ class ChatSessionService:
             settings_snapshot = SimpleNamespace(
                 mx_api_key=settings.mx_api_key,
                 system_prompt=settings.system_prompt,
+                prompt_templates=getattr(settings, "prompt_templates", {}),
                 llm_model=settings.llm_model,
                 llm_base_url=str(settings.llm_base_url),
                 llm_api_key=str(settings.llm_api_key),
@@ -731,6 +732,7 @@ class ChatSessionService:
                     base_url=settings_snapshot.llm_base_url,
                     api_key=settings_snapshot.llm_api_key,
                     system_prompt=settings_snapshot.system_prompt,
+                    prompt_templates=settings_snapshot.prompt_templates,
                     messages=history_messages,
                     timeout_seconds=180,
                     tool_context={"app_settings": settings_snapshot},

@@ -69,6 +69,53 @@ def test_moni_trade_rejects_non_positive_limit_price() -> None:
         )
 
 
+def test_manage_self_select_rejects_multiple_targets() -> None:
+    with pytest.raises(RuntimeError, match="一次只能添加或删除一只自选股"):
+        mx_skill_service._handle_manage_self_select(
+            client=None,
+            app_settings=None,
+            arguments={
+                "query": "把贵州茅台和东方财富加入自选股",
+            },
+        )
+
+
+def test_moni_trade_rejects_multiple_symbols() -> None:
+    with pytest.raises(RuntimeError, match="一次只能交易一只股票"):
+        mx_skill_service._handle_moni_trade(
+            client=None,
+            app_settings=None,
+            arguments={
+                "action": "BUY",
+                "symbol": "600519,300059",
+                "quantity": 100,
+                "price_type": "MARKET",
+            },
+        )
+
+
+def test_moni_cancel_rejects_batch_all_cancel() -> None:
+    with pytest.raises(RuntimeError, match="不允许 all 批量撤单"):
+        mx_skill_service._handle_moni_cancel(
+            client=None,
+            app_settings=None,
+            arguments={
+                "cancel_type": "all",
+            },
+        )
+
+
+def test_moni_cancel_requires_single_order_id() -> None:
+    with pytest.raises(RuntimeError, match="必须提供 order_id"):
+        mx_skill_service._handle_moni_cancel(
+            client=None,
+            app_settings=None,
+            arguments={
+                "cancel_type": "order",
+            },
+        )
+
+
 def test_resolve_run_type_maps_schedule_names() -> None:
     assert aniu_service._resolve_run_type(None) == "analysis"
     assert aniu_service._resolve_run_type(StrategySchedule(name="盘前分析", run_type="analysis")) == "analysis"
@@ -94,6 +141,7 @@ def test_build_persistent_session_user_content_includes_prefetched_context() -> 
         run_type="analysis",
         task_prompt="请分析今天市场",
         prefetched_context="[Jin10 当天新闻参考]\n1. [09:30:00] 新闻A",
+        runtime_context=None,
     )
 
     assert "本轮任务:" in content
@@ -115,6 +163,7 @@ def test_build_persistent_session_user_content_skips_self_select_guidance_for_tr
         run_type="trade",
         task_prompt="请根据持仓执行交易",
         prefetched_context="[Jin10 当天新闻参考]\n1. [09:30:00] 新闻A",
+        runtime_context=None,
     )
 
     assert "请根据持仓执行交易" in content
@@ -122,6 +171,156 @@ def test_build_persistent_session_user_content_skips_self_select_guidance_for_tr
     assert "mx_manage_self_select" not in content
     assert "mx_moni_trade" in content
     assert "本轮未实际交易" in content
+
+
+def test_resolve_manual_run_profile_uses_prompt_template_overrides() -> None:
+    settings = SimpleNamespace(
+        task_prompt="",
+        prompt_templates={
+            "manual_analysis_task_prompt": "分析模板A",
+            "manual_trade_task_prompt": "交易模板B",
+        },
+    )
+
+    analysis_run_type, analysis_prompt = aniu_service._resolve_manual_run_profile(
+        settings=settings,
+        manual_run_type=None,
+    )
+    trade_run_type, trade_prompt = aniu_service._resolve_manual_run_profile(
+        settings=settings,
+        manual_run_type="trade",
+    )
+
+    assert analysis_run_type == "analysis"
+    assert analysis_prompt == "分析模板A"
+    assert trade_run_type == "trade"
+    assert trade_prompt == "交易模板B"
+
+
+def test_build_run_type_guidance_uses_prompt_template_overrides() -> None:
+    settings = SimpleNamespace(
+        prompt_templates={
+            "analysis_self_select_guidance": "分析约束A",
+            "trade_execution_guidance": "交易约束B",
+        }
+    )
+
+    assert (
+        aniu_service._build_run_type_guidance(
+            settings=settings,
+            run_type="analysis",
+        )
+        == "分析约束A"
+    )
+    assert (
+        aniu_service._build_run_type_guidance(
+            settings=settings,
+            run_type="trade",
+        )
+        == "交易约束B"
+    )
+
+
+def test_build_jin10_prompt_templates_use_overrides() -> None:
+    settings = SimpleNamespace(
+        prompt_templates={
+            "jin10_news_analysis_output_format": "输出格式X",
+            "jin10_chunk_analysis_prompt_template": "{header}\n--{chunk_text}--\n{output_format}",
+            "jin10_merge_analysis_prompt_template": "{header}\n=={chunk_outputs}==\n{output_format}",
+        }
+    )
+
+    chunk_prompt = aniu_service._build_jin10_chunk_analysis_prompt(
+        settings=settings,
+        chunk_text="新闻块",
+        chunk_index=1,
+        chunk_total=2,
+        item_count=6,
+        target_day=date(2026, 4, 26),
+        current_time=datetime(2026, 4, 26, 9, 30),
+    )
+    merge_prompt = aniu_service._build_jin10_merge_analysis_prompt(
+        settings=settings,
+        chunk_outputs=["结论1", "结论2"],
+        item_count=6,
+        target_day=date(2026, 4, 26),
+        current_time=datetime(2026, 4, 26, 9, 30),
+    )
+
+    assert "输出格式X" in chunk_prompt
+    assert "--新闻块--" in chunk_prompt
+    assert "==第 1 批诊断：\n结论1\n\n第 2 批诊断：\n结论2==" in merge_prompt
+
+
+def test_llm_augment_system_prompt_uses_chat_prompt_override() -> None:
+    prompt = llm_service._augment_system_prompt(
+        "基础系统提示",
+        run_type="chat",
+        prompt_templates={
+            "chat_confirmation_append_prompt": "聊天确认规则XYZ",
+        },
+    )
+
+    assert "基础系统提示" in prompt
+    assert "聊天确认规则XYZ" in prompt
+
+
+def test_build_persistent_session_user_content_includes_beijing_time_and_call_index() -> None:
+    content = aniu_service._build_persistent_session_user_content(
+        settings=None,
+        trigger_source="schedule",
+        schedule_id=1,
+        schedule_name="盘前分析",
+        run_type="analysis",
+        task_prompt="请分析今天市场",
+        prefetched_context=None,
+        runtime_context={
+            "current_time": datetime(2026, 4, 13, 8, 45),
+            "is_trading_day": True,
+            "call_index": 3,
+            "analysis_call_index": 2,
+        },
+    )
+
+    assert "北京时间：2026年4月13日 08:45:00" in content
+    assert "今日类型: 交易日" in content
+    assert "今日第 3 次调用" in content
+    assert "今日第 2 次分析调用" in content
+
+
+def test_validate_schedule_payloads_rejects_more_than_two_non_trading_tasks() -> None:
+    with pytest.raises(RuntimeError, match="非交易日最多只能配置两条分析定时任务"):
+        aniu_service._validate_schedule_payloads(
+            [
+                ScheduleUpdate(
+                    name="非交易日分析1号",
+                    run_type="analysis",
+                    market_day_type="non_trading_day",
+                    cron_expression="0 9 * * *",
+                    task_prompt="a",
+                    timeout_seconds=1800,
+                    enabled=True,
+                ),
+                ScheduleUpdate(
+                    name="非交易日分析2号",
+                    run_type="analysis",
+                    market_day_type="non_trading_day",
+                    cron_expression="0 14 * * *",
+                    task_prompt="b",
+                    timeout_seconds=1800,
+                    enabled=True,
+                ),
+                ScheduleUpdate(
+                    name="非交易日分析3号",
+                    run_type="analysis",
+                    market_day_type="non_trading_day",
+                    cron_expression="0 20 * * *",
+                    task_prompt="c",
+                    timeout_seconds=1800,
+                    enabled=True,
+                ),
+            ]
+        )
 
 
 def test_schedule_update_defaults_task_prompt_by_run_type() -> None:

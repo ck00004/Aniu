@@ -6,6 +6,8 @@ from typing import Any, Callable, Iterable
 
 import httpx
 
+from app.core.prompt_templates import resolve_prompt_template
+from app.skills import skill_registry
 from app.services.mx_service import MXClient
 from app.services.skill_stack_service import skill_stack_service
 
@@ -13,17 +15,6 @@ _LLM_TEMPERATURE = 0.2
 _MAX_TOOL_ITERATIONS = 100
 _FINAL_STREAM_CHUNK_SIZE = 96
 _EMPTY_FINAL_ANSWER_RETRY_LIMIT = 1
-_EMPTY_FINAL_ANSWER_FOLLOWUP_PROMPT = (
-    "你已经完成了工具调用。请基于上面的工具结果直接输出最终结论，"
-    "必须给出可展示的中文结论，不要返回空字符串，也不要只返回工具调用。"
-)
-_CHAT_CONFIRMATION_APPEND_PROMPT = (
-    "聊天专用安全规则：当操作涉及交易执行、下单、撤单、自选股增删、写入、删除、覆盖、"
-    "批量修改或其他会改变数据、文件、配置、状态的破坏性操作时，你必须先明确说明拟执行操作、"
-    "影响范围和潜在风险，并在得到用户明确确认后才能调用工具或执行操作；若未获得明确确认，"
-    "只能提供方案、预览或建议，不得直接执行。"
-)
-
 
 class LLMStreamCancelled(RuntimeError):
     """Raised when a streaming chat/run should stop because the client disconnected."""
@@ -236,6 +227,7 @@ class LLMService:
         base_url: str,
         api_key: str,
         system_prompt: str | None,
+        prompt_templates: Any = None,
         messages: list[dict[str, str]],
         timeout_seconds: int = 60,
         tool_context: dict[str, Any] | None = None,
@@ -246,6 +238,7 @@ class LLMService:
         effective_system_prompt = self._augment_system_prompt(
             system_prompt,
             run_type="chat",
+            prompt_templates=prompt_templates,
         )
         if effective_system_prompt:
             payload_messages.append(
@@ -281,6 +274,7 @@ class LLMService:
         base_url: str,
         api_key: str,
         system_prompt: str | None,
+        prompt_templates: Any = None,
         messages: list[dict[str, str]],
         timeout_seconds: int = 60,
         run_type: str | None = None,
@@ -291,6 +285,7 @@ class LLMService:
         effective_system_prompt = self._augment_system_prompt(
             system_prompt,
             run_type=run_type,
+            prompt_templates=prompt_templates,
         )
         if effective_system_prompt:
             payload_messages.append(
@@ -321,6 +316,7 @@ class LLMService:
         system_prompt = self._augment_system_prompt(
             app_settings.system_prompt,
             run_type=run_type,
+            prompt_templates=getattr(app_settings, "prompt_templates", None),
         )
         return {
             "model": app_settings.llm_model,
@@ -343,6 +339,7 @@ class LLMService:
         system_prompt = self._augment_system_prompt(
             app_settings.system_prompt,
             run_type=run_type,
+            prompt_templates=getattr(app_settings, "prompt_templates", None),
         )
         payload_messages: list[dict[str, Any]] = []
         if system_prompt:
@@ -361,16 +358,20 @@ class LLMService:
         base_prompt: str | None,
         *,
         run_type: str | None = None,
+        prompt_templates: Any = None,
     ) -> str:
-        supplement = skill_stack_service.context.build_prompt_supplement(
-            run_type=run_type
-        )
+        supplement = skill_registry.build_prompt_supplement(run_type=run_type)
         prompt_parts = [
             str(base_prompt or "").strip(),
             str(supplement or "").strip(),
         ]
         if str(run_type or "").strip() == "chat":
-            prompt_parts.append(_CHAT_CONFIRMATION_APPEND_PROMPT)
+            prompt_parts.append(
+                resolve_prompt_template(
+                    prompt_templates,
+                    "chat_confirmation_append_prompt",
+                )
+            )
         return "\n\n".join(part for part in prompt_parts if part)
 
     def run_agent(
@@ -427,6 +428,7 @@ class LLMService:
             run_type=run_type,
             timeout_seconds=getattr(app_settings, "timeout_seconds", 60),
             tool_executor=_run_tool_executor,
+            prompt_templates=getattr(app_settings, "prompt_templates", None),
             emit=emit,
         )
 
@@ -453,6 +455,7 @@ class LLMService:
         run_type: str,
         timeout_seconds: int,
         tool_executor: Callable[[str, dict[str, Any]], dict[str, Any]],
+        prompt_templates: Any = None,
         emit: Any = None,
         cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
@@ -510,7 +513,10 @@ class LLMService:
                     messages.append(
                         {
                             "role": "user",
-                            "content": _EMPTY_FINAL_ANSWER_FOLLOWUP_PROMPT,
+                            "content": resolve_prompt_template(
+                                prompt_templates,
+                                "empty_final_answer_followup_prompt",
+                            ),
                         }
                     )
                     _emit(

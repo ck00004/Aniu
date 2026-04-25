@@ -7,6 +7,7 @@ export interface AppSettings {
   llm_api_key: string | null
   llm_model: string
   system_prompt: string
+  prompt_templates: Record<string, string>
   automation_context_window_tokens?: number | null
   created_at: string
   updated_at: string
@@ -16,6 +17,7 @@ export interface ScheduleConfig {
   id: number
   name: string
   run_type: 'analysis' | 'trade'
+  market_day_type: 'trading_day' | 'non_trading_day'
   cron_expression: string
   task_prompt: string
   timeout_seconds: number

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Callable
 
 from skills.mx_core.client import MXClient
@@ -155,6 +156,7 @@ class MXExecutionService:
         self, *, client: MXClient, app_settings: Any, arguments: dict[str, Any]
     ) -> dict[str, Any]:
         query = self._resolve_query(arguments, app_settings)
+        self._ensure_single_self_select_target(query)
         result = client.manage_self_select(query)
         return {
             "ok": True,
@@ -180,6 +182,7 @@ class MXExecutionService:
 
         if action not in {"BUY", "SELL"}:
             raise RuntimeError("模拟交易工具的 action 只能是 BUY 或 SELL。")
+        self._ensure_single_trade_symbol(symbol)
         if not symbol:
             raise RuntimeError("模拟交易工具缺少股票代码。")
         if quantity <= 0:
@@ -234,9 +237,9 @@ class MXExecutionService:
         stock_code = str(arguments.get("stock_code") or "").strip() or None
         reason = str(arguments.get("reason") or "").strip()
 
-        if cancel_type not in {"all", "order"}:
-            raise RuntimeError("cancel_type 只能是 all 或 order。")
-        if cancel_type == "order" and not order_id:
+        if cancel_type != "order":
+            raise RuntimeError("撤单一次只能按委托单号撤一笔，不允许 all 批量撤单。")
+        if not order_id:
             raise RuntimeError("按委托编号撤单时必须提供 order_id。")
 
         result = client.cancel_order(
@@ -247,9 +250,7 @@ class MXExecutionService:
         return {
             "ok": True,
             "tool_name": "mx_moni_cancel",
-            "summary": "已提交撤单请求。"
-            if cancel_type == "all"
-            else f"已提交撤单请求：{order_id}",
+            "summary": f"已提交撤单请求：{order_id}",
             "result": result,
             "executed_action": {
                 "action": "CANCEL",
@@ -268,6 +269,59 @@ class MXExecutionService:
         if fallback:
             return fallback
         raise RuntimeError("缺少 query 参数。")
+
+    def _ensure_single_self_select_target(self, query: str) -> None:
+        normalized = re.sub(r"\s+", "", str(query or ""))
+        if not normalized:
+            raise RuntimeError("自选股操作缺少目标股票。")
+
+        patterns = [
+            re.compile(r"(?:把|将)(.+?)(?:加入|添加到?|放入|纳入)(?:我的)?自选(?:股|列表)?"),
+            re.compile(r"(?:把|将)(.+?)(?:从)?(?:我的)?自选(?:股|列表)?(?:中)?(?:删除|移除|移出|去掉)"),
+            re.compile(r"(?:把|将)(.+?)(?:删除|移除|移出|去掉)(?:出)?(?:我的)?自选(?:股|列表)?"),
+            re.compile(r"(.+?)(?:加入|添加到?|放入|纳入)(?:我的)?自选(?:股|列表)?"),
+            re.compile(r"(.+?)(?:从)?(?:我的)?自选(?:股|列表)?(?:中)?(?:删除|移除|移出|去掉)"),
+        ]
+
+        target_fragment = normalized
+        for pattern in patterns:
+            matched = pattern.search(normalized)
+            if matched:
+                target_fragment = matched.group(1)
+                break
+
+        if re.search(r"(?:、|,|，|;|；|/|\\|和|及|以及|与)", target_fragment):
+            raise RuntimeError(
+                "一次只能添加或删除一只自选股；如需操作多只股票，请多次调用 mx_manage_self_select。"
+            )
+
+        stock_codes = {
+            item.group(0)
+            for item in re.finditer(r"\d{6}(?:\.(?:SH|SZ))?", target_fragment, re.IGNORECASE)
+        }
+        if len(stock_codes) > 1:
+            raise RuntimeError(
+                "一次只能添加或删除一只自选股；如需操作多只股票，请多次调用 mx_manage_self_select。"
+            )
+
+    def _ensure_single_trade_symbol(self, symbol: str) -> None:
+        text = str(symbol or "").strip()
+        if not text:
+            return
+
+        if re.search(r"(?:、|,|，|;|；|/|\\)\s*", text):
+            raise RuntimeError(
+                "一次只能交易一只股票；如需交易多只股票，请多次调用 mx_moni_trade。"
+            )
+
+        stock_codes = {
+            item.group(0)
+            for item in re.finditer(r"\d{6}(?:\.(?:SH|SZ))?", text, re.IGNORECASE)
+        }
+        if len(stock_codes) > 1:
+            raise RuntimeError(
+                "一次只能交易一只股票；如需交易多只股票，请多次调用 mx_moni_trade。"
+            )
 
     def _build_error_guidance(self, message: str) -> str:
         text = str(message or "").strip()

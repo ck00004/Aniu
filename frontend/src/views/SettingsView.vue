@@ -61,6 +61,35 @@
           </div>
         </div>
 
+        <section class="settings-prompt-section">
+          <div class="settings-prompt-head">
+            <h3>全局提示词配置</h3>
+            <p>这里展示运行时实际会用到的全局 prompt。保存后，后端会在下一次分析、交易、聊天或 Jin10 诊断时使用新内容。</p>
+          </div>
+
+          <div class="settings-prompt-groups">
+            <section
+              v-for="section in promptSections"
+              :key="section.key"
+              class="settings-prompt-group"
+            >
+              <div class="settings-prompt-group-head">
+                <h4>{{ section.title }}</h4>
+                <p>{{ section.description }}</p>
+              </div>
+              <label
+                v-for="field in section.items"
+                :key="field.key"
+                class="field"
+              >
+                <span>{{ field.label }}</span>
+                <textarea v-model="settings.prompt_templates[field.key]" :rows="field.rows" />
+                <p class="field-help">{{ field.description }}</p>
+              </label>
+            </section>
+          </div>
+        </section>
+
         <div v-if="errorMessage" class="error-banner">{{ errorMessage }}</div>
 
         <div class="panel-actions">
@@ -249,6 +278,20 @@ import { useSkillManager } from '@/composables/useSkillManager'
 import { useAppStore } from '@/stores/legacy'
 import type { SkillListItem } from '@/types'
 
+type PromptField = {
+  key: string
+  label: string
+  description: string
+  rows: number
+}
+
+type PromptSection = {
+  key: string
+  title: string
+  description: string
+  items: PromptField[]
+}
+
 const store = useAppStore()
 const { settings, busy, errorMessage } = storeToRefs(store)
 const { saveSettings } = store
@@ -270,6 +313,108 @@ const {
   deleteSkill: deleteManagedSkill,
 } = useSkillManager()
 const skillArchiveInputRef = ref<HTMLInputElement | null>(null)
+const promptSections: PromptSection[] = [
+  {
+    key: 'manual-run',
+    title: '手动运行默认提示词',
+    description: '用于未指定具体定时任务时的默认分析/交易任务提示词。',
+    items: [
+      {
+        key: 'manual_analysis_task_prompt',
+        label: '手动分析默认提示词',
+        description: '手动执行分析任务且未指定具体定时任务时使用。',
+        rows: 4,
+      },
+      {
+        key: 'manual_trade_task_prompt',
+        label: '手动交易默认提示词',
+        description: '手动执行交易任务且未指定具体定时任务时使用。',
+        rows: 4,
+      },
+    ],
+  },
+  {
+    key: 'runtime-guard',
+    title: '运行约束提示词',
+    description: '用于分析/交易运行期间的流程约束与一致性纠偏。',
+    items: [
+      {
+        key: 'analysis_self_select_guidance',
+        label: '分析任务执行要求',
+        description: '分析任务写入用户 prompt 时追加的流程约束。',
+        rows: 10,
+      },
+      {
+        key: 'trade_execution_guidance',
+        label: '交易任务执行要求',
+        description: '交易任务写入用户 prompt 时追加的执行约束。',
+        rows: 10,
+      },
+      {
+        key: 'self_select_consistency_followup_prompt',
+        label: '自选股一致性修正提示词',
+        description: '当结论与自选股工具执行不一致时触发。',
+        rows: 8,
+      },
+      {
+        key: 'trade_consistency_followup_prompt',
+        label: '交易一致性修正提示词',
+        description: '当结论与交易工具执行不一致时触发。',
+        rows: 8,
+      },
+      {
+        key: 'empty_final_answer_followup_prompt',
+        label: '空结论补充提示词',
+        description: '模型调了工具但没输出最终结论时触发。',
+        rows: 4,
+      },
+    ],
+  },
+  {
+    key: 'jin10',
+    title: 'Jin10 诊断提示词',
+    description: '用于 Jin10 新闻预分析与分批合并诊断。',
+    items: [
+      {
+        key: 'jin10_news_analysis_system_prompt',
+        label: 'Jin10 诊断系统提示词',
+        description: 'Jin10 预分析调用的大模型系统提示词。',
+        rows: 8,
+      },
+      {
+        key: 'jin10_news_analysis_output_format',
+        label: 'Jin10 输出格式提示词',
+        description: 'Jin10 诊断输出结构约束。',
+        rows: 7,
+      },
+      {
+        key: 'jin10_chunk_analysis_prompt_template',
+        label: 'Jin10 分块诊断模板',
+        description: '支持使用 {header}、{chunk_text}、{output_format} 占位符。',
+        rows: 5,
+      },
+      {
+        key: 'jin10_merge_analysis_prompt_template',
+        label: 'Jin10 汇总诊断模板',
+        description: '支持使用 {header}、{chunk_outputs}、{output_format} 占位符。',
+        rows: 5,
+      },
+    ],
+  },
+  {
+    key: 'chat-safety',
+    title: '聊天安全提示词',
+    description: '仅用于聊天模式的确认与保护规则。',
+    items: [
+      {
+        key: 'chat_confirmation_append_prompt',
+        label: '聊天确认附加提示词',
+        description: '聊天模式下自动追加到系统提示词后。',
+        rows: 6,
+      },
+    ],
+  },
+]
 const skillSections = computed(() => {
   const sections = [
     {

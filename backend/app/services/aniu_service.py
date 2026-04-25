@@ -26,6 +26,7 @@ from app.core.constants import (
     default_task_prompt,
     normalize_schedule_task_prompt,
 )
+from app.core.prompt_templates import render_prompt_template, resolve_prompt_template
 from app.db.database import session_scope
 from app.db.models import (
     AppSettings,
@@ -49,6 +50,9 @@ from app.services.trading_calendar_service import trading_calendar_service
 logger = logging.getLogger(__name__)
 
 RAW_TOOL_PREVIEW_MAX_CHARS = 6000
+TRADING_DAY_TYPE = "trading_day"
+NON_TRADING_DAY_TYPE = "non_trading_day"
+NON_TRADING_ANALYSIS_MAX_TASKS = 2
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 ANALYSIS_TASK_NAMES = {"盘前分析", "午间复盘", "收盘分析", "夜间分析"}
@@ -70,60 +74,14 @@ AUTOMATION_DEFAULT_RECENT_MESSAGE_LIMIT = 24
 AUTOMATION_DEFAULT_IDLE_SUMMARY_HOURS = 12
 AUTOMATION_RESERVED_OUTPUT_TOKENS = 4000
 AUTOMATION_SAFETY_BUFFER_TOKENS = 2000
-ANALYSIS_SELF_SELECT_GUIDANCE = """[分析执行要求]
-本轮属于分析任务，必须执行选股与自选维护流程：
-1. 优先结合上方 Jin10 当天新闻参考，提炼当日主题、催化、风险与资金偏好；若未提供 Jin10 参考，也要基于当日资讯继续完成分析。
-2. 必须调用 mx_get_self_selects 查看当前自选股列表，先盘点已有关注标的。
-3. 必须调用 mx_search_news 检索与当日主题、候选行业、候选个股相关的最新资讯、公告、研报或政策信息，核验催化是否成立。
-4. 必须调用 mx_screen_stocks 按主题、业绩、资金、趋势或估值等条件筛选候选股票，不得只凭主观记忆直接给出结论。
-5. 对确认值得后续持续跟踪的股票，调用 mx_manage_self_select 加入自选股。
-6. 对现有自选股中逻辑证伪、催化结束、关注价值下降、流动性明显不足或风险收益比恶化的股票，调用 mx_manage_self_select 从自选股移除。
-7. 如果没有找到合适的新标的，可以不新增；如果现有自选股仍应继续观察，可以不移除，但必须明确说明检查结论。
-8. 最终输出必须单独说明：新增自选股、移除自选股、继续保留观察的自选股，以及每只股票的跟踪理由与后续观察信号。"""
-TRADE_EXECUTION_GUIDANCE = """[交易执行要求]
-本轮属于交易任务，最终结论必须与真实交易执行完全一致：
-1. 必须先调用持仓、资产、委托或行情相关工具，再做买卖决策，不得跳过核验直接下结论。
-2. 如果你决定买入、卖出或撤单，必须调用 mx_moni_trade 或 mx_moni_cancel 执行实际操作，然后才能在最终结论中写“买入”“卖出”“撤单”“已执行”。
-3. 如果你没有实际调用交易工具，就不能在最终结论中声称已经下单、已经卖出、已经买入或已经撤单。
-4. 如果本轮只形成观察结论而不执行交易，必须明确写出“本轮未实际交易”。
-5. 最终输出必须单独说明：本轮实际交易动作、未执行原因、保留仓位与下一步观察条件。"""
-SELF_SELECT_CONSISTENCY_FOLLOWUP_PROMPT = """你刚才的最终结论里提到了自选股新增或移除，但当前工具执行记录没有对应的 mx_manage_self_select 操作。
-
-请立即进行一致性修正，且只能二选一：
-1. 如果你确认本轮确实应该新增或移除自选股，请立刻调用 mx_manage_self_select 完成实际操作，然后再给出最终结论。
-2. 如果你不打算实际执行自选股变更，请重写最终结论，明确说明本轮没有实际新增或移除任何自选股，不能再声称“已新增”“已移除”，也不能把未加入自选的股票表述为“新增候选”“新增重点跟踪对象”或其他等价新增表述。
-
-注意：最终自然语言结论必须与真实工具执行结果完全一致。"""
 SELF_SELECT_CONSISTENCY_WARNING = (
     "\n\n[系统一致性提示] 本轮最终结论提到了自选股变更，但系统未实际调用 "
     "mx_manage_self_select，因此未发生系统内自选股新增或移除。请以“本轮自选股变更”和工具执行记录为准。"
 )
-TRADE_CONSISTENCY_FOLLOWUP_PROMPT = """你刚才的最终结论里提到了明确的买入、卖出或撤单动作，但当前工具执行记录没有对应的交易执行。
-
-请立即进行一致性修正，且只能二选一：
-1. 如果你确认本轮确实应该执行交易，请立刻调用 mx_moni_trade 或 mx_moni_cancel 完成实际操作，然后再给出最终结论。
-2. 如果你不打算实际执行交易，请重写最终结论，明确说明本轮未实际交易，不能再声称“已买入”“已卖出”“执行买入”“执行卖出”“执行撤单”。
-
-注意：最终自然语言结论必须与真实工具执行结果完全一致。"""
 TRADE_CONSISTENCY_WARNING = (
     "\n\n[系统一致性提示] 本轮最终结论提到了交易执行，但系统未实际调用 "
     "mx_moni_trade 或 mx_moni_cancel，因此未发生系统内实际下单或撤单。请以交易执行记录和工具调用结果为准。"
 )
-JIN10_NEWS_ANALYSIS_SYSTEM_PROMPT = """你是负责盘前/盘中情报研判的专业市场策略分析师。
-你的任务是只基于给定的 Jin10 新闻原文，提炼对 A股市场和金融市场最重要的影响。
-严格要求：
-1. 只能依据输入新闻做归纳，不得编造未出现的信息。
-2. 优先关注宏观政策、监管、产业政策、汇率利率、大宗商品、海外市场联动、券商银行、科技制造、地产链、消费、军工与风险偏好变化。
-3. 输出必须服务于后续分析任务和交易任务，强调“可能影响哪些板块/资产、为何影响、还需验证什么”。
-4. 若新闻噪音较多，要主动去噪，只保留真正可能影响 A股或金融市场定价的信号。"""
-JIN10_NEWS_ANALYSIS_OUTPUT_FORMAT = """请严格使用以下结构输出：
-市场总览：用 3-5 句概括今日新闻流对 A股与金融市场的主导影响。
-A股重点方向：列出 3-5 个最值得关注的方向或板块，并写明驱动原因。
-金融市场联动：说明对利率、汇率、商品、港股、美股或风险偏好的联动影响；若不明显请明确写“不明显”。
-交易观察：给出 3-5 条可供后续分析/交易任务直接使用的观察点，强调需要结合盘口、量价、公告或持仓验证。
-风险提示：指出最值得警惕的 2-3 个不确定性或反转风险。"""
-
-
 @dataclass
 class PersistentRunSessionContext:
     session_id: int
@@ -140,6 +98,13 @@ def now_utc() -> datetime:
 
 def now_shanghai() -> datetime:
     return now_utc().astimezone(SHANGHAI_TZ)
+
+
+def _normalize_market_day_type(value: Any) -> str:
+    normalized = str(value or "").strip()
+    if normalized == NON_TRADING_DAY_TYPE:
+        return NON_TRADING_DAY_TYPE
+    return TRADING_DAY_TYPE
 
 
 def _assume_utc(value: datetime | None) -> datetime | None:
@@ -289,6 +254,33 @@ class AniuService:
             return "trade"
         return "analysis"
 
+    def _resolve_schedule_market_day_type(
+        self, schedule: StrategySchedule | None
+    ) -> str:
+        if schedule is None:
+            return TRADING_DAY_TYPE
+        return _normalize_market_day_type(getattr(schedule, "market_day_type", None))
+
+    def _market_day_matches(self, *, market_day_type: str, current_day: date) -> bool:
+        is_trading_day = trading_calendar_service.is_trading_day(current_day)
+        if _normalize_market_day_type(market_day_type) == NON_TRADING_DAY_TYPE:
+            return not is_trading_day
+        return is_trading_day
+
+    def _validate_schedule_payloads(self, payloads: list[ScheduleUpdate]) -> None:
+        non_trading_schedules = [
+            payload
+            for payload in payloads
+            if _normalize_market_day_type(payload.market_day_type)
+            == NON_TRADING_DAY_TYPE
+        ]
+        if len(non_trading_schedules) > NON_TRADING_ANALYSIS_MAX_TASKS:
+            raise RuntimeError("非交易日最多只能配置两条分析定时任务。")
+
+        for payload in non_trading_schedules:
+            if str(payload.run_type or "analysis") != "analysis":
+                raise RuntimeError("非交易日定时任务只能配置分析任务。")
+
     def _resolve_manual_run_profile(
         self,
         *,
@@ -297,11 +289,23 @@ class AniuService:
     ) -> tuple[str, str]:
         normalized = str(manual_run_type or "").strip().lower()
         if normalized == "trade":
-            return ("trade", default_task_prompt("trade"))
+            return (
+                "trade",
+                resolve_prompt_template(
+                    getattr(settings, "prompt_templates", None),
+                    "manual_trade_task_prompt",
+                ),
+            )
         task_prompt = str(getattr(settings, "task_prompt", "") or "").strip()
         if task_prompt:
             return ("analysis", task_prompt)
-        return ("analysis", default_task_prompt("analysis"))
+        return (
+            "analysis",
+            resolve_prompt_template(
+                getattr(settings, "prompt_templates", None),
+                "manual_analysis_task_prompt",
+            ),
+        )
 
     def _run_agent_supports_emit(self, run_agent: Any) -> bool:
         try:
@@ -387,6 +391,10 @@ class AniuService:
             if str(schedule.run_type or "").strip() not in {"analysis", "trade"}:
                 schedule.run_type = self._resolve_run_type(schedule)
                 mutated = True
+            normalized_market_day_type = self._resolve_schedule_market_day_type(schedule)
+            if str(schedule.market_day_type or "").strip() != normalized_market_day_type:
+                schedule.market_day_type = normalized_market_day_type
+                mutated = True
             if not schedule.cron_expression:
                 schedule.cron_expression = "*/30 * * * *"
                 mutated = True
@@ -405,7 +413,8 @@ class AniuService:
                 mutated = True
             if schedule.enabled and schedule.next_run_at is None:
                 schedule.next_run_at = self._compute_next_run_at(
-                    schedule.cron_expression
+                    schedule.cron_expression,
+                    market_day_type=schedule.market_day_type,
                 )
                 mutated = True
         if mutated:
@@ -416,6 +425,7 @@ class AniuService:
             instance = StrategySchedule(
                 name="默认任务",
                 run_type="analysis",
+                market_day_type=TRADING_DAY_TYPE,
                 cron_expression="*/30 * * * *",
                 task_prompt=default_task_prompt("analysis"),
                 timeout_seconds=1800,
@@ -457,6 +467,7 @@ class AniuService:
     def replace_schedules(
         self, db: Session, payloads: list[ScheduleUpdate]
     ) -> list[StrategySchedule]:
+        self._validate_schedule_payloads(payloads)
         existing = {item.id: item for item in self.list_schedules(db)}
         keep_ids: set[int] = set()
 
@@ -477,14 +488,24 @@ class AniuService:
                 instance.run_type,
                 instance.task_prompt,
             )
+            instance.market_day_type = _normalize_market_day_type(
+                instance.market_day_type
+            )
 
-            if instance.run_type == "analysis" and instance.name in ANALYSIS_TASK_NAMES:
+            if (
+                instance.run_type == "analysis"
+                and instance.market_day_type == TRADING_DAY_TYPE
+                and instance.name in ANALYSIS_TASK_NAMES
+            ):
                 parsed_time = _extract_fixed_analysis_time(instance.cron_expression)
                 if parsed_time is not None:
                     hour, minute = parsed_time
                     instance.cron_expression = f"{minute} {hour} * * 1-5"
 
-            instance.next_run_at = self._compute_next_run_at(instance.cron_expression)
+            instance.next_run_at = self._compute_next_run_at(
+                instance.cron_expression,
+                market_day_type=instance.market_day_type,
+            )
             db.add(instance)
             db.flush()
             keep_ids.add(instance.id)
@@ -1464,6 +1485,7 @@ class AniuService:
             base_url=str(settings.llm_base_url),
             api_key=str(settings.llm_api_key),
             system_prompt=settings.system_prompt,
+            prompt_templates=getattr(settings, "prompt_templates", None),
             messages=messages,
             timeout_seconds=1800,
             tool_context={"app_settings": settings},
@@ -1500,6 +1522,7 @@ class AniuService:
         settings_snapshot = SimpleNamespace(
             mx_api_key=settings.mx_api_key,
             system_prompt=settings.system_prompt,
+            prompt_templates=getattr(settings, "prompt_templates", {}),
             llm_model=settings.llm_model,
             llm_base_url=str(settings.llm_base_url),
             llm_api_key=str(settings.llm_api_key),
@@ -1520,6 +1543,7 @@ class AniuService:
                     base_url=settings_snapshot.llm_base_url,
                     api_key=settings_snapshot.llm_api_key,
                     system_prompt=settings_snapshot.system_prompt,
+                    prompt_templates=settings_snapshot.prompt_templates,
                     messages=messages,
                     timeout_seconds=180,
                     tool_context={"app_settings": settings_snapshot},
@@ -1818,9 +1842,15 @@ class AniuService:
                 settings=settings,
                 manual_run_type=manual_run_type,
             )
+            current_market_day_type = (
+                TRADING_DAY_TYPE
+                if trading_calendar_service.is_trading_day(now_shanghai().date())
+                else NON_TRADING_DAY_TYPE
+            )
             run = StrategyRun(
                 trigger_source=trigger_source,
                 run_type=schedule.run_type if schedule else manual_resolved_run_type,
+                market_day_type=current_market_day_type,
                 schedule_id=schedule.id if schedule else None,
                 schedule_name=schedule.name if schedule else None,
                 status="running",
@@ -1839,7 +1869,15 @@ class AniuService:
                 "llm_api_key": settings.llm_api_key,
                 "llm_model": settings.llm_model,
                 "run_type": schedule.run_type if schedule else manual_resolved_run_type,
+                "market_day_type": current_market_day_type,
+                "schedule_market_day_type": (
+                    self._resolve_schedule_market_day_type(schedule)
+                    if schedule is not None
+                    else current_market_day_type
+                ),
+                "prompt_templates": getattr(settings, "prompt_templates", {}),
                 "schedule_id": schedule.id if schedule else None,
+                "schedule_name": schedule.name if schedule else None,
                 "system_prompt": settings.system_prompt,
                 "task_prompt": schedule.task_prompt if schedule else manual_task_prompt,
                 "timeout_seconds": int(
@@ -2000,11 +2038,16 @@ class AniuService:
                     model=str(getattr(settings, "llm_model", "") or ""),
                     base_url=str(getattr(settings, "llm_base_url", "") or ""),
                     api_key=str(getattr(settings, "llm_api_key", "") or ""),
-                    system_prompt=JIN10_NEWS_ANALYSIS_SYSTEM_PROMPT,
+                    system_prompt=resolve_prompt_template(
+                        getattr(settings, "prompt_templates", None),
+                        "jin10_news_analysis_system_prompt",
+                    ),
+                    prompt_templates=getattr(settings, "prompt_templates", None),
                     messages=[
                         {
                             "role": "user",
                             "content": self._build_jin10_chunk_analysis_prompt(
+                                settings=settings,
                                 chunk_text=chunk,
                                 chunk_index=index,
                                 chunk_total=len(chunks),
@@ -2028,11 +2071,16 @@ class AniuService:
                     model=str(getattr(settings, "llm_model", "") or ""),
                     base_url=str(getattr(settings, "llm_base_url", "") or ""),
                     api_key=str(getattr(settings, "llm_api_key", "") or ""),
-                    system_prompt=JIN10_NEWS_ANALYSIS_SYSTEM_PROMPT,
+                    system_prompt=resolve_prompt_template(
+                        getattr(settings, "prompt_templates", None),
+                        "jin10_news_analysis_system_prompt",
+                    ),
+                    prompt_templates=getattr(settings, "prompt_templates", None),
                     messages=[
                         {
                             "role": "user",
                             "content": self._build_jin10_merge_analysis_prompt(
+                                settings=settings,
                                 chunk_outputs=chunk_outputs,
                                 item_count=len(items),
                                 target_day=target_day,
@@ -2070,6 +2118,7 @@ class AniuService:
     def _build_jin10_chunk_analysis_prompt(
         self,
         *,
+        settings: Any,
         chunk_text: str,
         chunk_index: int,
         chunk_total: int,
@@ -2077,17 +2126,24 @@ class AniuService:
         target_day: date,
         current_time: datetime,
     ) -> str:
-        return (
-            f"以下是 {target_day.isoformat()} 截至 {current_time.strftime('%H:%M:%S')} 的 Jin10 新闻原文"
-            f"（第 {chunk_index}/{chunk_total} 批，共 {item_count} 条新闻的一部分）。\n\n"
-            f"{chunk_text}\n\n"
-            "请只基于这些新闻原文，提炼这批新闻对 A股市场和金融市场的影响。\n"
-            f"{JIN10_NEWS_ANALYSIS_OUTPUT_FORMAT}"
+        return render_prompt_template(
+            getattr(settings, "prompt_templates", None),
+            "jin10_chunk_analysis_prompt_template",
+            header=(
+                f"以下是 {target_day.isoformat()} 截至 {current_time.strftime('%H:%M:%S')} 的 Jin10 新闻原文"
+                f"（第 {chunk_index}/{chunk_total} 批，共 {item_count} 条新闻的一部分）。"
+            ),
+            chunk_text=chunk_text,
+            output_format=resolve_prompt_template(
+                getattr(settings, "prompt_templates", None),
+                "jin10_news_analysis_output_format",
+            ),
         )
 
     def _build_jin10_merge_analysis_prompt(
         self,
         *,
+        settings: Any,
         chunk_outputs: list[str],
         item_count: int,
         target_day: date,
@@ -2097,12 +2153,18 @@ class AniuService:
         for index, output in enumerate(chunk_outputs, start=1):
             parts.append(f"第 {index} 批诊断：\n{output}")
         joined = "\n\n".join(parts)
-        return (
-            f"以下是 {target_day.isoformat()} 截至 {current_time.strftime('%H:%M:%S')} 的 Jin10 新闻分批诊断结果。"
-            f"请合并为一份最终结论，共对应 {item_count} 条新闻。\n\n"
-            f"{joined}\n\n"
-            "请去重、消除矛盾，保留真正对 A股和金融市场有定价意义的信息。\n"
-            f"{JIN10_NEWS_ANALYSIS_OUTPUT_FORMAT}"
+        return render_prompt_template(
+            getattr(settings, "prompt_templates", None),
+            "jin10_merge_analysis_prompt_template",
+            header=(
+                f"以下是 {target_day.isoformat()} 截至 {current_time.strftime('%H:%M:%S')} 的 Jin10 新闻分批诊断结果。"
+                f"请合并为一份最终结论，共对应 {item_count} 条新闻。"
+            ),
+            chunk_outputs=joined,
+            output_format=resolve_prompt_template(
+                getattr(settings, "prompt_templates", None),
+                "jin10_news_analysis_output_format",
+            ),
         )
 
     def _build_jin10_analysis_context_text(
@@ -2300,6 +2362,7 @@ class AniuService:
                         schedule.next_run_at = self._compute_next_run_at(
                             schedule.cron_expression,
                             from_time=completed_at_shanghai,
+                            market_day_type=schedule.market_day_type,
                         )
                         db.add(schedule)
 
@@ -2455,6 +2518,7 @@ class AniuService:
                         schedule.next_run_at = self._compute_next_run_at(
                             schedule.cron_expression,
                             from_time=now_shanghai(),
+                            market_day_type=schedule.market_day_type,
                         )
                         if trigger_source == "schedule":
                             retry_count = max(int(schedule.retry_count or 0), 0)
@@ -2550,16 +2614,22 @@ class AniuService:
             for schedule in schedules:
                 if not schedule.enabled:
                     continue
+                schedule_market_day_type = self._resolve_schedule_market_day_type(schedule)
                 if schedule.next_run_at is None:
                     schedule.next_run_at = self._compute_next_run_at(
-                        schedule.cron_expression
+                        schedule.cron_expression,
+                        market_day_type=schedule_market_day_type,
                     )
                     db.add(schedule)
                     continue
-                if not trading_calendar_service.is_trading_day(now.date()):
+                if not self._market_day_matches(
+                    market_day_type=schedule_market_day_type,
+                    current_day=now.date(),
+                ):
                     schedule.next_run_at = self._compute_next_run_at(
                         schedule.cron_expression,
                         from_time=now,
+                        market_day_type=schedule_market_day_type,
                     )
                     db.add(schedule)
                     continue
@@ -3128,7 +3198,10 @@ class AniuService:
         followup_messages.append(
             {
                 "role": "user",
-                "content": SELF_SELECT_CONSISTENCY_FOLLOWUP_PROMPT,
+                "content": resolve_prompt_template(
+                    getattr(settings, "prompt_templates", None),
+                    "self_select_consistency_followup_prompt",
+                ),
             }
         )
         followup_decision, followup_request, followup_response, followup_runtime_trace = (
@@ -3236,7 +3309,10 @@ class AniuService:
         followup_messages.append(
             {
                 "role": "user",
-                "content": TRADE_CONSISTENCY_FOLLOWUP_PROMPT,
+                "content": resolve_prompt_template(
+                    getattr(settings, "prompt_templates", None),
+                    "trade_consistency_followup_prompt",
+                ),
             }
         )
         followup_decision, followup_request, followup_response, followup_runtime_trace = (
@@ -3310,6 +3386,26 @@ class AniuService:
     ) -> PersistentRunSessionContext:
         with session_scope() as db:
             session = self._get_or_create_persistent_session(db)
+            runtime_context = self._build_daily_run_context(
+                db=db,
+                run_id=run_id,
+                current_time=now_shanghai(),
+                run_type=str(getattr(settings, "run_type", "analysis") or "analysis"),
+                market_day_type=str(
+                    getattr(settings, "market_day_type", TRADING_DAY_TYPE)
+                    or TRADING_DAY_TYPE
+                ),
+            )
+            handoff_context = self._build_non_trading_analysis_handoff_context(
+                db=db,
+                current_time=runtime_context["current_time"],
+                run_type=str(getattr(settings, "run_type", "analysis") or "analysis"),
+                market_day_type=str(
+                    getattr(settings, "market_day_type", TRADING_DAY_TYPE)
+                    or TRADING_DAY_TYPE
+                ),
+                analysis_call_index=int(runtime_context["analysis_call_index"]),
+            )
             user_content = self._build_persistent_session_user_content(
                 settings=settings,
                 trigger_source=trigger_source,
@@ -3317,7 +3413,11 @@ class AniuService:
                 schedule_name=getattr(settings, "schedule_name", None),
                 run_type=str(getattr(settings, "run_type", "analysis") or "analysis"),
                 task_prompt=str(getattr(settings, "task_prompt", "") or ""),
-                prefetched_context=prefetched_context,
+                prefetched_context=self._merge_prefetched_contexts(
+                    handoff_context,
+                    prefetched_context,
+                ),
+                runtime_context=runtime_context,
             )
             user_message = self._persist_persistent_session_user_message(
                 db=db,
@@ -3376,6 +3476,133 @@ class AniuService:
                 context_tokens_estimate=context_tokens_estimate,
                 messages=messages,
             )
+
+    def _build_daily_run_context(
+        self,
+        *,
+        db: Session,
+        run_id: int,
+        current_time: datetime,
+        run_type: str,
+        market_day_type: str,
+    ) -> dict[str, Any]:
+        day_start = datetime.combine(
+            current_time.date(),
+            datetime.min.time(),
+            tzinfo=SHANGHAI_TZ,
+        )
+        day_end = day_start + timedelta(days=1)
+        day_start_utc = day_start.astimezone(timezone.utc)
+        day_end_utc = day_end.astimezone(timezone.utc)
+        prior_total = db.scalar(
+            select(func.count(StrategyRun.id)).where(
+                StrategyRun.id != run_id,
+                StrategyRun.started_at >= day_start_utc,
+                StrategyRun.started_at < day_end_utc,
+            )
+        )
+        prior_analysis = db.scalar(
+            select(func.count(StrategyRun.id)).where(
+                StrategyRun.id != run_id,
+                StrategyRun.run_type == "analysis",
+                StrategyRun.started_at >= day_start_utc,
+                StrategyRun.started_at < day_end_utc,
+            )
+        )
+        normalized_market_day_type = _normalize_market_day_type(market_day_type)
+        return {
+            "current_time": current_time,
+            "is_trading_day": normalized_market_day_type == TRADING_DAY_TYPE,
+            "market_day_type": normalized_market_day_type,
+            "call_index": int(prior_total or 0) + 1,
+            "analysis_call_index": (
+                int(prior_analysis or 0) + 1
+                if str(run_type or "analysis") == "analysis"
+                else int(prior_analysis or 0)
+            ),
+        }
+
+    def _merge_prefetched_contexts(self, *parts: str | None) -> str | None:
+        normalized_parts = [
+            str(part or "").strip() for part in parts if str(part or "").strip()
+        ]
+        if not normalized_parts:
+            return None
+        return "\n\n".join(normalized_parts)
+
+    def _previous_trading_day(self, current: date) -> date | None:
+        probe = current - timedelta(days=1)
+        for _ in range(30):
+            if trading_calendar_service.is_trading_day(probe):
+                return probe
+            probe -= timedelta(days=1)
+        return None
+
+    def _build_non_trading_analysis_handoff_context(
+        self,
+        *,
+        db: Session,
+        current_time: datetime,
+        run_type: str,
+        market_day_type: str,
+        analysis_call_index: int,
+    ) -> str | None:
+        if str(run_type or "") != "analysis":
+            return None
+        if _normalize_market_day_type(market_day_type) != TRADING_DAY_TYPE:
+            return None
+        if int(analysis_call_index or 0) != 1:
+            return None
+
+        previous_trading_day = self._previous_trading_day(current_time.date())
+        if previous_trading_day is None:
+            return None
+
+        window_start = datetime.combine(
+            previous_trading_day + timedelta(days=1),
+            datetime.min.time(),
+            tzinfo=SHANGHAI_TZ,
+        ).astimezone(timezone.utc)
+        window_end = datetime.combine(
+            current_time.date(),
+            datetime.min.time(),
+            tzinfo=SHANGHAI_TZ,
+        ).astimezone(timezone.utc)
+        stmt = (
+            select(StrategyRun)
+            .where(
+                StrategyRun.run_type == "analysis",
+                StrategyRun.market_day_type == NON_TRADING_DAY_TYPE,
+                StrategyRun.status == "completed",
+                StrategyRun.started_at >= window_start,
+                StrategyRun.started_at < window_end,
+            )
+            .order_by(StrategyRun.started_at.asc(), StrategyRun.id.asc())
+            .limit(6)
+        )
+        runs = list(db.scalars(stmt).all())
+        if not runs:
+            return None
+
+        lines = [
+            "[最近非交易日分析结论]",
+            "以下为最近非交易日的分析结果，请在今天第一次交易日分析中继承其结论，并结合最新行情与资讯重新验证：",
+            "",
+        ]
+        for index, run in enumerate(runs, start=1):
+            started_at = _assume_utc(run.started_at)
+            started_text = (
+                started_at.astimezone(SHANGHAI_TZ).strftime("%Y-%m-%d %H:%M:%S")
+                if started_at is not None
+                else "--"
+            )
+            summary = self._build_analysis_summary(
+                run.final_answer or run.analysis_summary or run.error_message
+            ) or "--"
+            lines.append(
+                f"{index}. {started_text} {str(run.schedule_name or '非交易日分析')}：{summary}"
+            )
+        return "\n".join(lines).strip()
 
     def _get_or_create_persistent_session(self, db: Session) -> ChatSession:
         settings = self.get_or_create_settings(db)
@@ -3436,8 +3663,15 @@ class AniuService:
         run_type: str,
         task_prompt: str,
         prefetched_context: str | None,
+        runtime_context: dict[str, Any] | None,
     ) -> str:
-        current_time = now_shanghai()
+        current_time = (
+            runtime_context.get("current_time")
+            if isinstance(runtime_context, dict)
+            else None
+        )
+        if not isinstance(current_time, datetime):
+            current_time = now_shanghai()
         run_time = (
             f"{current_time.year}年{current_time.month}月{current_time.day}日 "
             f"{current_time.strftime('%H:%M:%S')}"
@@ -3449,28 +3683,46 @@ class AniuService:
             "交易任务" if str(run_type or "").strip() == "trade" else "分析任务"
         )
         lines = [
-            f"时间：{run_time}",
+            f"北京时间：{run_time}",
             f"来源: {trigger_source_text}",
             f"任务类型: {task_type_text}",
+            (
+                "今日类型: 交易日"
+                if bool((runtime_context or {}).get("is_trading_day", False))
+                else "今日类型: 非交易日"
+            ),
+            f"今日第 {(runtime_context or {}).get('call_index', 1)} 次调用",
+            f"今日第 {(runtime_context or {}).get('analysis_call_index', 1)} 次分析调用",
             "",
             "本轮任务:",
             str(task_prompt or "").strip() or "--",
         ]
+        if schedule_name:
+            lines.insert(3, f"定时任务: {schedule_name}")
         extra_context = str(prefetched_context or "").strip()
         if extra_context:
             lines.extend(["", extra_context])
-        run_type_guidance = self._build_run_type_guidance(run_type=run_type)
+        run_type_guidance = self._build_run_type_guidance(
+            settings=settings,
+            run_type=run_type,
+        )
         if run_type_guidance:
             lines.extend(["", run_type_guidance])
-        del settings, schedule_name
+        del settings
         return "\n".join(lines).strip()
 
-    def _build_run_type_guidance(self, *, run_type: str) -> str:
+    def _build_run_type_guidance(self, *, settings: Any, run_type: str) -> str:
         normalized = str(run_type or "").strip()
         if normalized == "analysis":
-            return ANALYSIS_SELF_SELECT_GUIDANCE
+            return resolve_prompt_template(
+                getattr(settings, "prompt_templates", None),
+                "analysis_self_select_guidance",
+            )
         if normalized == "trade":
-            return TRADE_EXECUTION_GUIDANCE
+            return resolve_prompt_template(
+                getattr(settings, "prompt_templates", None),
+                "trade_execution_guidance",
+            )
         return ""
 
     def _build_persistent_session_assistant_content(
@@ -3667,6 +3919,19 @@ class AniuService:
         messages.extend(history_messages)
         return messages
 
+    def _build_persistent_session_context_system_message(
+        self,
+        *,
+        session: ChatSession,
+    ) -> dict[str, Any] | None:
+        summary = str(getattr(session, "archived_summary", "") or "").strip()
+        if not summary:
+            return None
+        return {
+            "role": "system",
+            "content": "[上下文压缩摘要]\n" + summary,
+        }
+
     def _build_compacted_summary_text(
         self, records: list[ChatMessageRecord]
     ) -> str | None:
@@ -3828,6 +4093,7 @@ class AniuService:
         self,
         cron_expression: str | None,
         from_time: datetime | None = None,
+        market_day_type: str = TRADING_DAY_TYPE,
     ) -> datetime | None:
         if not cron_expression:
             return None
@@ -3856,14 +4122,19 @@ class AniuService:
             current_base = current_base.replace(tzinfo=SHANGHAI_TZ)
         else:
             current_base = current_base.astimezone(SHANGHAI_TZ)
+        resolved_market_day_type = _normalize_market_day_type(market_day_type)
 
         current = current_base.replace(second=0, microsecond=0) + timedelta(minutes=1)
 
         for _ in range(60 * 24 * 366 * 2):
-            if not trading_calendar_service.is_trading_day(current.date()):
-                next_day = trading_calendar_service.next_trading_day(current.date())
+            if not self._market_day_matches(
+                market_day_type=resolved_market_day_type,
+                current_day=current.date(),
+            ):
                 current = datetime.combine(
-                    next_day, datetime.min.time(), tzinfo=SHANGHAI_TZ
+                    current.date() + timedelta(days=1),
+                    datetime.min.time(),
+                    tzinfo=SHANGHAI_TZ,
                 )
                 continue
 

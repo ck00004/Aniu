@@ -2,6 +2,7 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from fastapi.testclient import TestClient
 
@@ -219,6 +220,55 @@ def test_manual_runs_share_automation_session_with_scheduled_runs(monkeypatch, t
             assert len(messages) == 4
             assert [item.role for item in messages] == ["user", "assistant", "user", "assistant"]
             assert any(record.run_id == manual_run.id for record in messages)
+
+    reset_db_state()
+
+
+def test_manual_schedule_run_uses_actual_market_day_type_in_context(
+    monkeypatch, tmp_path
+) -> None:
+    captured_messages: list[list[dict[str, object]]] = []
+
+    def fake_run_agent_with_messages(*, messages, **kwargs):
+        del kwargs
+        captured_messages.append(messages)
+        return _fake_run_result("manual scheduled decision")
+
+    monkeypatch.setattr(llm_service, "run_agent_with_messages", fake_run_agent_with_messages)
+    monkeypatch.setattr(
+        aniu_service,
+        "_prefetch_analysis_context",
+        lambda **kwargs: (None, None),
+    )
+
+    from app.services import aniu_service as aniu_service_module
+
+    monkeypatch.setattr(
+        aniu_service_module,
+        "now_shanghai",
+        lambda: datetime(2026, 4, 11, 9, 30, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    monkeypatch.setattr(
+        trading_calendar_service,
+        "is_trading_day",
+        lambda current: False if current.isoformat() == "2026-04-11" else current.weekday() < 5,
+    )
+
+    with create_test_client(monkeypatch, tmp_path):
+        with session_scope() as db:
+            settings = aniu_service.get_or_create_settings(db)
+            settings.mx_api_key = "mx-key"
+            settings.llm_base_url = "https://example.com/v1"
+            settings.llm_api_key = "llm-key"
+            settings.llm_model = "demo-model"
+            schedule = _prepare_schedule(db, name="盘前分析", run_type="analysis")
+            schedule_id = schedule.id
+
+        run = aniu_service.execute_run(trigger_source="manual", schedule_id=schedule_id)
+
+        assert run.market_day_type == "non_trading_day"
+        assert len(captured_messages) == 1
+        assert any("今日类型: 非交易日" in str(msg.get("content") or "") for msg in captured_messages[0])
 
     reset_db_state()
 
