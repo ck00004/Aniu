@@ -24,6 +24,9 @@ class AppSettings(Base):
     jin10_api_base_url: Mapped[str | None] = mapped_column(
         String(255), nullable=True
     )
+    cls_api_base_url: Mapped[str | None] = mapped_column(
+        String(255), nullable=True
+    )
     llm_base_url: Mapped[str | None] = mapped_column(String(255), nullable=True)
     llm_api_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     llm_model: Mapped[str] = mapped_column(String(128), default="gpt-4o-mini")

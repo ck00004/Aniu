@@ -38,7 +38,17 @@
                 placeholder="http://127.0.0.1:3000"
               />
               <p class="field-help">
-                用于连接 Jin10 新闻服务，分析前会拉取当天新闻作为辅助参考。
+                用于连接 Jin10 新闻服务，分析前会拉取当天全量新闻并独立预分析。
+              </p>
+            </label>
+            <label class="field">
+              <span>CLS API Base URL</span>
+              <input
+                v-model="settings.cls_api_base_url"
+                placeholder="http://127.0.0.1:3000"
+              />
+              <p class="field-help">
+                用于连接 CLS 电报服务，分析前会拉取当天全量电报并独立预分析。
               </p>
             </label>
           </div>
@@ -64,7 +74,7 @@
         <section class="settings-prompt-section">
           <div class="settings-prompt-head">
             <h3>全局提示词配置</h3>
-            <p>这里展示运行时实际会用到的全局 prompt。保存后，后端会在下一次分析、交易、聊天或 Jin10 诊断时使用新内容。</p>
+            <p>这里展示运行时实际会用到的全局 prompt。保存后，后端会在下一次分析、交易、聊天或新闻源预诊断时使用新内容。</p>
           </div>
 
           <div class="settings-prompt-groups">
@@ -316,20 +326,51 @@ const skillArchiveInputRef = ref<HTMLInputElement | null>(null)
 const promptSections: PromptSection[] = [
   {
     key: 'manual-run',
-    title: '手动运行默认提示词',
-    description: '用于未指定具体定时任务时的默认分析/交易任务提示词。',
+    title: '手动运行提示词',
+    description: '用于手动触发分析或交易任务时的默认提示词。',
     items: [
       {
         key: 'manual_analysis_task_prompt',
         label: '手动分析默认提示词',
-        description: '手动执行分析任务且未指定具体定时任务时使用。',
+        description: '手动运行分析任务时写入用户 prompt 的默认内容。',
         rows: 4,
       },
       {
         key: 'manual_trade_task_prompt',
         label: '手动交易默认提示词',
-        description: '手动执行交易任务且未指定具体定时任务时使用。',
+        description: '手动运行交易任务时写入用户 prompt 的默认内容。',
         rows: 4,
+      },
+    ],
+  },
+  {
+    key: 'news-analysis',
+    title: '资讯源诊断提示词',
+    description: '用于 Jin10 / CLS 新闻预分析与分批合并诊断。',
+    items: [
+      {
+        key: 'jin10_news_analysis_system_prompt',
+        label: '资讯源诊断系统提示词',
+        description: 'Jin10 / CLS 预分析调用的大模型系统提示词。',
+        rows: 8,
+      },
+      {
+        key: 'jin10_news_analysis_output_format',
+        label: '资讯源输出格式提示词',
+        description: 'Jin10 / CLS 诊断输出结构约束。',
+        rows: 7,
+      },
+      {
+        key: 'jin10_chunk_analysis_prompt_template',
+        label: '资讯源分块诊断模板',
+        description: '支持使用 {header}、{chunk_text}、{output_format} 占位符。',
+        rows: 5,
+      },
+      {
+        key: 'jin10_merge_analysis_prompt_template',
+        label: '资讯源汇总诊断模板',
+        description: '支持使用 {header}、{chunk_outputs}、{output_format} 占位符。',
+        rows: 5,
       },
     ],
   },
@@ -367,37 +408,6 @@ const promptSections: PromptSection[] = [
         label: '空结论补充提示词',
         description: '模型调了工具但没输出最终结论时触发。',
         rows: 4,
-      },
-    ],
-  },
-  {
-    key: 'jin10',
-    title: 'Jin10 诊断提示词',
-    description: '用于 Jin10 新闻预分析与分批合并诊断。',
-    items: [
-      {
-        key: 'jin10_news_analysis_system_prompt',
-        label: 'Jin10 诊断系统提示词',
-        description: 'Jin10 预分析调用的大模型系统提示词。',
-        rows: 8,
-      },
-      {
-        key: 'jin10_news_analysis_output_format',
-        label: 'Jin10 输出格式提示词',
-        description: 'Jin10 诊断输出结构约束。',
-        rows: 7,
-      },
-      {
-        key: 'jin10_chunk_analysis_prompt_template',
-        label: 'Jin10 分块诊断模板',
-        description: '支持使用 {header}、{chunk_text}、{output_format} 占位符。',
-        rows: 5,
-      },
-      {
-        key: 'jin10_merge_analysis_prompt_template',
-        label: 'Jin10 汇总诊断模板',
-        description: '支持使用 {header}、{chunk_outputs}、{output_format} 占位符。',
-        rows: 5,
       },
     ],
   },

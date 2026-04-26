@@ -3,6 +3,7 @@ export interface AppSettings {
   provider_name: string
   mx_api_key: string | null
   jin10_api_base_url: string | null
+  cls_api_base_url: string | null
   llm_base_url: string | null
   llm_api_key: string | null
   llm_model: string
@@ -98,6 +99,16 @@ export interface ExecutionSummary {
   error_message: string | null
 }
 
+export interface NewsSourceDiagnostic {
+  key: string
+  label: string
+  baseUrl: string | null
+  sourceSummary: string | null
+  diagnosisText: string | null
+  metrics: DiagnosticMetric[]
+  failureReason: string | null
+}
+
 export interface ApiDetail {
   tool_name: string
   name: string
@@ -122,6 +133,12 @@ export interface RawToolPreviewDetail extends RawToolPreview {
   full_preview: string
 }
 
+export interface DiagnosticMetric {
+  label: string
+  value: string
+  tone?: 'default' | 'warning'
+}
+
 export interface TradeDetail {
   action: 'buy' | 'sell'
   action_text: string
@@ -131,6 +148,7 @@ export interface TradeDetail {
   price: number | null
   amount: number | null
   summary: string
+  source_labels: string[]
   tool_name: string | null
   preview_index: number | null
   status?: 'running' | 'done' | 'failed' | null

@@ -482,6 +482,7 @@ function createRunStream() {
       price,
       amount,
       summary: `挂单${tradeAction === 'sell' ? '卖出' : '买入'}${symbol}共计${volume}股。`,
+      source_labels: [],
       tool_name: null,
       preview_index: null,
       status: tradeStatus,

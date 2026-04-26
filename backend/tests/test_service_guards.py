@@ -8,7 +8,7 @@ import pytest
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from app.db.database import init_db
-from app.db.models import StrategySchedule
+from app.db.models import StrategyRun, StrategySchedule
 from app.schemas.aniu import ScheduleUpdate
 from app.services.aniu_service import aniu_service
 from app.services.jin10_news_service import Jin10NewsService
@@ -154,6 +154,38 @@ def test_build_persistent_session_user_content_includes_prefetched_context() -> 
     assert "mx_manage_self_select" in content
 
 
+def test_build_persistent_session_user_content_includes_source_overview() -> None:
+    content = aniu_service._build_persistent_session_user_content(
+        settings=None,
+        trigger_source="manual",
+        schedule_id=None,
+        schedule_name=None,
+        run_type="analysis",
+        task_prompt="请分析今天市场",
+        prefetched_context="[Jin10 新闻诊断]\n摘要A",
+        prefetched_context_meta={
+            "sources": {
+                "jin10": {
+                    "source_key": "jin10",
+                    "source_label": "Jin10",
+                    "analysis_meta": {"summary": "风险偏好回升"},
+                },
+                "cls": {
+                    "source_key": "cls",
+                    "source_label": "CLS",
+                    "analysis_meta": {"summary": "政策催化增强"},
+                },
+            },
+            "used_sources": ["jin10", "cls"],
+        },
+        runtime_context=None,
+    )
+
+    assert "本轮资讯来源摘要" in content
+    assert "Jin10：风险偏好回升" in content
+    assert "CLS：政策催化增强" in content
+
+
 def test_build_persistent_session_user_content_skips_self_select_guidance_for_trade() -> None:
     content = aniu_service._build_persistent_session_user_content(
         settings=None,
@@ -250,6 +282,121 @@ def test_build_jin10_prompt_templates_use_overrides() -> None:
     assert "输出格式X" in chunk_prompt
     assert "--新闻块--" in chunk_prompt
     assert "==第 1 批诊断：\n结论1\n\n第 2 批诊断：\n结论2==" in merge_prompt
+
+
+def test_build_cls_prompt_templates_use_overrides() -> None:
+    settings = SimpleNamespace(
+        prompt_templates={
+            "jin10_news_analysis_output_format": "输出格式Y",
+            "jin10_chunk_analysis_prompt_template": "{header}\n--{chunk_text}--\n{output_format}",
+            "jin10_merge_analysis_prompt_template": "{header}\n=={chunk_outputs}==\n{output_format}",
+        }
+    )
+
+    chunk_prompt = aniu_service._build_cls_chunk_analysis_prompt(
+        settings=settings,
+        chunk_text="电报块",
+        chunk_index=1,
+        chunk_total=2,
+        item_count=8,
+        target_day=date(2026, 4, 26),
+        current_time=datetime(2026, 4, 26, 9, 30),
+    )
+    merge_prompt = aniu_service._build_cls_merge_analysis_prompt(
+        settings=settings,
+        chunk_outputs=["结论A", "结论B"],
+        item_count=8,
+        target_day=date(2026, 4, 26),
+        current_time=datetime(2026, 4, 26, 9, 30),
+    )
+
+    assert "CLS 新闻原文" in chunk_prompt
+    assert "输出格式Y" in chunk_prompt
+    assert "--电报块--" in chunk_prompt
+    assert "CLS 新闻分批诊断结果" in merge_prompt
+    assert "==第 1 批诊断：\n结论A\n\n第 2 批诊断：\n结论B==" in merge_prompt
+
+
+def test_select_primary_prefetched_context_meta_prefers_jin10_then_cls() -> None:
+    meta = {
+        "sources": {
+            "cls": {"source_key": "cls", "analysis_text": "cls"},
+            "jin10": {"source_key": "jin10", "analysis_text": "jin10"},
+        }
+    }
+
+    selected = aniu_service._select_primary_prefetched_context_meta(meta)
+
+    assert selected == {"source_key": "jin10", "analysis_text": "jin10"}
+
+    cls_only = {"sources": {"cls": {"source_key": "cls", "analysis_text": "cls"}}}
+    assert aniu_service._select_primary_prefetched_context_meta(cls_only) == {
+        "source_key": "cls",
+        "analysis_text": "cls",
+    }
+
+
+def test_build_analysis_summary_and_final_answer_include_source_labels() -> None:
+    source_meta = {
+        "sources": {
+            "jin10": {
+                "source_key": "jin10",
+                "source_label": "Jin10",
+                "analysis_meta": {"summary": "风险偏好回升"},
+            },
+            "cls": {
+                "source_key": "cls",
+                "source_label": "CLS",
+                "analysis_meta": {"summary": "政策催化增强"},
+            },
+        },
+        "used_sources": ["jin10", "cls"],
+    }
+
+    summary = aniu_service._build_analysis_summary(
+        "市场主线转强，关注券商与科技。",
+        source_meta,
+    )
+    decorated = aniu_service._decorate_final_answer_with_sources(
+        "市场主线转强，关注券商与科技。",
+        source_meta,
+    )
+
+    assert summary is not None
+    assert summary.startswith("资讯源：Jin10、CLS；")
+    assert decorated is not None
+    assert decorated.startswith("本轮资讯来源\n- Jin10：风险偏好回升\n- CLS：政策催化增强")
+    assert decorated.endswith("市场主线转强，关注券商与科技。")
+
+
+def test_build_run_trade_details_includes_source_labels() -> None:
+    run = StrategyRun(
+        executed_actions=[
+            {
+                "action": "BUY",
+                "symbol": "600519.SH",
+                "quantity": 100,
+                "status": "submitted",
+            }
+        ],
+        skill_payloads={
+            "prefetched_context_sources": {
+                "sources": {
+                    "jin10": {"source_key": "jin10", "source_label": "Jin10"},
+                    "cls": {"source_key": "cls", "source_label": "CLS"},
+                },
+                "used_sources": ["jin10", "cls"],
+            }
+        },
+        decision_payload={"tool_calls": []},
+    )
+    run.trade_orders = []
+
+    details = aniu_service._build_run_trade_details(run)
+
+    assert len(details) == 1
+    assert details[0]["source_labels"] == ["Jin10", "CLS"]
+    assert "资讯依据：Jin10 / CLS" in details[0]["summary"]
 
 
 def test_llm_augment_system_prompt_uses_chat_prompt_override() -> None:

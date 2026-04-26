@@ -20,6 +20,7 @@ class AppSettingsBase(BaseModel):
     provider_name: str = "openai-compatible"
     mx_api_key: str | None = Field(default=None, max_length=512)
     jin10_api_base_url: str | None = Field(default=None, max_length=512)
+    cls_api_base_url: str | None = Field(default=None, max_length=512)
     llm_base_url: str | None = Field(default=None, max_length=512)
     llm_api_key: str | None = Field(default=None, max_length=512)
     llm_model: str = Field(default="gpt-4o-mini", max_length=128)
@@ -203,6 +204,7 @@ class TradeDetailRead(BaseModel):
     price: float | None = None
     amount: float | None = None
     summary: str
+    source_labels: list[str] = Field(default_factory=list)
     tool_name: str | None = None
     preview_index: int | None = None
     status: Literal["running", "done", "failed"] | None = None

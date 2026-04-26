@@ -10,7 +10,6 @@ import time
 import traceback
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from concurrent.futures import ThreadPoolExecutor
 from threading import Event, Lock, Thread
 from types import SimpleNamespace
 from typing import Any, Iterator
@@ -26,7 +25,10 @@ from app.core.constants import (
     default_task_prompt,
     normalize_schedule_task_prompt,
 )
-from app.core.prompt_templates import render_prompt_template, resolve_prompt_template
+from app.core.prompt_templates import (
+    render_prompt_template,
+    resolve_prompt_template,
+)
 from app.db.database import session_scope
 from app.db.models import (
     AppSettings,
@@ -40,18 +42,25 @@ from app.db.models import (
 from app.schemas.aniu import AppSettingsUpdate, ChatRequest, ScheduleUpdate
 from app.schemas.aniu import ChatMessageRead, PersistentSessionRead
 from app.services.execution_plan_service import execution_plan_service
-from app.services.execution_reconcile_service import execution_reconcile_service
+from app.services.execution_reconcile_service import (
+    execution_reconcile_service,
+)
 from app.services.execution_runner_service import execution_runner_service
-from app.services.event_bus import event_bus, make_emitter
+from app.services.event_bus import make_emitter
+from app.services.cls_news_service import cls_news_service
 from app.services.jin10_news_service import jin10_news_service
 from app.services.llm_service import LLMStreamCancelled, llm_service
 from app.services.mx_skill_service import mx_skill_service
 from app.services.mx_service import MXClient
-from app.services.token_estimator import estimate_messages_tokens, estimate_text_tokens
+from app.services.token_estimator import (
+    estimate_messages_tokens,
+    estimate_text_tokens,
+)
 from app.services.trading_calendar_service import trading_calendar_service
 
 
 logger = logging.getLogger(__name__)
+_MX_SKILL_SERVICE_REF = mx_skill_service
 
 RAW_TOOL_PREVIEW_MAX_CHARS = 6000
 TRADING_DAY_TYPE = "trading_day"
@@ -86,6 +95,8 @@ TRADE_CONSISTENCY_WARNING = (
     "\n\n[系统一致性提示] 本轮最终结论提到了交易执行，但系统未实际调用 "
     "mx_moni_trade 或 mx_moni_cancel，因此未发生系统内实际下单或撤单。请以交易执行记录和工具调用结果为准。"
 )
+
+
 @dataclass
 class PersistentRunSessionContext:
     session_id: int
@@ -374,6 +385,7 @@ class AniuService:
                 provider_name="openai-compatible",
                 mx_api_key=env.mx_apikey,
                 jin10_api_base_url=env.jin10_api_base_url,
+                cls_api_base_url=env.cls_api_base_url,
                 llm_base_url=env.openai_base_url,
                 llm_api_key=env.openai_api_key,
                 llm_model=env.openai_model,
@@ -1001,10 +1013,19 @@ class AniuService:
         action: str,
         symbol: str,
         volume: int,
+        source_labels: list[str] | None = None,
     ) -> str:
         action_text = "卖出" if action == "sell" else "买入"
         display_symbol = symbol or "--"
-        return f"挂单{action_text}{display_symbol}共计{volume}股。"
+        summary = f"挂单{action_text}{display_symbol}共计{volume}股。"
+        normalized_labels = [
+            str(item or "").strip()
+            for item in (source_labels or [])
+            if str(item or "").strip()
+        ]
+        if normalized_labels:
+            summary += f" 资讯依据：{' / '.join(normalized_labels)}。"
+        return summary
 
     def _resolve_trade_detail_status(self, raw_status: Any) -> tuple[str, bool | None]:
         text = str(raw_status or "").strip().lower()
@@ -1014,6 +1035,13 @@ class AniuService:
 
     def _build_run_trade_details(self, run: StrategyRun) -> list[dict[str, Any]]:
         tool_calls = self._get_detail_tool_calls(run)
+        skill_payloads = run.skill_payloads if isinstance(run.skill_payloads, dict) else {}
+        source_labels = self._get_prefetched_source_labels(
+            skill_payloads.get("prefetched_context_sources")
+            if isinstance(skill_payloads.get("prefetched_context_sources"), dict)
+            else None,
+            used_only=True,
+        )
         if run.trade_orders:
             details: list[dict[str, Any]] = []
             for order in run.trade_orders:
@@ -1032,7 +1060,13 @@ class AniuService:
                         "amount": round(float(order.price or 0) * int(order.quantity), 2)
                         if order.price is not None
                         else None,
-                        "summary": self._get_trade_summary(trade_action, order.symbol, int(order.quantity)),
+                        "summary": self._get_trade_summary(
+                            trade_action,
+                            order.symbol,
+                            int(order.quantity),
+                            source_labels,
+                        ),
+                        "source_labels": list(source_labels),
                         "tool_name": tool_name,
                         "preview_index": self._find_tool_call_index(tool_calls, tool_name, order.symbol),
                         "status": detail_status,
@@ -1066,7 +1100,13 @@ class AniuService:
                     "volume": volume,
                     "price": price,
                     "amount": round((price or 0) * volume, 2) if price is not None else None,
-                    "summary": self._get_trade_summary(trade_action, symbol, volume),
+                    "summary": self._get_trade_summary(
+                        trade_action,
+                        symbol,
+                        volume,
+                        source_labels,
+                    ),
+                    "source_labels": list(source_labels),
                     "tool_name": tool_name,
                     "preview_index": self._find_tool_call_index(tool_calls, tool_name, symbol),
                     "status": detail_status,
@@ -1889,6 +1929,10 @@ class AniuService:
                     settings.jin10_api_base_url
                     or env_settings.jin10_api_base_url
                 ),
+                "cls_api_base_url": (
+                    settings.cls_api_base_url
+                    or env_settings.cls_api_base_url
+                ),
                 "llm_base_url": settings.llm_base_url,
                 "llm_api_key": settings.llm_api_key,
                 "llm_model": settings.llm_model,
@@ -1938,6 +1982,8 @@ class AniuService:
                 ),
                 "jin10_api_timeout_seconds": env_settings.jin10_api_timeout_seconds,
                 "jin10_news_limit": env_settings.jin10_news_limit,
+                "cls_api_timeout_seconds": env_settings.cls_api_timeout_seconds,
+                "cls_news_limit": env_settings.cls_news_limit,
             }
         return run_id, settings_snapshot
 
@@ -1949,23 +1995,107 @@ class AniuService:
     ) -> tuple[str | None, dict[str, Any] | None]:
         _emit = emit if callable(emit) else (lambda *_a, **_kw: None)
         current_time = now_shanghai()
-        base_url = getattr(settings, "jin10_api_base_url", None)
+        source_results: list[tuple[str, str | None, dict[str, Any] | None]] = []
+
+        source_results.append(
+            (
+                "jin10",
+                *self._prefetch_news_source_context(
+                    source_key="jin10",
+                    source_label="Jin10",
+                    base_url=getattr(settings, "jin10_api_base_url", None),
+                    limit=int(getattr(settings, "jin10_news_limit", 30) or 30),
+                    timeout_seconds=float(getattr(settings, "jin10_api_timeout_seconds", 5) or 5),
+                    fetch_items=jin10_news_service.fetch_news_items,
+                    build_analysis_chunks=jin10_news_service.build_analysis_chunks,
+                    build_raw_context_text=jin10_news_service.build_raw_context_text,
+                    build_analysis_context_text=self._build_jin10_analysis_context_text,
+                    target_day=current_time.date(),
+                    current_time=current_time,
+                    emit=_emit,
+                    settings=settings,
+                ),
+            )
+        )
+        source_results.append(
+            (
+                "cls",
+                *self._prefetch_news_source_context(
+                    source_key="cls",
+                    source_label="CLS",
+                    base_url=getattr(settings, "cls_api_base_url", None),
+                    limit=int(getattr(settings, "cls_news_limit", 200) or 200),
+                    timeout_seconds=float(getattr(settings, "cls_api_timeout_seconds", 5) or 5),
+                    fetch_items=cls_news_service.fetch_news_items,
+                    build_analysis_chunks=cls_news_service.build_analysis_chunks,
+                    build_raw_context_text=cls_news_service.build_raw_context_text,
+                    build_analysis_context_text=self._build_cls_analysis_context_text,
+                    target_day=current_time.date(),
+                    current_time=current_time,
+                    emit=_emit,
+                    settings=settings,
+                ),
+            )
+        )
+
+        used_texts: list[str] = []
+        sources_meta: dict[str, Any] = {}
+        configured_sources: list[str] = []
+        used_sources: list[str] = []
+
+        for source_key, context_text, meta in source_results:
+            if meta is None:
+                continue
+            configured_sources.append(source_key)
+            sources_meta[source_key] = meta
+            if context_text:
+                used_texts.append(context_text)
+                used_sources.append(source_key)
+
+        if not sources_meta:
+            return None, None
+
+        combined_meta = {
+            "sources": sources_meta,
+            "configured_sources": configured_sources,
+            "used_sources": used_sources,
+        }
+        return self._merge_prefetched_contexts(*used_texts), combined_meta
+
+    def _prefetch_news_source_context(
+        self,
+        *,
+        source_key: str,
+        source_label: str,
+        base_url: str | None,
+        limit: int,
+        timeout_seconds: float,
+        fetch_items: Any,
+        build_analysis_chunks: Any,
+        build_raw_context_text: Any,
+        build_analysis_context_text: Any,
+        target_day: date,
+        current_time: datetime,
+        emit: Any,
+        settings: Any,
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        _emit = emit if callable(emit) else (lambda *_a, **_kw: None)
         if not str(base_url or "").strip():
             return None, None
 
-        _emit("stage", stage="news", message="正在获取 Jin10 当天新闻")
-        items, meta = jin10_news_service.fetch_news_items(
+        _emit("stage", stage="news", message=f"正在获取 {source_label} 当天新闻")
+        items, meta = fetch_items(
             base_url=str(base_url),
-            target_day=current_time.date(),
+            target_day=target_day,
             current_time=current_time,
-            limit=int(getattr(settings, "jin10_news_limit", 30) or 30),
-            timeout_seconds=float(
-                getattr(settings, "jin10_api_timeout_seconds", 5) or 5
-            ),
+            limit=limit,
+            timeout_seconds=timeout_seconds,
         )
         if not meta or meta.get("ok") is False:
             if isinstance(meta, dict):
                 meta = dict(meta)
+                meta["source_key"] = source_key
+                meta["source_label"] = source_label
                 meta["analysis_meta"] = {
                     "ok": False,
                     "status": "fetch_failed",
@@ -1976,49 +2106,52 @@ class AniuService:
                 }
             return None, meta
 
-        analysis_text, analysis_meta = self._analyze_jin10_news(
+        analysis_text, analysis_meta = self._analyze_news_source(
+            source_label=source_label,
             settings=settings,
             items=items,
-            target_day=current_time.date(),
+            build_analysis_chunks=build_analysis_chunks,
+            target_day=target_day,
             current_time=current_time,
             emit=emit,
         )
         combined_meta = dict(meta)
+        combined_meta["source_key"] = source_key
+        combined_meta["source_label"] = source_label
         combined_meta["analysis_text"] = analysis_text
         combined_meta["analysis_meta"] = dict(analysis_meta or {})
 
         if analysis_text:
             combined_meta["analysis_meta"]["status"] = "ok"
             combined_meta["analysis_meta"]["fallback_used"] = False
-            context_text = self._build_jin10_analysis_context_text(
+            context_text = build_analysis_context_text(
                 analysis_text=analysis_text,
                 item_count=len(items),
-                target_day=current_time.date(),
+                target_day=target_day,
                 current_time=current_time,
             )
-            _emit("stage", stage="news", message="已注入 Jin10 新闻诊断")
+            _emit("stage", stage="news", message=f"已注入 {source_label} 新闻诊断")
             return context_text, combined_meta
 
-        raw_context = jin10_news_service.build_raw_context_text(
+        raw_context = build_raw_context_text(
             items,
-            target_day=current_time.date(),
+            target_day=target_day,
             current_time=current_time,
         )
         combined_meta["analysis_meta"]["fallback_used"] = bool(raw_context)
-        if raw_context and combined_meta["analysis_meta"].get("status") not in {
-            "no_items",
-            "fetch_failed",
-        }:
+        if raw_context and combined_meta["analysis_meta"].get("status") not in {"no_items", "fetch_failed"}:
             combined_meta["analysis_meta"]["status"] = "fallback_raw_context"
         if raw_context:
-            _emit("stage", stage="news", message="Jin10 新闻诊断失败，已回退为原始新闻摘录")
+            _emit("stage", stage="news", message=f"{source_label} 新闻诊断失败，已回退为原始新闻摘录")
         return raw_context, combined_meta
 
-    def _analyze_jin10_news(
+    def _analyze_news_source(
         self,
         *,
+        source_label: str,
         settings: Any,
         items: list[dict[str, str]],
+        build_analysis_chunks: Any,
         target_day: date,
         current_time: datetime,
         emit: Any,
@@ -2032,46 +2165,39 @@ class AniuService:
                 "chunk_count": 0,
                 "fallback_used": False,
                 "failure_reason": None,
-                "summary": "当天暂无可用于诊断的 Jin10 新闻。",
+                "summary": f"当天暂无可用于诊断的 {source_label} 新闻。",
             }
-        if not getattr(settings, "llm_base_url", None) or not getattr(
-            settings,
-            "llm_api_key",
-            None,
-        ):
+        if not getattr(settings, "llm_base_url", None) or not getattr(settings, "llm_api_key", None):
             return None, {
                 "ok": False,
                 "status": "llm_unavailable",
                 "item_count": len(items),
                 "chunk_count": 0,
                 "fallback_used": False,
-                "failure_reason": "未配置大模型接口，无法生成 Jin10 新闻诊断。",
-                "error": "未配置大模型接口，无法生成 Jin10 新闻诊断。",
+                "failure_reason": f"未配置大模型接口，无法生成 {source_label} 新闻诊断。",
+                "error": f"未配置大模型接口，无法生成 {source_label} 新闻诊断。",
             }
 
-        chunks = jin10_news_service.build_analysis_chunks(items)
+        chunks = build_analysis_chunks(items)
         chunk_outputs: list[str] = []
         try:
             for index, chunk in enumerate(chunks, start=1):
-                _emit(
-                    "stage",
-                    stage="news",
-                    message=f"正在分析 Jin10 新闻（{index}/{len(chunks)}）",
-                )
+                _emit("stage", stage="news", message=f"正在分析 {source_label} 新闻（{index}/{len(chunks)}）")
                 chunk_text, _request_payload, _response_payload = llm_service.generate_text(
                     model=str(getattr(settings, "llm_model", "") or ""),
                     base_url=str(getattr(settings, "llm_base_url", "") or ""),
                     api_key=str(getattr(settings, "llm_api_key", "") or ""),
-                    system_prompt=resolve_prompt_template(
-                        getattr(settings, "prompt_templates", None),
-                        "jin10_news_analysis_system_prompt",
+                    system_prompt=self._build_news_analysis_system_prompt(
+                        settings=settings,
+                        source_name=source_label,
                     ),
                     prompt_templates=getattr(settings, "prompt_templates", None),
                     messages=[
                         {
                             "role": "user",
-                            "content": self._build_jin10_chunk_analysis_prompt(
+                            "content": self._build_news_source_chunk_analysis_prompt(
                                 settings=settings,
+                                source_name=source_label,
                                 chunk_text=chunk,
                                 chunk_index=index,
                                 chunk_total=len(chunks),
@@ -2090,21 +2216,22 @@ class AniuService:
             if len(chunk_outputs) == 1:
                 final_text = chunk_outputs[0]
             else:
-                _emit("stage", stage="news", message="正在汇总 Jin10 新闻诊断")
+                _emit("stage", stage="news", message=f"正在汇总 {source_label} 新闻诊断")
                 final_text, _request_payload, _response_payload = llm_service.generate_text(
                     model=str(getattr(settings, "llm_model", "") or ""),
                     base_url=str(getattr(settings, "llm_base_url", "") or ""),
                     api_key=str(getattr(settings, "llm_api_key", "") or ""),
-                    system_prompt=resolve_prompt_template(
-                        getattr(settings, "prompt_templates", None),
-                        "jin10_news_analysis_system_prompt",
+                    system_prompt=self._build_news_analysis_system_prompt(
+                        settings=settings,
+                        source_name=source_label,
                     ),
                     prompt_templates=getattr(settings, "prompt_templates", None),
                     messages=[
                         {
                             "role": "user",
-                            "content": self._build_jin10_merge_analysis_prompt(
+                            "content": self._build_news_source_merge_analysis_prompt(
                                 settings=settings,
+                                source_name=source_label,
                                 chunk_outputs=chunk_outputs,
                                 item_count=len(items),
                                 target_day=target_day,
@@ -2117,7 +2244,7 @@ class AniuService:
                     emit=None,
                 )
 
-            final_summary = self._summarize_jin10_analysis(final_text)
+            final_summary = self._summarize_news_source_analysis(final_text)
             return final_text, {
                 "ok": True,
                 "status": "ok",
@@ -2128,7 +2255,7 @@ class AniuService:
                 "summary": final_summary,
             }
         except Exception as exc:  # noqa: BLE001
-            logger.warning("jin10 news analysis failed: %s", exc)
+            logger.warning("%s news analysis failed: %s", source_label.lower(), exc)
             return None, {
                 "ok": False,
                 "status": "failed",
@@ -2139,10 +2266,42 @@ class AniuService:
                 "error": str(exc),
             }
 
-    def _build_jin10_chunk_analysis_prompt(
+    def _analyze_jin10_news(
         self,
         *,
         settings: Any,
+        items: list[dict[str, str]],
+        target_day: date,
+        current_time: datetime,
+        emit: Any,
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        return self._analyze_news_source(
+            source_label="Jin10",
+            settings=settings,
+            items=items,
+            build_analysis_chunks=jin10_news_service.build_analysis_chunks,
+            target_day=target_day,
+            current_time=current_time,
+            emit=emit,
+        )
+
+    def _build_news_analysis_system_prompt(
+        self,
+        *,
+        settings: Any,
+        source_name: str,
+    ) -> str:
+        return render_prompt_template(
+            getattr(settings, "prompt_templates", None),
+            "jin10_news_analysis_system_prompt",
+            source_name=source_name,
+        )
+
+    def _build_news_source_chunk_analysis_prompt(
+        self,
+        *,
+        settings: Any,
+        source_name: str,
         chunk_text: str,
         chunk_index: int,
         chunk_total: int,
@@ -2154,7 +2313,7 @@ class AniuService:
             getattr(settings, "prompt_templates", None),
             "jin10_chunk_analysis_prompt_template",
             header=(
-                f"以下是 {target_day.isoformat()} 截至 {current_time.strftime('%H:%M:%S')} 的 Jin10 新闻原文"
+                f"以下是 {target_day.isoformat()} 截至 {current_time.strftime('%H:%M:%S')} 的 {source_name} 新闻原文"
                 f"（第 {chunk_index}/{chunk_total} 批，共 {item_count} 条新闻的一部分）。"
             ),
             chunk_text=chunk_text,
@@ -2164,10 +2323,11 @@ class AniuService:
             ),
         )
 
-    def _build_jin10_merge_analysis_prompt(
+    def _build_news_source_merge_analysis_prompt(
         self,
         *,
         settings: Any,
+        source_name: str,
         chunk_outputs: list[str],
         item_count: int,
         target_day: date,
@@ -2181,7 +2341,7 @@ class AniuService:
             getattr(settings, "prompt_templates", None),
             "jin10_merge_analysis_prompt_template",
             header=(
-                f"以下是 {target_day.isoformat()} 截至 {current_time.strftime('%H:%M:%S')} 的 Jin10 新闻分批诊断结果。"
+                f"以下是 {target_day.isoformat()} 截至 {current_time.strftime('%H:%M:%S')} 的 {source_name} 新闻分批诊断结果。"
                 f"请合并为一份最终结论，共对应 {item_count} 条新闻。"
             ),
             chunk_outputs=joined,
@@ -2189,6 +2349,86 @@ class AniuService:
                 getattr(settings, "prompt_templates", None),
                 "jin10_news_analysis_output_format",
             ),
+        )
+
+    def _build_jin10_chunk_analysis_prompt(
+        self,
+        *,
+        settings: Any,
+        chunk_text: str,
+        chunk_index: int,
+        chunk_total: int,
+        item_count: int,
+        target_day: date,
+        current_time: datetime,
+    ) -> str:
+        return self._build_news_source_chunk_analysis_prompt(
+            settings=settings,
+            source_name="Jin10",
+            chunk_text=chunk_text,
+            chunk_index=chunk_index,
+            chunk_total=chunk_total,
+            item_count=item_count,
+            target_day=target_day,
+            current_time=current_time,
+        )
+
+    def _build_jin10_merge_analysis_prompt(
+        self,
+        *,
+        settings: Any,
+        chunk_outputs: list[str],
+        item_count: int,
+        target_day: date,
+        current_time: datetime,
+    ) -> str:
+        return self._build_news_source_merge_analysis_prompt(
+            settings=settings,
+            source_name="Jin10",
+            chunk_outputs=chunk_outputs,
+            item_count=item_count,
+            target_day=target_day,
+            current_time=current_time,
+        )
+
+    def _build_cls_chunk_analysis_prompt(
+        self,
+        *,
+        settings: Any,
+        chunk_text: str,
+        chunk_index: int,
+        chunk_total: int,
+        item_count: int,
+        target_day: date,
+        current_time: datetime,
+    ) -> str:
+        return self._build_news_source_chunk_analysis_prompt(
+            settings=settings,
+            source_name="CLS",
+            chunk_text=chunk_text,
+            chunk_index=chunk_index,
+            chunk_total=chunk_total,
+            item_count=item_count,
+            target_day=target_day,
+            current_time=current_time,
+        )
+
+    def _build_cls_merge_analysis_prompt(
+        self,
+        *,
+        settings: Any,
+        chunk_outputs: list[str],
+        item_count: int,
+        target_day: date,
+        current_time: datetime,
+    ) -> str:
+        return self._build_news_source_merge_analysis_prompt(
+            settings=settings,
+            source_name="CLS",
+            chunk_outputs=chunk_outputs,
+            item_count=item_count,
+            target_day=target_day,
+            current_time=current_time,
         )
 
     def _build_jin10_analysis_context_text(
@@ -2207,7 +2447,26 @@ class AniuService:
             f"{str(analysis_text or '').strip()}"
         ).strip()
 
+    def _build_cls_analysis_context_text(
+        self,
+        *,
+        analysis_text: str,
+        item_count: int,
+        target_day: date,
+        current_time: datetime,
+    ) -> str:
+        return (
+            "[CLS 新闻诊断]\n"
+            f"日期：{target_day.isoformat()}，截至 {current_time.strftime('%H:%M:%S')}，"
+            f"系统已全量扫描 {item_count} 条 CLS 电报原文（time/title/content）并完成预分析。\n"
+            "以下诊断优先从 A股市场与金融市场角度提炼影响，请继续结合行情、盘口、公告、持仓和工具结果交叉验证：\n\n"
+            f"{str(analysis_text or '').strip()}"
+        ).strip()
+
     def _summarize_jin10_analysis(self, analysis_text: Any) -> str | None:
+        return self._summarize_news_source_analysis(analysis_text)
+
+    def _summarize_news_source_analysis(self, analysis_text: Any) -> str | None:
         text = str(analysis_text or "").strip()
         if not text:
             return None
@@ -2276,6 +2535,9 @@ class AniuService:
             prefetched_context, prefetched_context_meta = (
                 self._prefetch_analysis_context(settings=settings, emit=_emit)
             )
+            primary_prefetched_context_meta = self._select_primary_prefetched_context_meta(
+                prefetched_context_meta
+            )
             if not settings.mx_api_key:
                 raise RuntimeError("未配置 MX API Key，请先在设置页保存后再运行。")
             client = MXClient(api_key=settings.mx_api_key)
@@ -2287,6 +2549,7 @@ class AniuService:
                     trigger_source=trigger_source,
                     schedule_id=schedule_id,
                     prefetched_context=prefetched_context,
+                    prefetched_context_meta=prefetched_context_meta,
                 )
                 planning_sequence = {"value": 0}
 
@@ -2411,8 +2674,12 @@ class AniuService:
                     finalized_answer,
                     executed_actions,
                 )
+                decorated_final_answer = self._decorate_final_answer_with_sources(
+                    finalized_answer,
+                    prefetched_context_meta,
+                )
                 decision = dict(decision)
-                decision["final_answer"] = finalized_answer
+                decision["final_answer"] = decorated_final_answer
                 decision["execution_summary"] = execution_summary
             finally:
                 client.close()
@@ -2422,7 +2689,8 @@ class AniuService:
                 "tool_calls": tool_calls,
                 "execution_tool_calls": execution_tool_calls,
                 "runtime_trace": runtime_trace,
-                "prefetched_context": prefetched_context_meta,
+                "prefetched_context": primary_prefetched_context_meta,
+                "prefetched_context_sources": prefetched_context_meta,
                 "execution_summary": execution_summary,
             }
             persisted_trade_orders = [
@@ -2468,7 +2736,8 @@ class AniuService:
                 run.llm_response_payload = llm_response
                 run.decision_payload = decision
                 run.analysis_summary = self._build_analysis_summary(
-                    decision.get("final_answer")
+                    finalized_answer,
+                    prefetched_context_meta,
                 )
                 run.final_answer = (
                     str(decision.get("final_answer") or "").strip() or None
@@ -3795,14 +4064,21 @@ class AniuService:
             merged_planned_actions,
         )
 
-    def _build_analysis_summary(self, final_answer: Any) -> str | None:
+    def _build_analysis_summary(
+        self,
+        final_answer: Any,
+        source_meta: dict[str, Any] | None = None,
+    ) -> str | None:
         text = str(final_answer or "").strip()
-        if not text:
+        compact = " ".join(text.split()) if text else ""
+        source_labels = self._get_prefetched_source_labels(source_meta, used_only=True)
+        source_prefix = f"资讯源：{'、'.join(source_labels)}" if source_labels else ""
+        combined = "；".join(part for part in (source_prefix, compact) if part)
+        if not combined:
             return None
-        compact = " ".join(text.split())
-        if len(compact) <= 120:
-            return compact
-        return compact[:117] + "..."
+        if len(combined) <= 120:
+            return combined
+        return combined[:117] + "..."
 
     def _prepare_persistent_session_context(
         self,
@@ -3812,6 +4088,7 @@ class AniuService:
         trigger_source: str,
         schedule_id: int | None,
         prefetched_context: str | None,
+        prefetched_context_meta: dict[str, Any] | None = None,
     ) -> PersistentRunSessionContext:
         with session_scope() as db:
             session = self._get_or_create_persistent_session(db)
@@ -3846,6 +4123,7 @@ class AniuService:
                     handoff_context,
                     prefetched_context,
                 ),
+                prefetched_context_meta=prefetched_context_meta,
                 runtime_context=runtime_context,
             )
             user_message = self._persist_persistent_session_user_message(
@@ -3958,6 +4236,151 @@ class AniuService:
         if not normalized_parts:
             return None
         return "\n\n".join(normalized_parts)
+
+    def _iter_prefetched_source_entries(
+        self,
+        meta: dict[str, Any] | None,
+        *,
+        used_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        if not isinstance(meta, dict):
+            return []
+        sources = meta.get("sources")
+        if isinstance(sources, dict):
+            ordered_keys: list[str] = []
+            preferred_keys = meta.get("used_sources") if used_only else meta.get(
+                "configured_sources"
+            )
+            if isinstance(preferred_keys, list):
+                ordered_keys.extend(
+                    str(item or "").strip()
+                    for item in preferred_keys
+                    if str(item or "").strip()
+                )
+            ordered_keys.extend(
+                str(key or "").strip() for key in sources.keys() if str(key or "").strip()
+            )
+
+            entries: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            for key in ordered_keys:
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                value = sources.get(key)
+                if isinstance(value, dict):
+                    entries.append(value)
+            return entries
+
+        if str(meta.get("source_key") or "").strip() or str(
+            meta.get("source_label") or ""
+        ).strip():
+            return [meta]
+        return []
+
+    def _get_prefetched_source_label(self, entry: dict[str, Any]) -> str | None:
+        label = str(entry.get("source_label") or "").strip()
+        if label:
+            return label
+        key = str(entry.get("source_key") or "").strip().lower()
+        if key == "jin10":
+            return "Jin10"
+        if key == "cls":
+            return "CLS"
+        return key or None
+
+    def _get_prefetched_source_labels(
+        self,
+        meta: dict[str, Any] | None,
+        *,
+        used_only: bool = False,
+    ) -> list[str]:
+        labels: list[str] = []
+        for entry in self._iter_prefetched_source_entries(meta, used_only=used_only):
+            label = self._get_prefetched_source_label(entry)
+            if label and label not in labels:
+                labels.append(label)
+        return labels
+
+    def _summarize_prefetched_source_entry(self, entry: dict[str, Any]) -> str | None:
+        label = self._get_prefetched_source_label(entry)
+        if not label:
+            return None
+        analysis_meta = (
+            dict(entry.get("analysis_meta"))
+            if isinstance(entry.get("analysis_meta"), dict)
+            else {}
+        )
+        summary = str(analysis_meta.get("summary") or "").strip()
+        failure_reason = str(
+            analysis_meta.get("failure_reason")
+            or analysis_meta.get("error")
+            or entry.get("error")
+            or ""
+        ).strip()
+        status = str(analysis_meta.get("status") or "").strip()
+        item_count = analysis_meta.get("item_count")
+        if not isinstance(item_count, int):
+            item_count = entry.get("item_count")
+
+        if summary:
+            return f"{label}：{summary}"
+        if failure_reason:
+            return f"{label}：{failure_reason}"
+        if status == "no_items":
+            return f"{label}：当天暂无可用资讯"
+        if isinstance(item_count, int) and item_count > 0:
+            return f"{label}：已纳入 {item_count} 条资讯"
+        return f"{label}：已纳入本轮分析"
+
+    def _build_prefetched_source_overview(
+        self,
+        meta: dict[str, Any] | None,
+        *,
+        title: str = "本轮资讯来源",
+        used_only: bool = True,
+    ) -> str | None:
+        items = [
+            self._summarize_prefetched_source_entry(entry)
+            for entry in self._iter_prefetched_source_entries(meta, used_only=used_only)
+        ]
+        lines = [item for item in items if item]
+        if not lines:
+            return None
+        return "\n".join([title, *[f"- {line}" for line in lines]])
+
+    def _select_primary_prefetched_context_meta(
+        self,
+        meta: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if not isinstance(meta, dict):
+            return meta
+        sources = meta.get("sources")
+        if not isinstance(sources, dict):
+            return meta
+        for key in ("jin10", "cls"):
+            candidate = sources.get(key)
+            if isinstance(candidate, dict):
+                return candidate
+        for candidate in sources.values():
+            if isinstance(candidate, dict):
+                return candidate
+        return None
+
+    def _decorate_final_answer_with_sources(
+        self,
+        final_answer: Any,
+        source_meta: dict[str, Any] | None,
+    ) -> str | None:
+        answer = str(final_answer or "").strip()
+        source_overview = self._build_prefetched_source_overview(source_meta)
+        if not source_overview:
+            return answer or None
+        if answer.startswith(source_overview):
+            return answer
+        if not answer:
+            return source_overview
+        return f"{source_overview}\n\n{answer}"
 
     def _previous_trading_day(self, current: date) -> date | None:
         probe = current - timedelta(days=1)
@@ -4092,6 +4515,7 @@ class AniuService:
         run_type: str,
         task_prompt: str,
         prefetched_context: str | None,
+        prefetched_context_meta: dict[str, Any] | None = None,
         runtime_context: dict[str, Any] | None,
     ) -> str:
         current_time = (
@@ -4128,6 +4552,12 @@ class AniuService:
         ]
         if schedule_name:
             lines.insert(3, f"定时任务: {schedule_name}")
+        source_overview = self._build_prefetched_source_overview(
+            prefetched_context_meta,
+            title="本轮资讯来源摘要",
+        )
+        if source_overview:
+            lines.extend(["", source_overview])
         extra_context = str(prefetched_context or "").strip()
         if extra_context:
             lines.extend(["", extra_context])

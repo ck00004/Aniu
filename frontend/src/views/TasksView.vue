@@ -215,6 +215,15 @@
                         <div class="compact-main trade-main">
                           <span class="trade-text-action" :class="trade.action">{{ trade.action_text }}</span>
                           <span class="trade-text-summary" :title="trade.summary">{{ trade.summary }}</span>
+                          <span v-if="trade.source_labels?.length" class="trade-source-chip-row">
+                            <span
+                              v-for="label in trade.source_labels"
+                              :key="`${trade.symbol}-${trade.action}-${label}`"
+                              class="trade-source-chip"
+                            >
+                              {{ label }}
+                            </span>
+                          </span>
                         </div>
                         <span class="compact-item-status-dot" :class="getTradeItemStatusClass(trade)" aria-hidden="true"></span>
                       </button>
@@ -231,21 +240,25 @@
               正在加载本次运行详情...
             </div>
 
-            <div v-if="displayJin10SourceVisible" class="jin10-diagnostic-section">
-              <div class="source-diagnostic-card">
-                <div class="source-diagnostic-title">Jin10 诊断</div>
-                <div v-if="displayJin10BaseUrl" class="source-diagnostic-row">
-                  <span class="source-diagnostic-label">当前使用的 Jin10 地址</span>
-                  <span class="source-diagnostic-value" :title="displayJin10BaseUrl">{{ displayJin10BaseUrl }}</span>
+            <div v-if="displaySourceDiagnosticsVisible" class="jin10-diagnostic-section">
+              <div
+                v-for="source in displaySourceDiagnostics"
+                :key="source.key"
+                class="source-diagnostic-card"
+              >
+                <div class="source-diagnostic-title">{{ source.label }} 诊断</div>
+                <div v-if="source.baseUrl" class="source-diagnostic-row">
+                  <span class="source-diagnostic-label">当前使用的 {{ source.label }} 地址</span>
+                  <span class="source-diagnostic-value" :title="source.baseUrl">{{ source.baseUrl }}</span>
                 </div>
-                <div v-if="displayJin10SourceSummary" class="source-diagnostic-row">
-                  <span class="source-diagnostic-label">本轮 Jin10 新闻来源</span>
-                  <span class="source-diagnostic-value" :title="displayJin10SourceSummary">{{ displayJin10SourceSummary }}</span>
+                <div v-if="source.sourceSummary" class="source-diagnostic-row">
+                  <span class="source-diagnostic-label">本轮 {{ source.label }} 新闻来源</span>
+                  <span class="source-diagnostic-value" :title="source.sourceSummary">{{ source.sourceSummary }}</span>
                 </div>
-                <div v-if="displayJin10Metrics.length" class="source-diagnostic-metrics">
+                <div v-if="source.metrics.length" class="source-diagnostic-metrics">
                   <div
-                    v-for="metric in displayJin10Metrics"
-                    :key="`${metric.label}-${metric.value}`"
+                    v-for="metric in source.metrics"
+                    :key="`${source.key}-${metric.label}-${metric.value}`"
                     class="source-diagnostic-metric"
                     :class="metric.tone === 'warning' ? 'warning' : ''"
                   >
@@ -253,13 +266,13 @@
                     <span class="source-diagnostic-metric-value">{{ metric.value }}</span>
                   </div>
                 </div>
-                <div v-if="displayJin10FailureReason" class="source-diagnostic-block source-diagnostic-failure">
+                <div v-if="source.failureReason" class="source-diagnostic-block source-diagnostic-failure">
                   <div class="source-diagnostic-label block">诊断失败原因</div>
-                  <div class="source-diagnostic-text">{{ displayJin10FailureReason }}</div>
+                  <div class="source-diagnostic-text">{{ source.failureReason }}</div>
                 </div>
-                <div v-if="displayJin10DiagnosisText" class="source-diagnostic-block">
-                  <div class="source-diagnostic-label block">本轮 Jin10 新闻诊断</div>
-                  <div class="source-diagnostic-text">{{ displayJin10DiagnosisText }}</div>
+                <div v-if="source.diagnosisText" class="source-diagnostic-block">
+                  <div class="source-diagnostic-label block">本轮 {{ source.label }} 新闻诊断</div>
+                  <div class="source-diagnostic-text">{{ source.diagnosisText }}</div>
                 </div>
               </div>
             </div>
@@ -790,25 +803,11 @@ const displayOutputTokens = computed(() => displayTokenSource.value?.outputToken
 
 const displayTotalTokens = computed(() => displayTokenSource.value?.totalTokens ?? '--')
 
-const displayJin10SourceVisible = computed(
-  () => !liveVisible.value && (
-    !!selectedRun.value?.jin10BaseUrl
-    || !!selectedRun.value?.jin10SourceSummary
-    || !!selectedRun.value?.jin10DiagnosisText
-    || !!selectedRun.value?.jin10FailureReason
-    || !!selectedRun.value?.jin10Metrics.length
-  ),
+const displaySourceDiagnostics = computed(() => selectedRun.value?.sourceDiagnostics ?? [])
+
+const displaySourceDiagnosticsVisible = computed(
+  () => !liveVisible.value && displaySourceDiagnostics.value.length > 0,
 )
-
-const displayJin10BaseUrl = computed(() => selectedRun.value?.jin10BaseUrl ?? '')
-
-const displayJin10SourceSummary = computed(() => selectedRun.value?.jin10SourceSummary ?? '')
-
-const displayJin10DiagnosisText = computed(() => selectedRun.value?.jin10DiagnosisText ?? '')
-
-const displayJin10Metrics = computed(() => selectedRun.value?.jin10Metrics ?? [])
-
-const displayJin10FailureReason = computed(() => selectedRun.value?.jin10FailureReason ?? '')
 
 const displaySelfSelectChangesVisible = computed(
   () => !liveVisible.value && !!selectedRun.value?.detailLoaded,
@@ -1368,6 +1367,26 @@ onBeforeUnmount(() => {
   display: block;
   -webkit-line-clamp: unset;
   -webkit-box-orient: unset;
+}
+
+.trade-source-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.trade-source-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.16);
+  color: rgba(226, 232, 240, 0.88);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
 }
 
 .output-surface {

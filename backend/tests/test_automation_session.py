@@ -721,6 +721,132 @@ def test_scheduled_runs_can_read_prior_manual_history(monkeypatch, tmp_path) -> 
     reset_db_state()
 
 
+def test_schedule_run_prefetches_jin10_and_cls_sources(monkeypatch, tmp_path) -> None:
+    captured_messages: list[list[dict[str, object]]] = []
+
+    def fake_run_agent_with_messages(*, messages, **kwargs):
+        del kwargs
+        captured_messages.append(messages)
+        return _fake_run_result("multi-source decision")
+
+    def fake_fetch_jin10_items(**kwargs):
+        del kwargs
+        return (
+            [
+                {
+                    "time": "09:31:00",
+                    "title": "Jin10 新闻A",
+                    "content": "市场风险偏好改善。",
+                }
+            ],
+            {
+                "ok": True,
+                "url": "http://127.0.0.1:3000/api/news",
+                "params": {
+                    "date": "2026-04-22",
+                    "startTime": "00:00:00",
+                    "endTime": "14:30:00",
+                    "limit": "30",
+                },
+                "item_count": 1,
+                "total": 1,
+                "has_more": False,
+                "request_count": 1,
+            },
+        )
+
+    def fake_fetch_cls_items(**kwargs):
+        del kwargs
+        return (
+            [
+                {
+                    "time": "09:35:00",
+                    "title": "CLS 电报A",
+                    "content": "产业政策催化升温。",
+                }
+            ],
+            {
+                "ok": True,
+                "url": "http://127.0.0.1:3000/api/cls/export",
+                "params": {
+                    "startCtime": "1713744000",
+                    "endCtime": "1713796200",
+                    "limit": "200",
+                },
+                "item_count": 1,
+                "total": 1,
+                "has_more": False,
+                "request_count": 1,
+            },
+        )
+
+    def fake_generate_text(**kwargs):
+        user_message = str(kwargs["messages"][0]["content"])
+        if "CLS" in user_message:
+            return (
+                "CLS 主线：政策催化升温。\n关注方向：低空经济。",
+                {"messages": []},
+                {"choices": [{"message": {"content": "ok"}}]},
+            )
+        return (
+            "Jin10 主线：风险偏好回升。\n关注方向：券商。",
+            {"messages": []},
+            {"choices": [{"message": {"content": "ok"}}]},
+        )
+
+    monkeypatch.setattr(llm_service, "run_agent_with_messages", fake_run_agent_with_messages)
+    monkeypatch.setattr(
+        "app.services.jin10_news_service.jin10_news_service.fetch_news_items",
+        fake_fetch_jin10_items,
+    )
+    monkeypatch.setattr(
+        "app.services.cls_news_service.cls_news_service.fetch_news_items",
+        fake_fetch_cls_items,
+    )
+    monkeypatch.setattr(llm_service, "generate_text", fake_generate_text)
+
+    with create_test_client(monkeypatch, tmp_path):
+        with session_scope() as db:
+            settings = aniu_service.get_or_create_settings(db)
+            settings.mx_api_key = "mx-key"
+            settings.llm_base_url = "https://example.com/v1"
+            settings.llm_api_key = "llm-key"
+            settings.llm_model = "demo-model"
+            settings.cls_api_base_url = "http://127.0.0.1:3000"
+            schedule = _prepare_schedule(db, name="盘前分析", run_type="analysis")
+            schedule_id = schedule.id
+
+        run = aniu_service.execute_run(trigger_source="schedule", schedule_id=schedule_id)
+
+        assert len(captured_messages) == 1
+        assert any(
+            "[Jin10 新闻诊断]" in str(msg.get("content") or "")
+            for msg in captured_messages[0]
+        )
+        assert any(
+            "[CLS 新闻诊断]" in str(msg.get("content") or "")
+            for msg in captured_messages[0]
+        )
+
+        assert run.skill_payloads is not None
+        prefetched = run.skill_payloads.get("prefetched_context")
+        assert isinstance(prefetched, dict)
+        assert prefetched.get("source_key") == "jin10"
+
+        prefetched_sources = run.skill_payloads.get("prefetched_context_sources")
+        assert isinstance(prefetched_sources, dict)
+        assert prefetched_sources.get("used_sources") == ["jin10", "cls"]
+
+        source_map = prefetched_sources.get("sources")
+        assert isinstance(source_map, dict)
+        assert "jin10" in source_map
+        assert "cls" in source_map
+        assert "Jin10 主线" in str(source_map["jin10"].get("analysis_text") or "")
+        assert "CLS 主线" in str(source_map["cls"].get("analysis_text") or "")
+
+    reset_db_state()
+
+
 def test_schedule_run_failure_persists_failed_assistant_message(monkeypatch, tmp_path) -> None:
     def fake_run_agent_with_messages(**kwargs):
         del kwargs

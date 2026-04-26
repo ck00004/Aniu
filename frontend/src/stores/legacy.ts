@@ -34,6 +34,7 @@ const defaultSettings = (): SettingsPayload => ({
   provider_name: 'openai-compatible',
   mx_api_key: '',
   jin10_api_base_url: 'http://127.0.0.1:3000',
+  cls_api_base_url: 'http://127.0.0.1:3000',
   llm_base_url: '',
   llm_api_key: '',
   llm_model: 'gpt-4o-mini',
@@ -216,6 +217,7 @@ export const useAppStore = defineStore('app', () => {
     settings.provider_name = payload.provider_name
     settings.mx_api_key = payload.mx_api_key ?? ''
     settings.jin10_api_base_url = payload.jin10_api_base_url ?? 'http://127.0.0.1:3000'
+    settings.cls_api_base_url = payload.cls_api_base_url ?? 'http://127.0.0.1:3000'
     settings.llm_base_url = payload.llm_base_url ?? ''
     settings.llm_api_key = payload.llm_api_key ?? ''
     settings.llm_model = payload.llm_model
@@ -341,6 +343,7 @@ export const useAppStore = defineStore('app', () => {
         ...settings,
         mx_api_key: settings.mx_api_key || null,
         jin10_api_base_url: settings.jin10_api_base_url || null,
+        cls_api_base_url: settings.cls_api_base_url || null,
         llm_base_url: settings.llm_base_url || null,
         llm_api_key: settings.llm_api_key || null,
       })

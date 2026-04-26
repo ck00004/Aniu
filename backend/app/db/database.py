@@ -71,6 +71,10 @@ def _ensure_app_settings_columns(engine) -> None:
         statements.append(
             "ALTER TABLE app_settings ADD COLUMN jin10_api_base_url VARCHAR(255)"
         )
+    if "cls_api_base_url" not in columns:
+        statements.append(
+            "ALTER TABLE app_settings ADD COLUMN cls_api_base_url VARCHAR(255)"
+        )
     if "disabled_skill_ids_json" not in columns:
         statements.append(
             "ALTER TABLE app_settings ADD COLUMN disabled_skill_ids_json TEXT DEFAULT '[]'"

@@ -2,7 +2,9 @@ import { computed, ref, watch } from 'vue'
 
 import type {
   ApiDetail,
+  DiagnosticMetric,
   ExecutionSummary,
+  NewsSourceDiagnostic,
   RawToolPreview,
   RawToolPreviewDetail,
   RunAction,
@@ -35,6 +37,7 @@ export interface AnalysisRunViewModel {
   hasConsistencyRevision: boolean
   summary: string
   detailLoaded: boolean
+  sourceDiagnostics: NewsSourceDiagnostic[]
   jin10BaseUrl: string | null
   jin10SourceSummary: string | null
   jin10DiagnosisText: string | null
@@ -84,12 +87,6 @@ export interface RunActionAttemptViewModel {
 }
 
 type ActionTone = 'neutral' | 'running' | 'success' | 'warning' | 'error'
-
-export interface DiagnosticMetric {
-  label: string
-  value: string
-  tone?: 'default' | 'warning'
-}
 
 export interface SelfSelectChange {
   action: 'add' | 'remove'
@@ -153,47 +150,63 @@ function normalizeJin10BaseUrl(url: string | null) {
   }
 }
 
-function getJin10SourceInfo(detail: RunDetail) {
-  const skillPayloads = isRecord(detail.skill_payloads) ? detail.skill_payloads : null
-  const prefetchedContext = isRecord(skillPayloads?.prefetched_context)
-    ? skillPayloads.prefetched_context
-    : null
-
-  if (!prefetchedContext) {
-    return {
-      jin10BaseUrl: null,
-      jin10SourceSummary: null,
-      jin10DiagnosisText: null,
-      jin10Metrics: [],
-      jin10FailureReason: null,
-    }
+function normalizeClsBaseUrl(url: string | null) {
+  if (!url) {
+    return null
   }
 
-  const fullUrl = getStringValue(prefetchedContext.url)
-  const baseUrl = normalizeJin10BaseUrl(fullUrl)
-  const ok = typeof prefetchedContext.ok === 'boolean' ? prefetchedContext.ok : null
-  const error = getStringValue(prefetchedContext.error)
-  const itemCount = getNumberValue(prefetchedContext.item_count)
-  const total = getNumberValue(prefetchedContext.total)
-  const hasMore = typeof prefetchedContext.has_more === 'boolean' ? prefetchedContext.has_more : null
-  const requestCount = getNumberValue(prefetchedContext.request_count)
-  const params = isRecord(prefetchedContext.params) ? prefetchedContext.params : null
-  const analysisMeta = isRecord(prefetchedContext.analysis_meta)
-    ? prefetchedContext.analysis_meta
-    : null
-  const date = getStringValue(params?.date)
-  const startTime = getStringValue(params?.startTime)
-  const endTime = getStringValue(params?.endTime)
-  const diagnosisText = getStringValue(prefetchedContext.analysis_text)
+  try {
+    const parsed = new URL(url)
+    const pathname = parsed.pathname.replace(/\/api\/cls\/(telegraphs|export)\/?$/, '')
+    return `${parsed.origin}${pathname}`
+  } catch {
+    return url.replace(/\/api\/cls\/(telegraphs|export)(?:\?.*)?$/, '')
+  }
+}
+
+function getSourceBaseUrl(sourceKey: string, fullUrl: string | null) {
+  if (sourceKey === 'cls') {
+    return normalizeClsBaseUrl(fullUrl)
+  }
+  return normalizeJin10BaseUrl(fullUrl)
+}
+
+function getSourceLabel(sourceKey: string, meta: Record<string, unknown>) {
+  const fromMeta = getStringValue(meta.source_label)
+  if (fromMeta) {
+    return fromMeta
+  }
+  return sourceKey === 'cls' ? 'CLS' : 'Jin10'
+}
+
+function getNewsSourceDiagnostic(sourceKey: string, meta: Record<string, unknown>): NewsSourceDiagnostic {
+  const label = getSourceLabel(sourceKey, meta)
+  const fullUrl = getStringValue(meta.url)
+  const baseUrl = getSourceBaseUrl(sourceKey, fullUrl)
+  const ok = typeof meta.ok === 'boolean' ? meta.ok : null
+  const itemCount = getNumberValue(meta.item_count)
+  const total = getNumberValue(meta.total)
+  const hasMore = typeof meta.has_more === 'boolean' ? meta.has_more : null
+  const requestCount = getNumberValue(meta.request_count)
+  const params = isRecord(meta.params) ? meta.params : null
+  const analysisMeta = isRecord(meta.analysis_meta) ? meta.analysis_meta : null
+  const analysisText = getStringValue(meta.analysis_text)
   const analysisSummary = getStringValue(analysisMeta?.summary)
   const analysisError = getStringValue(analysisMeta?.failure_reason) || getStringValue(analysisMeta?.error)
   const chunkCount = getNumberValue(analysisMeta?.chunk_count)
   const analysisStatus = getStringValue(analysisMeta?.status)
   const fallbackUsed = typeof analysisMeta?.fallback_used === 'boolean' ? analysisMeta.fallback_used : null
+  const date = getStringValue(params?.date)
+  const startTime = getStringValue(params?.startTime)
+  const endTime = getStringValue(params?.endTime)
+  const startCtime = getStringValue(params?.startCtime)
+  const endCtime = getStringValue(params?.endCtime)
 
   const segments: string[] = []
   if (date) {
     segments.push(`日期 ${date}`)
+  } else if (startCtime && endCtime) {
+    segments.push(`时间范围 ${startCtime} - ${endCtime}`)
   }
   if (startTime || endTime) {
     segments.push(`时间 ${startTime ?? '--'}-${endTime ?? '--'}`)
@@ -220,24 +233,15 @@ function getJin10SourceInfo(detail: RunDetail) {
     fetchCountParts.push(`总量 ${totalText}`)
   }
   if (fetchCountParts.length) {
-    metrics.push({
-      label: '抓取条数',
-      value: fetchCountParts.join(' / '),
-    })
+    metrics.push({ label: '抓取条数', value: fetchCountParts.join(' / ') })
   }
   const requestCountText = formatMetricNumber(requestCount)
   if (requestCountText) {
-    metrics.push({
-      label: '分页请求数',
-      value: requestCountText,
-    })
+    metrics.push({ label: '分页请求数', value: requestCountText })
   }
   const chunkCountText = formatMetricNumber(chunkCount)
   if (chunkCountText) {
-    metrics.push({
-      label: '分块数',
-      value: chunkCountText,
-    })
+    metrics.push({ label: '分块数', value: chunkCountText })
   }
   if (analysisStatus) {
     const statusLabelMap: Record<string, string> = {
@@ -255,39 +259,80 @@ function getJin10SourceInfo(detail: RunDetail) {
     })
   }
   if (fallbackUsed) {
-    metrics.push({
-      label: '回退策略',
-      value: '已回退为原始新闻摘录',
-      tone: 'warning',
-    })
+    metrics.push({ label: '回退策略', value: '已回退为原始新闻摘录', tone: 'warning' })
   }
   if (hasMore === true) {
-    metrics.push({
-      label: '拉取完整性',
-      value: '仍有后续分页未合并',
-      tone: 'warning',
-    })
+    metrics.push({ label: '拉取完整性', value: '仍有后续分页未合并', tone: 'warning' })
   }
 
-  let summary = '已注入 Jin10 新闻上下文'
+  let summary = `已注入 ${label} 新闻上下文`
   if (ok === false) {
-    summary = error ? `拉取失败：${error}` : '拉取失败'
+    summary = analysisError ? `拉取失败：${analysisError}` : '拉取失败'
   } else if (analysisError) {
-    summary = `已拉取 Jin10 新闻，但诊断失败：${analysisError}`
-  } else if (ok === true && segments.length) {
-    summary = segments.join('；')
+    summary = `已拉取 ${label} 新闻，但诊断失败：${analysisError}`
   } else if (segments.length) {
     summary = segments.join('；')
   }
 
-  const finalDiagnosisText = diagnosisText || analysisSummary
+  return {
+    key: sourceKey,
+    label,
+    baseUrl: baseUrl ?? fullUrl,
+    sourceSummary: summary,
+    diagnosisText: analysisText || analysisSummary,
+    metrics,
+    failureReason: analysisError || (ok === false ? getStringValue(meta.error) : null),
+  }
+}
+
+function getSourceDiagnostics(detail: RunDetail): NewsSourceDiagnostic[] {
+  const skillPayloads = isRecord(detail.skill_payloads) ? detail.skill_payloads : null
+  const prefetchedSourceContext = isRecord(skillPayloads?.prefetched_context_sources)
+    ? skillPayloads.prefetched_context_sources
+    : null
+  const sourceMap = isRecord(prefetchedSourceContext?.sources)
+    ? prefetchedSourceContext.sources
+    : null
+
+  if (sourceMap) {
+    const diagnostics: NewsSourceDiagnostic[] = []
+    for (const [key, value] of Object.entries(sourceMap)) {
+      if (!isRecord(value)) {
+        continue
+      }
+      diagnostics.push(getNewsSourceDiagnostic(key, value))
+    }
+    return diagnostics
+  }
+
+  const prefetchedContext = isRecord(skillPayloads?.prefetched_context)
+    ? skillPayloads.prefetched_context
+    : null
+  if (!prefetchedContext) {
+    return []
+  }
+  return [getNewsSourceDiagnostic('jin10', prefetchedContext)]
+}
+
+function getJin10SourceInfo(detail: RunDetail) {
+  const diagnostics = getSourceDiagnostics(detail)
+  const jin10 = diagnostics.find((item) => item.key === 'jin10')
+  if (!jin10) {
+    return {
+      jin10BaseUrl: null,
+      jin10SourceSummary: null,
+      jin10DiagnosisText: null,
+      jin10Metrics: [],
+      jin10FailureReason: null,
+    }
+  }
 
   return {
-    jin10BaseUrl: baseUrl ?? fullUrl,
-    jin10SourceSummary: summary,
-    jin10DiagnosisText: finalDiagnosisText,
-    jin10Metrics: metrics,
-    jin10FailureReason: analysisError || (ok === false ? error : null),
+    jin10BaseUrl: jin10.baseUrl,
+    jin10SourceSummary: jin10.sourceSummary,
+    jin10DiagnosisText: jin10.diagnosisText,
+    jin10Metrics: jin10.metrics,
+    jin10FailureReason: jin10.failureReason,
   }
 }
 
@@ -683,6 +728,12 @@ function getTradeSummary(action: 'buy' | 'sell', symbol: string, name: string, v
   return `挂单${actionText}${displaySymbol}共计${volume}股。`
 }
 
+function getTradeSourceLabels(detail: RunDetail) {
+  return getSourceDiagnostics(detail)
+    .map((item) => item.label)
+    .filter((item, index, items) => !!item && items.indexOf(item) === index)
+}
+
 function mapApiDetails(detail: RunDetail): ApiDetail[] {
   const tradeToolNames = new Set(['mx_moni_trade', 'mx_moni_cancel'])
   const skillPayloads = detail.skill_payloads && typeof detail.skill_payloads === 'object'
@@ -727,7 +778,11 @@ function resolveTradeDetailStatus(value: unknown): 'done' | 'failed' {
   return 'done'
 }
 
-function mapTradeDetails(tradeOrders: TradeOrder[], executedActions: Array<Record<string, unknown>> | null): TradeDetail[] {
+function mapTradeDetails(
+  tradeOrders: TradeOrder[],
+  executedActions: Array<Record<string, unknown>> | null,
+  sourceLabels: string[],
+): TradeDetail[] {
   if (tradeOrders.length > 0) {
     return tradeOrders.map((order) => {
       const price = order.price
@@ -744,6 +799,7 @@ function mapTradeDetails(tradeOrders: TradeOrder[], executedActions: Array<Recor
         price,
         amount,
         summary: getTradeSummary(action, order.symbol, name, order.quantity, price, amount),
+        source_labels: sourceLabels,
         tool_name: null,
         preview_index: null,
         status,
@@ -772,6 +828,7 @@ function mapTradeDetails(tradeOrders: TradeOrder[], executedActions: Array<Recor
       price,
       amount,
       summary: getTradeSummary(actionType, symbol, name, volume, price, amount),
+      source_labels: sourceLabels,
       tool_name: null,
       preview_index: null,
       status,
@@ -802,6 +859,7 @@ function mapRunSummaryToViewModel(summary: RunSummary): AnalysisRunViewModel {
     hasConsistencyRevision: false,
     summary: summary.analysis_summary || '--',
     detailLoaded: false,
+    sourceDiagnostics: [],
     jin10BaseUrl: null,
     jin10SourceSummary: null,
     jin10DiagnosisText: null,
@@ -818,8 +876,12 @@ function mapRunDetailToViewModel(detail: RunDetail): AnalysisRunViewModel {
   const tokenUsage = getTokenUsage(detail)
   const apiDetails = detail.api_details?.length ? detail.api_details : mapApiDetails(detail)
   const rawToolPreviews = Array.isArray(detail.raw_tool_previews) ? detail.raw_tool_previews : []
-  const tradeDetails = detail.trade_details?.length ? detail.trade_details : mapTradeDetails(detail.trade_orders, detail.executed_actions)
   const outputSections = getConsistencyOutputSections(detail)
+  const sourceDiagnostics = getSourceDiagnostics(detail)
+  const tradeSourceLabels = getTradeSourceLabels(detail)
+  const tradeDetails = detail.trade_details?.length
+    ? detail.trade_details
+    : mapTradeDetails(detail.trade_orders, detail.executed_actions, tradeSourceLabels)
   const jin10SourceInfo = getJin10SourceInfo(detail)
   const selfSelectChanges = getSelfSelectChanges(detail)
   const executionSummary = getExecutionSummary(detail)
@@ -846,6 +908,7 @@ function mapRunDetailToViewModel(detail: RunDetail): AnalysisRunViewModel {
     hasConsistencyRevision: outputSections.hasConsistencyRevision,
     summary: detail.analysis_summary || '--',
     detailLoaded: true,
+    sourceDiagnostics,
     jin10BaseUrl: jin10SourceInfo.jin10BaseUrl,
     jin10SourceSummary: jin10SourceInfo.jin10SourceSummary,
     jin10DiagnosisText: jin10SourceInfo.jin10DiagnosisText,

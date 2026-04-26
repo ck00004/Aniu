@@ -343,6 +343,7 @@ def test_execute_run_failure_advances_schedule_window(monkeypatch, tmp_path) -> 
             "id": 1,
             "mx_api_key": "demo-key",
             "jin10_api_base_url": None,
+            "cls_api_base_url": None,
             "llm_base_url": "https://example.com/v1",
             "llm_api_key": "token",
             "llm_model": "demo-model",
@@ -426,6 +427,7 @@ def test_execute_run_failure_stops_retry_after_third_retry(monkeypatch, tmp_path
             "id": 1,
             "mx_api_key": "demo-key",
             "jin10_api_base_url": None,
+            "cls_api_base_url": None,
             "llm_base_url": "https://example.com/v1",
             "llm_api_key": "token",
             "llm_model": "demo-model",
@@ -495,6 +497,7 @@ def test_manual_failure_does_not_increment_retry_count(monkeypatch, tmp_path) ->
             "id": 1,
             "mx_api_key": "demo-key",
             "jin10_api_base_url": None,
+            "cls_api_base_url": None,
             "llm_base_url": "https://example.com/v1",
             "llm_api_key": "token",
             "llm_model": "demo-model",
@@ -743,6 +746,7 @@ def test_execute_run_rolls_back_partial_trade_orders_when_order_persist_fails(
                 "id": 1,
                 "mx_api_key": "demo-key",
                 "jin10_api_base_url": None,
+                "cls_api_base_url": None,
                 "llm_base_url": "https://example.com/v1",
                 "llm_api_key": "token",
                 "llm_model": "demo-model",
@@ -1065,7 +1069,11 @@ def test_account_overview_prefers_live_positions_over_cached_snapshot(monkeypatc
     monkeypatch.setattr(
         aniu_service_module.aniu_service,
         "get_or_create_settings",
-        lambda db: type("StubSettings", (), {"mx_api_key": "demo-key"})(),
+        lambda db: type(
+            "StubSettings",
+            (),
+            {"mx_api_key": "demo-key", "jin10_api_base_url": None, "cls_api_base_url": None},
+        )(),
     )
     monkeypatch.setattr(
         aniu_service_module.aniu_service,
@@ -1144,7 +1152,11 @@ def test_account_overview_falls_back_to_cached_orders_when_live_orders_fail(
     monkeypatch.setattr(
         aniu_service_module.aniu_service,
         "get_or_create_settings",
-        lambda db: type("StubSettings", (), {"mx_api_key": "demo-key"})(),
+        lambda db: type(
+            "StubSettings",
+            (),
+            {"mx_api_key": "demo-key", "jin10_api_base_url": None, "cls_api_base_url": None},
+        )(),
     )
     monkeypatch.setattr(
         aniu_service_module.aniu_service,
@@ -1243,6 +1255,7 @@ def test_execute_run_does_not_prefetch_account_before_agent(monkeypatch, tmp_pat
                 "id": 1,
                 "mx_api_key": "demo-key",
                 "jin10_api_base_url": None,
+                "cls_api_base_url": None,
                 "llm_base_url": "https://example.com/v1",
                 "llm_api_key": "token",
                 "llm_model": "demo-model",
@@ -1350,6 +1363,7 @@ def test_execute_run_passes_emit_when_run_agent_supports_it(monkeypatch, tmp_pat
                 "id": 1,
                 "mx_api_key": "demo-key",
                 "jin10_api_base_url": None,
+                "cls_api_base_url": None,
                 "llm_base_url": "https://example.com/v1",
                 "llm_api_key": "token",
                 "llm_model": "demo-model",
@@ -1415,6 +1429,7 @@ def test_manual_trade_run_overrides_default_run_type(monkeypatch, tmp_path) -> N
                 "id": 1,
                 "mx_api_key": "demo-key",
                 "jin10_api_base_url": None,
+                "cls_api_base_url": None,
                 "llm_base_url": "https://example.com/v1",
                 "llm_api_key": "token",
                 "llm_model": "demo-model",

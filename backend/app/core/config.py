@@ -40,6 +40,10 @@ class Settings(BaseSettings):
         default="http://127.0.0.1:3000",
         alias="JIN10_API_BASE_URL",
     )
+    cls_api_base_url: str | None = Field(
+        default="http://127.0.0.1:3000",
+        alias="CLS_API_BASE_URL",
+    )
     jin10_api_timeout_seconds: int = Field(
         default=5,
         alias="JIN10_API_TIMEOUT_SECONDS",
@@ -47,6 +51,14 @@ class Settings(BaseSettings):
     jin10_news_limit: int = Field(
         default=30,
         alias="JIN10_NEWS_LIMIT",
+    )
+    cls_api_timeout_seconds: int = Field(
+        default=5,
+        alias="CLS_API_TIMEOUT_SECONDS",
+    )
+    cls_news_limit: int = Field(
+        default=200,
+        alias="CLS_NEWS_LIMIT",
     )
 
     account_overview_cache_ttl_seconds: int = Field(
@@ -70,6 +82,7 @@ class Settings(BaseSettings):
         "openai_base_url",
         "openai_api_key",
         "jin10_api_base_url",
+        "cls_api_base_url",
         "app_login_password",
         mode="before",
     )
