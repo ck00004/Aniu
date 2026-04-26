@@ -138,6 +138,39 @@ class TradeOrderRead(BaseModel):
     created_at: datetime
 
 
+class RunActionResultRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    attempt_no: int
+    status: str
+    response_payload: dict[str, Any] | None = None
+    error_message: str | None = None
+    created_at: datetime
+    finished_at: datetime | None = None
+
+
+class RunActionRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    sequence_no: int
+    phase: str
+    tool_name: str
+    action_type: str
+    status: str
+    tool_call_id: str | None = None
+    arguments_payload: dict[str, Any] | None = None
+    planned_action_payload: dict[str, Any] | None = None
+    executed_action_payload: dict[str, Any] | None = None
+    result_summary: str | None = None
+    error_message: str | None = None
+    created_at: datetime
+    updated_at: datetime
+    executed_at: datetime | None = None
+    results: list[RunActionResultRead] = Field(default_factory=list)
+
+
 class ApiDetailRead(BaseModel):
     tool_name: str
     name: str
@@ -215,6 +248,7 @@ class RunDetailRead(RunSummaryRead):
     llm_response_payload: dict[str, Any] | None = None
     skill_payloads: dict[str, Any] | None = None
     trade_orders: list[TradeOrderRead] = Field(default_factory=list)
+    actions: list[RunActionRead] = Field(default_factory=list)
 
 
 class RunSummaryPageRead(BaseModel):

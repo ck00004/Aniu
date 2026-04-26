@@ -57,6 +57,45 @@ export interface RunDetail extends RunSummary {
   llm_response_payload: Record<string, unknown> | null
   skill_payloads: Record<string, unknown> | null
   trade_orders: TradeOrder[]
+  actions: RunAction[]
+}
+
+export interface RunActionResult {
+  id: number
+  attempt_no: number
+  status: string
+  response_payload: Record<string, unknown> | null
+  error_message: string | null
+  created_at: string
+  finished_at: string | null
+}
+
+export interface RunAction {
+  id: number
+  sequence_no: number
+  phase: string
+  tool_name: string
+  action_type: string
+  status: string
+  tool_call_id: string | null
+  arguments_payload: Record<string, unknown> | null
+  planned_action_payload: Record<string, unknown> | null
+  executed_action_payload: Record<string, unknown> | null
+  result_summary: string | null
+  error_message: string | null
+  created_at: string
+  updated_at: string
+  executed_at: string | null
+  results: RunActionResult[]
+}
+
+export interface ExecutionSummary {
+  total_planned: number
+  total_executed: number
+  fully_executed: boolean
+  unresolved_count: number
+  status_counts: Record<string, number>
+  error_message: string | null
 }
 
 export interface ApiDetail {

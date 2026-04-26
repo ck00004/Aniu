@@ -442,6 +442,32 @@ def test_extract_claimed_self_select_changes_treats_new_candidates_as_additions(
     assert any(item["action"] == "add" and item["target"] == "中船防务" for item in changes)
 
 
+def test_extract_claimed_self_select_changes_ignores_reason_lines_in_non_trading_day_summary() -> None:
+    final_answer = """
+六、本轮自选股调整
+1. 本轮新增
+1. 杰瑞股份
+- 理由：周末油气地缘风险未退，油服是A股里相对更有基本面承接的映射方向
+- 后续观察信号：国际油价是否继续走强，A股油服是否放量跟随，而不是只高开脉冲
+
+2. 本轮移除
+1. 工业富联
+- 理由：旧算力中军短线明显弱于半导体/国产芯片新主线，风险收益比恶化
+- 后续观察信号：若未来重新出现放量止跌、强于板块的修复结构，再考虑重新纳入
+
+七、继续保留观察的自选股
+1. 中芯国际
+- 跟踪理由：半导体制造中军，决定主线强弱
+"""
+
+    changes = aniu_service._extract_claimed_self_select_changes(final_answer)
+
+    assert changes == [
+        {"action": "add", "target": "杰瑞股份", "raw_query": "杰瑞股份"},
+        {"action": "remove", "target": "工业富联", "raw_query": "工业富联"},
+    ]
+
+
 def test_finalize_self_select_consistency_appends_warning_when_claim_has_no_action() -> None:
     final_answer = "新增自选股：光迅科技（002281）"
 
@@ -463,6 +489,95 @@ def test_finalize_self_select_consistency_keeps_answer_when_action_exists() -> N
     result = aniu_service._finalize_self_select_consistency(final_answer, executed_actions)
 
     assert result == final_answer
+
+
+def test_finalize_self_select_consistency_appends_execution_correction_when_answer_denies_actions() -> None:
+    final_answer = "本轮没有实际新增任何自选股。\n本轮没有实际移除任何自选股。"
+    executed_actions = [
+        {
+            "action": "MANAGE_SELF_SELECT",
+            "query": "把杰瑞股份加入自选股",
+        },
+        {
+            "action": "MANAGE_SELF_SELECT",
+            "query": "把工业富联从自选股删除",
+        },
+    ]
+
+    result = aniu_service._finalize_self_select_consistency(final_answer, executed_actions)
+
+    assert "[系统一致性修正]" in result
+    assert "实际新增自选股：杰瑞股份" in result
+    assert "实际移除自选股：工业富联" in result
+
+
+def test_enforce_self_select_consistency_corrects_followup_text_when_actions_exist(
+    monkeypatch,
+) -> None:
+    original_has_gap = aniu_service._has_self_select_consistency_gap
+    call_count = {"value": 0}
+
+    def fake_has_gap(final_answer, executed_actions):
+        call_count["value"] += 1
+        if call_count["value"] == 1:
+            return True
+        return original_has_gap(final_answer, executed_actions)
+
+    def fake_run_agent_with_messages(*, messages, **kwargs):
+        del messages, kwargs
+        return (
+            {
+                "final_answer": "本轮没有实际新增任何自选股。\n本轮没有实际移除任何自选股。",
+                "tool_calls": [],
+            },
+            {"messages": []},
+            {"responses": [], "final_message": {"content": "followup"}},
+            {"messages": [{"role": "assistant", "content": "followup"}]},
+        )
+
+    monkeypatch.setattr(aniu_service, "_has_self_select_consistency_gap", fake_has_gap)
+    monkeypatch.setattr(llm_service, "run_agent_with_messages", fake_run_agent_with_messages)
+
+    decision = {
+        "final_answer": "新增自选股：杰瑞股份\n移除自选股：工业富联",
+        "tool_calls": [
+            {
+                "name": "mx_manage_self_select",
+                "result": {
+                    "ok": True,
+                    "executed_action": {
+                        "action": "MANAGE_SELF_SELECT",
+                        "query": "把杰瑞股份加入自选股",
+                    },
+                },
+            },
+            {
+                "name": "mx_manage_self_select",
+                "result": {
+                    "ok": True,
+                    "executed_action": {
+                        "action": "MANAGE_SELF_SELECT",
+                        "query": "把工业富联从自选股删除",
+                    },
+                },
+            },
+        ],
+    }
+    settings = SimpleNamespace(run_type="analysis", prompt_templates={})
+
+    merged_decision, _, _, _, executed_actions = aniu_service._enforce_self_select_consistency(
+        settings=settings,
+        client=None,
+        decision=decision,
+        llm_request={},
+        llm_response={},
+        runtime_trace={"messages": [{"role": "assistant", "content": decision["final_answer"]}]},
+    )
+
+    assert len(executed_actions) == 2
+    assert "[系统一致性修正]" in str(merged_decision.get("final_answer") or "")
+    assert "实际新增自选股：杰瑞股份" in str(merged_decision.get("final_answer") or "")
+    assert "实际移除自选股：工业富联" in str(merged_decision.get("final_answer") or "")
 
 
 def test_merge_consistency_followup_final_answer_preserves_original_analysis() -> None:
@@ -508,6 +623,84 @@ def test_finalize_trade_consistency_keeps_answer_when_trade_action_exists() -> N
     result = aniu_service._finalize_trade_consistency(final_answer, executed_actions)
 
     assert result == final_answer
+
+
+def test_finalize_trade_consistency_appends_execution_correction_when_answer_denies_trade() -> None:
+    final_answer = "本轮未实际交易。"
+    executed_actions = [
+        {
+            "action": "SELL",
+            "symbol": "002475",
+            "name": "立讯精密",
+            "quantity": 5000,
+        }
+    ]
+
+    result = aniu_service._finalize_trade_consistency(final_answer, executed_actions)
+
+    assert "[系统一致性修正]" in result
+    assert "实际卖出：立讯精密(002475) 5000股" in result
+
+
+def test_enforce_trade_consistency_corrects_followup_text_when_actions_exist(
+    monkeypatch,
+) -> None:
+    original_has_gap = aniu_service._has_trade_consistency_gap
+    call_count = {"value": 0}
+
+    def fake_has_gap(final_answer, executed_actions):
+        call_count["value"] += 1
+        if call_count["value"] == 1:
+            return True
+        return original_has_gap(final_answer, executed_actions)
+
+    def fake_run_agent_with_messages(*, messages, **kwargs):
+        del messages, kwargs
+        return (
+            {
+                "final_answer": "本轮未实际交易。",
+                "tool_calls": [],
+            },
+            {"messages": []},
+            {"responses": [], "final_message": {"content": "followup"}},
+            {"messages": [{"role": "assistant", "content": "followup"}]},
+        )
+
+    monkeypatch.setattr(aniu_service, "_has_trade_consistency_gap", fake_has_gap)
+    monkeypatch.setattr(llm_service, "run_agent_with_messages", fake_run_agent_with_messages)
+
+    decision = {
+        "final_answer": "执行：卖出立讯精密 5000股",
+        "tool_calls": [
+            {
+                "name": "mx_moni_trade",
+                "result": {
+                    "ok": True,
+                    "executed_action": {
+                        "action": "SELL",
+                        "symbol": "002475",
+                        "name": "立讯精密",
+                        "quantity": 5000,
+                        "price_type": "MARKET",
+                    },
+                },
+            }
+        ],
+    }
+    settings = SimpleNamespace(run_type="trade", prompt_templates={})
+
+    merged_decision, _, _, _, executed_actions = aniu_service._enforce_trade_consistency(
+        settings=settings,
+        client=None,
+        decision=decision,
+        llm_request={},
+        llm_response={},
+        runtime_trace={"messages": [{"role": "assistant", "content": decision["final_answer"]}]},
+    )
+
+    assert len(executed_actions) == 1
+    assert "[系统一致性修正]" in str(merged_decision.get("final_answer") or "")
+    assert "实际卖出：立讯精密(002475) 5000股" in str(merged_decision.get("final_answer") or "")
 
 
 def test_jin10_news_service_fetches_raw_news_items(monkeypatch) -> None:

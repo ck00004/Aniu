@@ -149,6 +149,60 @@ class StrategyRun(Base):
         back_populates="run",
         cascade="all, delete-orphan",
     )
+    actions: Mapped[list["StrategyRunAction"]] = relationship(
+        back_populates="run",
+        cascade="all, delete-orphan",
+        order_by="StrategyRunAction.sequence_no, StrategyRunAction.id",
+    )
+
+
+class StrategyRunAction(Base):
+    __tablename__ = "strategy_run_actions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("strategy_runs.id", ondelete="CASCADE"), index=True)
+    sequence_no: Mapped[int] = mapped_column(Integer, default=1)
+    phase: Mapped[str] = mapped_column(String(32), default="planned", index=True)
+    tool_name: Mapped[str] = mapped_column(String(64), index=True)
+    action_type: Mapped[str] = mapped_column(String(32), default="UNKNOWN", index=True)
+    status: Mapped[str] = mapped_column(String(32), default="planned", index=True)
+    tool_call_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    arguments_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    planned_action_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    executed_action_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    result_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+    executed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    run: Mapped[StrategyRun] = relationship(back_populates="actions")
+    results: Mapped[list["StrategyRunActionResult"]] = relationship(
+        back_populates="action",
+        cascade="all, delete-orphan",
+        order_by="StrategyRunActionResult.attempt_no, StrategyRunActionResult.id",
+    )
+
+
+class StrategyRunActionResult(Base):
+    __tablename__ = "strategy_run_action_results"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    action_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_run_actions.id", ondelete="CASCADE"), index=True
+    )
+    attempt_no: Mapped[int] = mapped_column(Integer, default=1)
+    status: Mapped[str] = mapped_column(String(32), default="planned", index=True)
+    response_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    action: Mapped[StrategyRunAction] = relationship(back_populates="results")
 
 
 class TradeOrder(Base):

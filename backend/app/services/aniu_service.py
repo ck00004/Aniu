@@ -33,11 +33,15 @@ from app.db.models import (
     ChatMessageRecord,
     ChatSession,
     StrategyRun,
+    StrategyRunAction,
     StrategySchedule,
     TradeOrder,
 )
 from app.schemas.aniu import AppSettingsUpdate, ChatRequest, ScheduleUpdate
 from app.schemas.aniu import ChatMessageRead, PersistentSessionRead
+from app.services.execution_plan_service import execution_plan_service
+from app.services.execution_reconcile_service import execution_reconcile_service
+from app.services.execution_runner_service import execution_runner_service
 from app.services.event_bus import event_bus, make_emitter
 from app.services.jin10_news_service import jin10_news_service
 from app.services.llm_service import LLMStreamCancelled, llm_service
@@ -600,7 +604,10 @@ class AniuService:
         stmt = (
             select(StrategyRun)
             .where(StrategyRun.id == run_id)
-            .options(selectinload(StrategyRun.trade_orders))
+            .options(
+                selectinload(StrategyRun.trade_orders),
+                selectinload(StrategyRun.actions).selectinload(StrategyRunAction.results),
+            )
         )
         run = db.scalar(stmt)
         if run is not None:
@@ -745,6 +752,13 @@ class AniuService:
             self._hydrate_run_display_fields(run)
             for order in run.trade_orders:
                 order.created_at = _assume_utc(order.created_at)
+            for action in run.actions:
+                action.created_at = _assume_utc(action.created_at)
+                action.updated_at = _assume_utc(action.updated_at)
+                action.executed_at = _assume_utc(action.executed_at)
+                for result in action.results:
+                    result.created_at = _assume_utc(result.created_at)
+                    result.finished_at = _assume_utc(result.finished_at)
 
     def _hydrate_run_summary_metrics(self, run: StrategyRun) -> None:
         token_usage = self._get_run_token_usage(run)
@@ -1177,6 +1191,10 @@ class AniuService:
             1
             for item in self._get_detail_tool_calls(run)
             if str(item.get("name") or "") not in trade_tool_names
+            and not (
+                isinstance(item.get("result"), dict)
+                and isinstance(item.get("result", {}).get("planned_action"), dict)
+            )
         )
 
     def _count_executed_actions(self, run: StrategyRun) -> int:
@@ -1199,12 +1217,18 @@ class AniuService:
             run.decision_payload if isinstance(run.decision_payload, dict) else {}
         )
 
-        tool_calls = skill_payloads.get("tool_calls")
-        if not isinstance(tool_calls, list):
-            tool_calls = decision_payload.get("tool_calls")
-        if not isinstance(tool_calls, list):
-            return []
-        return [item for item in tool_calls if isinstance(item, dict)]
+        planning_tool_calls = skill_payloads.get("tool_calls")
+        if not isinstance(planning_tool_calls, list):
+            planning_tool_calls = decision_payload.get("tool_calls")
+
+        execution_tool_calls = skill_payloads.get("execution_tool_calls")
+
+        combined: list[dict[str, Any]] = []
+        if isinstance(planning_tool_calls, list):
+            combined.extend(item for item in planning_tool_calls if isinstance(item, dict))
+        if isinstance(execution_tool_calls, list):
+            combined.extend(item for item in execution_tool_calls if isinstance(item, dict))
+        return combined
 
     def _empty_account_overview(self, errors: list[str] | None = None) -> dict[str, Any]:
         return {
@@ -2195,6 +2219,30 @@ class AniuService:
             return summary
         return summary[:157].rstrip() + "..."
 
+    def _run_agent_with_optional_tool_executor(
+        self,
+        *,
+        app_settings: Any,
+        client: MXClient,
+        messages: list[dict[str, Any]],
+        emit: Any = None,
+        tool_executor: Any = None,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+        kwargs = {
+            "app_settings": app_settings,
+            "client": client,
+            "messages": messages,
+            "emit": emit,
+        }
+        if tool_executor is not None:
+            try:
+                signature = inspect.signature(llm_service.run_agent_with_messages)
+            except (TypeError, ValueError):
+                signature = None
+            if signature is None or "tool_executor" in signature.parameters:
+                kwargs["tool_executor"] = tool_executor
+        return llm_service.run_agent_with_messages(**kwargs)
+
     def _run_body(
         self,
         *,
@@ -2240,12 +2288,37 @@ class AniuService:
                     schedule_id=schedule_id,
                     prefetched_context=prefetched_context,
                 )
+                planning_sequence = {"value": 0}
+
+                def _planning_tool_executor(
+                    tool_name: str,
+                    arguments: dict[str, Any],
+                    tool_call_id: str | None,
+                ) -> dict[str, Any]:
+                    is_mutation = execution_plan_service.is_mutation_tool(tool_name)
+                    next_sequence = planning_sequence["value"] + 1 if is_mutation else planning_sequence["value"]
+                    tool_result, _draft = execution_plan_service.execute_tool(
+                        tool_name=tool_name,
+                        arguments=arguments,
+                        tool_call_id=tool_call_id,
+                        context={
+                            "client": client,
+                            "app_settings": settings,
+                            "run_type": str(getattr(settings, "run_type", "analysis") or "analysis"),
+                        },
+                        sequence_no=next_sequence,
+                    )
+                    if is_mutation and bool(tool_result.get("ok")):
+                        planning_sequence["value"] = next_sequence
+                    return tool_result
+
                 decision, llm_request, llm_response, runtime_trace = (
-                    llm_service.run_agent_with_messages(
+                    self._run_agent_with_optional_tool_executor(
                         app_settings=settings,
                         client=client,
                         messages=session_context.messages,
                         emit=_emit,
+                        tool_executor=_planning_tool_executor,
                     )
                 )
                 (
@@ -2253,7 +2326,7 @@ class AniuService:
                     llm_request,
                     llm_response,
                     runtime_trace,
-                    executed_actions,
+                    planned_actions,
                 ) = self._enforce_self_select_consistency(
                     settings=settings,
                     client=client,
@@ -2268,7 +2341,7 @@ class AniuService:
                     llm_request,
                     llm_response,
                     runtime_trace,
-                    executed_actions,
+                    planned_actions,
                 ) = self._enforce_trade_consistency(
                     settings=settings,
                     client=client,
@@ -2278,14 +2351,79 @@ class AniuService:
                     runtime_trace=runtime_trace,
                     emit=_emit,
                 )
+
+                tool_calls = decision.get("tool_calls")
+                planned_actions = self._extract_planned_actions(tool_calls)
+                planned_action_drafts = self._extract_planned_action_drafts(tool_calls)
+                legacy_executed_actions = self._extract_executed_actions(tool_calls)
+
+                execution_summary = None
+                executed_actions: list[dict[str, Any]] = []
+                execution_tool_calls: list[dict[str, Any]] = []
+                if planned_action_drafts:
+                    execution_runner_service.replace_plan(
+                        run_id=run_id,
+                        planned_actions=planned_action_drafts,
+                    )
+                    _emit(
+                        "stage",
+                        stage="execution",
+                        message=f"正在执行计划动作（{len(planned_action_drafts)} 条）",
+                    )
+                    execution_result = execution_runner_service.execute_plan(
+                        run_id=run_id,
+                        client=client,
+                        app_settings=settings,
+                        emit=_emit,
+                    )
+                    executed_actions = list(execution_result.executed_actions)
+                    execution_tool_calls = list(execution_result.execution_tool_calls)
+                    execution_summary = execution_reconcile_service.summarize(
+                        planned_actions=planned_actions,
+                        executed_actions=executed_actions,
+                        unresolved_count=execution_result.unresolved_count,
+                        action_status_counts=execution_result.action_status_counts,
+                        error_message=execution_result.error_message,
+                    )
+                elif legacy_executed_actions:
+                    executed_actions = list(legacy_executed_actions)
+                    execution_summary = execution_reconcile_service.summarize(
+                        planned_actions=legacy_executed_actions,
+                        executed_actions=legacy_executed_actions,
+                        unresolved_count=0,
+                        action_status_counts={"completed": len(legacy_executed_actions)},
+                        error_message=None,
+                    )
+                else:
+                    execution_summary = execution_reconcile_service.summarize(
+                        planned_actions=planned_actions,
+                        executed_actions=[],
+                        unresolved_count=0,
+                        action_status_counts={"planned": 0},
+                        error_message=None,
+                    )
+
+                finalized_answer = self._finalize_self_select_consistency(
+                    decision.get("final_answer"),
+                    executed_actions,
+                )
+                finalized_answer = self._finalize_trade_consistency(
+                    finalized_answer,
+                    executed_actions,
+                )
+                decision = dict(decision)
+                decision["final_answer"] = finalized_answer
+                decision["execution_summary"] = execution_summary
             finally:
                 client.close()
 
             tool_calls = decision.get("tool_calls")
             skill_payloads = {
                 "tool_calls": tool_calls,
+                "execution_tool_calls": execution_tool_calls,
                 "runtime_trace": runtime_trace,
                 "prefetched_context": prefetched_context_meta,
+                "execution_summary": execution_summary,
             }
             persisted_trade_orders = [
                 {
@@ -2298,6 +2436,9 @@ class AniuService:
                 for action in executed_actions
                 if str(action.get("action") or "") in {"BUY", "SELL"}
             ]
+            run_error_message = execution_reconcile_service.build_run_error_message(
+                execution_summary
+            )
             completed_at = now_utc()
             completed_at_shanghai = completed_at.astimezone(SHANGHAI_TZ)
 
@@ -2332,8 +2473,9 @@ class AniuService:
                 run.final_answer = (
                     str(decision.get("final_answer") or "").strip() or None
                 )
+                run.error_message = run_error_message
                 run.executed_actions = executed_actions
-                run.status = "completed"
+                run.status = "completed" if not run_error_message else "failed"
                 run.finished_at = completed_at
                 db.add(run)
 
@@ -2372,7 +2514,7 @@ class AniuService:
                         assistant_content = self._build_persistent_session_assistant_content(
                             run_id=run_id,
                             run_type=str(getattr(settings, "run_type", "analysis") or "analysis"),
-                            status="completed",
+                            status=str(run.status or "completed"),
                             final_answer=str(decision.get("final_answer") or "").strip()
                             or None,
                             tool_calls=tool_calls if isinstance(tool_calls, list) else None,
@@ -2384,7 +2526,7 @@ class AniuService:
                             run_id=run_id,
                             content=assistant_content,
                             tool_calls=tool_calls if isinstance(tool_calls, list) else None,
-                            status="completed",
+                            status=str(run.status or "completed"),
                             meta_payload={
                                 "run_type": str(
                                     getattr(settings, "run_type", "analysis") or "analysis"
@@ -2726,45 +2868,97 @@ class AniuService:
             )
         return combined_tool_calls
 
-    def _extract_executed_actions(self, tool_calls: Any) -> list[dict[str, Any]]:
+    def _extract_action_records(
+        self,
+        tool_calls: Any,
+        *,
+        payload_key: str,
+        default_status: str,
+    ) -> list[dict[str, Any]]:
         if not isinstance(tool_calls, list):
             return []
 
-        executed_actions: list[dict[str, Any]] = []
+        action_records: list[dict[str, Any]] = []
         for item in tool_calls:
             if not isinstance(item, dict):
                 continue
             result = item.get("result")
             if not isinstance(result, dict) or not result.get("ok"):
                 continue
-            executed_action = result.get("executed_action")
-            if not isinstance(executed_action, dict):
+            action_payload = result.get(payload_key)
+            if not isinstance(action_payload, dict):
                 continue
-            action_name = str(executed_action.get("action") or "").upper()
+            action_name = str(action_payload.get("action") or "").upper()
             entry = {
                 "symbol": str(
-                    executed_action.get("symbol")
-                    or executed_action.get("stock_code")
+                    action_payload.get("symbol")
+                    or action_payload.get("stock_code")
                     or ""
                 ).strip(),
-                "name": str(executed_action.get("name") or "").strip() or None,
+                "name": str(action_payload.get("name") or "").strip() or None,
                 "action": action_name,
-                "quantity": int(executed_action.get("quantity") or 0),
-                "price_type": str(executed_action.get("price_type") or "MARKET"),
-                "price": executed_action.get("price"),
-                "reason": str(executed_action.get("reason") or "").strip(),
-                "status": "submitted",
+                "quantity": int(action_payload.get("quantity") or 0),
+                "price_type": str(action_payload.get("price_type") or "MARKET"),
+                "price": action_payload.get("price"),
+                "reason": str(action_payload.get("reason") or "").strip(),
+                "status": default_status,
                 "response": result.get("result"),
             }
             if action_name == "CANCEL":
                 entry["price_type"] = "CANCEL"
-                entry["status"] = "cancel_requested"
+                entry["status"] = "cancel_requested" if payload_key == "executed_action" else "planned"
             if action_name == "MANAGE_SELF_SELECT":
                 entry["price_type"] = "SELF_SELECT"
-                entry["status"] = "completed"
-                entry["symbol"] = str(executed_action.get("query") or "")
-            executed_actions.append(entry)
-        return executed_actions
+                entry["status"] = "completed" if payload_key == "executed_action" else "planned"
+                entry["query"] = str(action_payload.get("query") or "")
+                entry["symbol"] = str(action_payload.get("query") or "")
+            action_records.append(entry)
+        return action_records
+
+    def _extract_planned_actions(self, tool_calls: Any) -> list[dict[str, Any]]:
+        return self._extract_action_records(
+            tool_calls,
+            payload_key="planned_action",
+            default_status="planned",
+        )
+
+    def _extract_planned_action_drafts(self, tool_calls: Any) -> list[dict[str, Any]]:
+        if not isinstance(tool_calls, list):
+            return []
+
+        drafts: list[dict[str, Any]] = []
+        sequence_no = 0
+        for item in tool_calls:
+            if not isinstance(item, dict):
+                continue
+            result = item.get("result")
+            if not isinstance(result, dict) or not result.get("ok"):
+                continue
+            planned_action = result.get("planned_action")
+            if not isinstance(planned_action, dict):
+                continue
+            sequence_no += 1
+            action_type = str(planned_action.get("action") or "").upper() or "UNKNOWN"
+            drafts.append(
+                {
+                    "sequence_no": sequence_no,
+                    "tool_name": str(item.get("name") or ""),
+                    "tool_call_id": str(item.get("id") or item.get("tool_call_id") or "")
+                    or None,
+                    "arguments": item.get("arguments") if isinstance(item.get("arguments"), dict) else {},
+                    "action_type": action_type,
+                    "planned_action": planned_action,
+                    "result_summary": str(result.get("summary") or "").strip() or None,
+                }
+            )
+        return drafts
+
+    def _extract_executed_actions(self, tool_calls: Any) -> list[dict[str, Any]]:
+        return self._extract_action_records(
+            tool_calls,
+            payload_key="executed_action",
+            default_status="submitted",
+        )
 
     def _clean_self_select_target(self, raw_target: Any) -> str:
         text = str(raw_target or "").strip()
@@ -2867,6 +3061,17 @@ class AniuService:
 
         changes: list[dict[str, str]] = []
         seen: set[tuple[str, str]] = set()
+        list_item_pattern = re.compile(r"^(?:[-*•]\s*|\d+[.、]\s*|[一二三四五六七八九十]+[.、]\s*)")
+        ignored_item_prefixes = (
+            "理由",
+            "跟踪理由",
+            "后续观察信号",
+            "观察信号",
+            "逻辑",
+            "风险提示",
+            "备注",
+            "原因",
+        )
 
         def _push(action: str, target: str, raw: str) -> None:
             normalized_target = self._clean_self_select_target(target)
@@ -2878,20 +3083,25 @@ class AniuService:
             seen.add(key)
             changes.append({"action": action, "target": normalized_target, "raw_query": raw})
 
+        def _matches_section_marker(prefixes: tuple[str, ...]) -> bool:
+            normalized_line = list_item_pattern.sub("", line).strip()
+            return any(normalized_line.startswith(prefix) for prefix in prefixes)
+
         current_action: str | None = None
         for raw_line in text.splitlines():
             line = str(raw_line or "").strip()
             if not line:
+                current_action = None
                 continue
 
             compact = re.sub(r"\s+", "", line)
-            if any(token in compact for token in ("新增自选股", "本轮新增", "自选新增")):
+            if _matches_section_marker(("新增自选股", "本轮新增", "自选新增")):
                 current_action = "add"
                 mentions = self._extract_stock_mentions(line)
                 for target in mentions:
                     _push("add", target, line)
                 continue
-            if any(token in compact for token in ("移除自选股", "本轮移除", "自选移除")):
+            if _matches_section_marker(("移除自选股", "本轮移除", "自选移除")):
                 current_action = "remove"
                 mentions = self._extract_stock_mentions(line)
                 for target in mentions:
@@ -2900,21 +3110,41 @@ class AniuService:
             if any(
                 token in compact
                 for token in ("新增候选", "新增关注", "新增重点跟踪", "重点跟踪的新增候选")
-            ):
+            ) and (line.endswith((":", "：")) or "只有" in line or "如下" in line):
                 current_action = "add"
                 mentions = self._extract_stock_mentions(line)
                 for target in mentions:
                     _push("add", target, line)
                 continue
 
-            if current_action and re.match(r"^[-*\d一二三四五六七八九十].*", line):
-                mentions = self._extract_stock_mentions(line)
+            if current_action and list_item_pattern.match(line):
+                normalized_item = list_item_pattern.sub("", line).strip()
+                prefix = re.split(r"[:：]", normalized_item, maxsplit=1)[0].strip()
+                if any(prefix.startswith(token) for token in ignored_item_prefixes):
+                    continue
+                mentions = self._extract_stock_mentions(normalized_item)
                 for target in mentions:
-                    _push(current_action, target, line)
+                    _push(current_action, target, normalized_item)
+                continue
+
+            if current_action:
+                current_action = None
 
         sentence_patterns: list[tuple[str, re.Pattern[str]]] = [
-            ("add", re.compile(r"(?:自选新增|新增自选股[:：]?|本轮新增[:：]?)([^。；;\n]+)")),
-            ("remove", re.compile(r"(?:自选移除|移除自选股[:：]?|本轮移除[:：]?)([^。；;\n]+)")),
+            (
+                "add",
+                re.compile(
+                    r"^\s*(?:[-*•]\s*)?(?:自选新增|新增自选股|本轮新增)\s*[:：]\s*([^。；;\n]+)",
+                    re.MULTILINE,
+                ),
+            ),
+            (
+                "remove",
+                re.compile(
+                    r"^\s*(?:[-*•]\s*)?(?:自选移除|移除自选股|本轮移除)\s*[:：]\s*([^。；;\n]+)",
+                    re.MULTILINE,
+                ),
+            ),
         ]
         for action, pattern in sentence_patterns:
             for matched in pattern.finditer(text):
@@ -3026,6 +3256,99 @@ class AniuService:
                 return True
         return False
 
+    def _has_trade_negative_claim(
+        self, final_answer: Any, executed_actions: list[dict[str, Any]] | Any
+    ) -> bool:
+        actual_changes = self._extract_actual_trade_changes(executed_actions)
+        if not actual_changes:
+            return False
+
+        normalized = re.sub(r"\s+", "", str(final_answer or ""))
+        if not normalized:
+            return False
+
+        actual_actions = {
+            str(item.get("action") or "").upper() for item in actual_changes if item.get("action")
+        }
+
+        universal_negative_markers = (
+            "本轮未实际交易",
+            "没有实际交易",
+            "未发生任何实际交易",
+            "本轮没有实际买入卖出或撤单",
+        )
+        buy_negative_markers = (
+            "未实际买入",
+            "没有实际买入",
+            "本轮未实际买入",
+            "本轮没有实际买入",
+        )
+        sell_negative_markers = (
+            "未实际卖出",
+            "没有实际卖出",
+            "本轮未实际卖出",
+            "本轮没有实际卖出",
+        )
+        cancel_negative_markers = (
+            "未实际撤单",
+            "没有实际撤单",
+            "本轮未实际撤单",
+            "本轮没有实际撤单",
+        )
+
+        if any(marker in normalized for marker in universal_negative_markers):
+            return True
+        if "BUY" in actual_actions and any(marker in normalized for marker in buy_negative_markers):
+            return True
+        if "SELL" in actual_actions and any(marker in normalized for marker in sell_negative_markers):
+            return True
+        if "CANCEL" in actual_actions and any(marker in normalized for marker in cancel_negative_markers):
+            return True
+        return False
+
+    def _build_trade_execution_correction(
+        self, executed_actions: list[dict[str, Any]] | Any
+    ) -> str:
+        if not isinstance(executed_actions, list):
+            return ""
+
+        lines = ["", "[系统一致性修正] 后端工具实际已执行以下交易动作，请以工具执行记录为准："]
+        seen_lines: set[str] = set()
+        for item in executed_actions:
+            if not isinstance(item, dict):
+                continue
+            action = str(item.get("action") or "").upper()
+            if action not in {"BUY", "SELL", "CANCEL"}:
+                continue
+
+            symbol = str(item.get("symbol") or "").strip()
+            name = str(item.get("name") or "").strip()
+            quantity = int(item.get("quantity") or 0)
+            display_target = ""
+            if name and symbol:
+                display_target = f"{name}({symbol})"
+            else:
+                display_target = name or symbol or "委托"
+
+            if action == "BUY":
+                detail = f"- 实际买入：{display_target}"
+                if quantity > 0:
+                    detail += f" {quantity}股"
+            elif action == "SELL":
+                detail = f"- 实际卖出：{display_target}"
+                if quantity > 0:
+                    detail += f" {quantity}股"
+            else:
+                detail = f"- 实际撤单：{display_target}"
+
+            if detail not in seen_lines:
+                seen_lines.add(detail)
+                lines.append(detail)
+
+        if len(lines) == 2:
+            return ""
+        return "\n".join(lines)
+
     def _extract_actual_self_select_changes(
         self, executed_actions: list[dict[str, Any]] | Any
     ) -> list[dict[str, str]]:
@@ -3072,17 +3395,98 @@ class AniuService:
                 return True
         return False
 
+    def _has_self_select_negative_claim(
+        self, final_answer: Any, executed_actions: list[dict[str, Any]] | Any
+    ) -> bool:
+        actual_changes = self._extract_actual_self_select_changes(executed_actions)
+        if not actual_changes:
+            return False
+
+        normalized = re.sub(r"\s+", "", str(final_answer or ""))
+        if not normalized:
+            return False
+
+        has_add = any(str(item.get("action") or "") == "add" for item in actual_changes)
+        has_remove = any(str(item.get("action") or "") == "remove" for item in actual_changes)
+
+        universal_negative_markers = (
+            "没有实际新增或移除任何自选股",
+            "没有实际新增任何自选股也没有实际移除任何自选股",
+            "未发生任何自选股新增或移除",
+            "本轮未发生任何自选股新增或移除",
+        )
+        add_negative_markers = (
+            "没有实际新增任何自选股",
+            "本轮没有实际新增任何自选股",
+            "未实际新增任何自选股",
+            "本轮未实际新增任何自选股",
+        )
+        remove_negative_markers = (
+            "没有实际移除任何自选股",
+            "本轮没有实际移除任何自选股",
+            "未实际移除任何自选股",
+            "本轮未实际移除任何自选股",
+        )
+
+        if any(marker in normalized for marker in universal_negative_markers):
+            return True
+        if has_add and any(marker in normalized for marker in add_negative_markers):
+            return True
+        if has_remove and any(marker in normalized for marker in remove_negative_markers):
+            return True
+        return False
+
+    def _build_self_select_execution_correction(
+        self, executed_actions: list[dict[str, Any]] | Any
+    ) -> str:
+        actual_changes = self._extract_actual_self_select_changes(executed_actions)
+        if not actual_changes:
+            return ""
+
+        additions: list[str] = []
+        removals: list[str] = []
+        seen_additions: set[str] = set()
+        seen_removals: set[str] = set()
+        for item in actual_changes:
+            action = str(item.get("action") or "")
+            target = self._clean_self_select_target(item.get("target"))
+            if not target:
+                continue
+            if action == "add" and target not in seen_additions:
+                seen_additions.add(target)
+                additions.append(target)
+            if action == "remove" and target not in seen_removals:
+                seen_removals.add(target)
+                removals.append(target)
+
+        if not additions and not removals:
+            return ""
+
+        lines = ["", "[系统一致性修正] 后端工具实际已执行以下自选股操作，请以工具执行记录为准："]
+        if additions:
+            lines.append(f"- 实际新增自选股：{'、'.join(additions)}")
+        if removals:
+            lines.append(f"- 实际移除自选股：{'、'.join(removals)}")
+        return "\n".join(lines)
+
     def _finalize_self_select_consistency(
         self, final_answer: Any, executed_actions: list[dict[str, Any]] | Any
     ) -> str:
         answer = str(final_answer or "").strip()
         if not answer:
             return answer
-        if not self._has_self_select_consistency_gap(answer, executed_actions):
-            return answer
-        if SELF_SELECT_CONSISTENCY_WARNING.strip() in answer:
-            return answer
-        return answer + SELF_SELECT_CONSISTENCY_WARNING
+
+        has_gap = self._has_self_select_consistency_gap(answer, executed_actions)
+        if has_gap and SELF_SELECT_CONSISTENCY_WARNING.strip() not in answer:
+            answer += SELF_SELECT_CONSISTENCY_WARNING
+
+        correction = ""
+        if self._has_self_select_negative_claim(answer, executed_actions):
+            correction = self._build_self_select_execution_correction(executed_actions)
+        if correction and correction.strip() not in answer:
+            answer += correction
+
+        return answer
 
     def _finalize_trade_consistency(
         self, final_answer: Any, executed_actions: list[dict[str, Any]] | Any
@@ -3090,11 +3494,18 @@ class AniuService:
         answer = str(final_answer or "").strip()
         if not answer:
             return answer
-        if not self._has_trade_consistency_gap(answer, executed_actions):
-            return answer
-        if TRADE_CONSISTENCY_WARNING.strip() in answer:
-            return answer
-        return answer + TRADE_CONSISTENCY_WARNING
+
+        has_gap = self._has_trade_consistency_gap(answer, executed_actions)
+        if has_gap and TRADE_CONSISTENCY_WARNING.strip() not in answer:
+            answer += TRADE_CONSISTENCY_WARNING
+
+        correction = ""
+        if self._has_trade_negative_claim(answer, executed_actions):
+            correction = self._build_trade_execution_correction(executed_actions)
+        if correction and correction.strip() not in answer:
+            answer += correction
+
+        return answer
 
     def _merge_consistency_followup_final_answer(
         self,
@@ -3158,26 +3569,30 @@ class AniuService:
     ]:
         if str(getattr(settings, "run_type", "analysis") or "analysis").strip() == "trade":
             tool_calls = decision.get("tool_calls")
-            executed_actions = self._extract_executed_actions(tool_calls)
-            return dict(decision), llm_request, llm_response, runtime_trace, executed_actions
+            action_records = self._extract_planned_actions(tool_calls)
+            if not action_records:
+                action_records = self._extract_executed_actions(tool_calls)
+            return dict(decision), llm_request, llm_response, runtime_trace, action_records
 
         _emit = emit if callable(emit) else (lambda *_a, **_kw: None)
         tool_calls = decision.get("tool_calls")
-        executed_actions = self._extract_executed_actions(tool_calls)
+        planned_actions = self._extract_planned_actions(tool_calls)
+        if not planned_actions:
+            planned_actions = self._extract_executed_actions(tool_calls)
         final_answer = decision.get("final_answer")
 
-        if not self._has_self_select_consistency_gap(final_answer, executed_actions):
+        if not self._has_self_select_consistency_gap(final_answer, planned_actions):
             normalized_decision = dict(decision)
             normalized_decision["final_answer"] = self._finalize_self_select_consistency(
                 final_answer,
-                executed_actions,
+                planned_actions,
             )
             return (
                 normalized_decision,
                 llm_request,
                 llm_response,
                 runtime_trace,
-                executed_actions,
+                planned_actions,
             )
 
         messages = runtime_trace.get("messages") if isinstance(runtime_trace, dict) else None
@@ -3185,9 +3600,9 @@ class AniuService:
             normalized_decision = dict(decision)
             normalized_decision["final_answer"] = self._finalize_self_select_consistency(
                 final_answer,
-                executed_actions,
+                planned_actions,
             )
-            return normalized_decision, llm_request, llm_response, runtime_trace, executed_actions
+            return normalized_decision, llm_request, llm_response, runtime_trace, planned_actions
 
         _emit(
             "stage",
@@ -3222,15 +3637,21 @@ class AniuService:
 
         merged_decision = dict(followup_decision)
         merged_decision["tool_calls"] = combined_tool_calls
-        merged_executed_actions = self._extract_executed_actions(combined_tool_calls)
+        merged_planned_actions = self._extract_planned_actions(combined_tool_calls)
+        if not merged_planned_actions:
+            merged_planned_actions = self._extract_executed_actions(combined_tool_calls)
         merged_decision["original_final_answer"] = str(final_answer or "").strip() or None
         revised_final_answer = self._finalize_self_select_consistency(
             followup_decision.get("final_answer"),
-            merged_executed_actions,
+            merged_planned_actions,
         )
-        merged_decision["final_answer"] = self._merge_consistency_followup_final_answer(
+        merged_final_answer = self._merge_consistency_followup_final_answer(
             final_answer,
             revised_final_answer,
+        )
+        merged_decision["final_answer"] = self._finalize_self_select_consistency(
+            merged_final_answer,
+            merged_planned_actions,
         )
 
         merged_runtime_trace = (
@@ -3252,7 +3673,7 @@ class AniuService:
             merged_llm_request,
             merged_llm_response,
             merged_runtime_trace,
-            merged_executed_actions,
+            merged_planned_actions,
         )
 
     def _enforce_trade_consistency(
@@ -3274,21 +3695,23 @@ class AniuService:
     ]:
         _emit = emit if callable(emit) else (lambda *_a, **_kw: None)
         tool_calls = decision.get("tool_calls")
-        executed_actions = self._extract_executed_actions(tool_calls)
+        planned_actions = self._extract_planned_actions(tool_calls)
+        if not planned_actions:
+            planned_actions = self._extract_executed_actions(tool_calls)
         final_answer = decision.get("final_answer")
 
-        if not self._has_trade_consistency_gap(final_answer, executed_actions):
+        if not self._has_trade_consistency_gap(final_answer, planned_actions):
             normalized_decision = dict(decision)
             normalized_decision["final_answer"] = self._finalize_trade_consistency(
                 final_answer,
-                executed_actions,
+                planned_actions,
             )
             return (
                 normalized_decision,
                 llm_request,
                 llm_response,
                 runtime_trace,
-                executed_actions,
+                planned_actions,
             )
 
         messages = runtime_trace.get("messages") if isinstance(runtime_trace, dict) else None
@@ -3296,9 +3719,9 @@ class AniuService:
             normalized_decision = dict(decision)
             normalized_decision["final_answer"] = self._finalize_trade_consistency(
                 final_answer,
-                executed_actions,
+                planned_actions,
             )
-            return normalized_decision, llm_request, llm_response, runtime_trace, executed_actions
+            return normalized_decision, llm_request, llm_response, runtime_trace, planned_actions
 
         _emit(
             "stage",
@@ -3333,15 +3756,21 @@ class AniuService:
 
         merged_decision = dict(followup_decision)
         merged_decision["tool_calls"] = combined_tool_calls
-        merged_executed_actions = self._extract_executed_actions(combined_tool_calls)
+        merged_planned_actions = self._extract_planned_actions(combined_tool_calls)
+        if not merged_planned_actions:
+            merged_planned_actions = self._extract_executed_actions(combined_tool_calls)
         merged_decision["original_final_answer"] = str(final_answer or "").strip() or None
         revised_final_answer = self._finalize_trade_consistency(
             followup_decision.get("final_answer"),
-            merged_executed_actions,
+            merged_planned_actions,
         )
-        merged_decision["final_answer"] = self._merge_consistency_followup_final_answer(
+        merged_final_answer = self._merge_consistency_followup_final_answer(
             final_answer,
             revised_final_answer,
+        )
+        merged_decision["final_answer"] = self._finalize_trade_consistency(
+            merged_final_answer,
+            merged_planned_actions,
         )
 
         merged_runtime_trace = (
@@ -3363,7 +3792,7 @@ class AniuService:
             merged_llm_request,
             merged_llm_response,
             merged_runtime_trace,
-            merged_executed_actions,
+            merged_planned_actions,
         )
 
     def _build_analysis_summary(self, final_answer: Any) -> str | None:

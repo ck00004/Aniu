@@ -247,7 +247,12 @@ class LLMService:
         payload_messages.extend(messages)
         chat_tool_context = {**(tool_context or {}), "run_type": "chat"}
 
-        def _chat_tool_executor(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        def _chat_tool_executor(
+            tool_name: str,
+            arguments: dict[str, Any],
+            tool_call_id: str | None,
+        ) -> dict[str, Any]:
+            del tool_call_id
             return skill_stack_service.runtime.execute_tool(
                 tool_name=tool_name,
                 arguments=arguments,
@@ -399,6 +404,7 @@ class LLMService:
         client: MXClient,
         messages: list[dict[str, Any]],
         emit: Any = None,
+        tool_executor: Callable[[str, dict[str, Any], str | None], dict[str, Any]] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
         request_payload = self.build_request_payload_from_messages(
             app_settings=app_settings,
@@ -409,7 +415,12 @@ class LLMService:
 
         run_type = str(getattr(app_settings, "run_type", "analysis") or "analysis")
 
-        def _run_tool_executor(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        def _run_tool_executor(
+            tool_name: str,
+            arguments: dict[str, Any],
+            tool_call_id: str | None,
+        ) -> dict[str, Any]:
+            del tool_call_id
             return skill_stack_service.runtime.execute_tool(
                 tool_name=tool_name,
                 arguments=arguments,
@@ -427,7 +438,7 @@ class LLMService:
             initial_messages=[dict(m) for m in request_payload["messages"]],
             run_type=run_type,
             timeout_seconds=getattr(app_settings, "timeout_seconds", 60),
-            tool_executor=_run_tool_executor,
+            tool_executor=tool_executor or _run_tool_executor,
             prompt_templates=getattr(app_settings, "prompt_templates", None),
             emit=emit,
         )
@@ -454,7 +465,7 @@ class LLMService:
         initial_messages: list[dict[str, Any]],
         run_type: str,
         timeout_seconds: int,
-        tool_executor: Callable[[str, dict[str, Any]], dict[str, Any]],
+        tool_executor: Callable[[str, dict[str, Any], str | None], dict[str, Any]],
         prompt_templates: Any = None,
         emit: Any = None,
         cancel_event: threading.Event | None = None,
@@ -562,7 +573,14 @@ class LLMService:
                     arguments=arguments,
                     status="running",
                 )
-                tool_result = tool_executor(tool_name, arguments)
+                try:
+                    tool_result = tool_executor(
+                        tool_name,
+                        arguments,
+                        tool_call.get("id"),
+                    )
+                except TypeError:
+                    tool_result = tool_executor(tool_name, arguments)  # type: ignore[misc, call-arg]
                 _emit(
                     "tool_call",
                     phase="llm",

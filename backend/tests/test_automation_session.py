@@ -273,6 +273,176 @@ def test_manual_schedule_run_uses_actual_market_day_type_in_context(
     reset_db_state()
 
 
+def test_execute_run_persists_planned_actions_and_execution_results(
+    monkeypatch, tmp_path
+) -> None:
+    from app.services import aniu_service as aniu_service_module
+
+    class StubClient:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+        def close(self) -> None:
+            return None
+
+    def fake_run_agent_with_messages(
+        *, app_settings, client, messages, emit=None, tool_executor=None
+    ):
+        del app_settings, client, messages, emit
+        arguments = {
+            "action": "BUY",
+            "symbol": "300059",
+            "name": "东方财富",
+            "quantity": 100,
+            "price_type": "MARKET",
+        }
+        tool_result = tool_executor("mx_moni_trade", arguments, "call-1")
+        return (
+            {
+                "final_answer": "本轮计划买入东方财富 100股。",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "name": "mx_moni_trade",
+                        "arguments": arguments,
+                        "result": tool_result,
+                    }
+                ],
+            },
+            {"messages": []},
+            {"responses": [], "final_message": {"content": "planned"}},
+            {"messages": []},
+        )
+
+    def fake_execute_tool(*, client, app_settings, tool_name, arguments):
+        del client, app_settings
+        assert tool_name == "mx_moni_trade"
+        return {
+            "ok": True,
+            "tool_name": tool_name,
+            "summary": "已提交买入委托。",
+            "result": {"order_id": "BUY-1"},
+            "executed_action": {
+                "action": "BUY",
+                "symbol": str(arguments.get("symbol") or ""),
+                "name": str(arguments.get("name") or ""),
+                "quantity": int(arguments.get("quantity") or 0),
+                "price_type": str(arguments.get("price_type") or "MARKET"),
+            },
+        }
+
+    monkeypatch.setattr(aniu_service_module, "MXClient", StubClient)
+    monkeypatch.setattr(llm_service, "run_agent_with_messages", fake_run_agent_with_messages)
+    monkeypatch.setattr(aniu_service_module.mx_skill_service, "execute_tool", fake_execute_tool)
+    monkeypatch.setattr(
+        aniu_service,
+        "_prefetch_analysis_context",
+        lambda **kwargs: (None, None),
+    )
+
+    with create_test_client(monkeypatch, tmp_path):
+        with session_scope() as db:
+            settings = aniu_service.get_or_create_settings(db)
+            settings.mx_api_key = "mx-key"
+            settings.llm_base_url = "https://example.com/v1"
+            settings.llm_api_key = "llm-key"
+            settings.llm_model = "demo-model"
+            settings.task_prompt = "请执行买入测试。"
+
+        run = aniu_service.execute_run(trigger_source="manual")
+
+        assert run.status == "completed"
+        assert run.executed_actions is not None
+        assert any(str(item.get("action") or "") == "BUY" for item in run.executed_actions)
+        assert len(run.actions) == 1
+        assert run.actions[0].tool_name == "mx_moni_trade"
+        assert run.actions[0].status == "completed"
+        assert len(run.actions[0].results) == 1
+        assert run.actions[0].results[0].status == "success"
+        assert isinstance(run.decision_payload, dict)
+        assert isinstance(run.decision_payload.get("execution_summary"), dict)
+        assert run.decision_payload["execution_summary"].get("fully_executed") is True
+
+    reset_db_state()
+
+
+def test_execute_run_marks_failed_when_planned_action_execution_fails(
+    monkeypatch, tmp_path
+) -> None:
+    from app.services import aniu_service as aniu_service_module
+
+    class StubClient:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+        def close(self) -> None:
+            return None
+
+    def fake_run_agent_with_messages(
+        *, app_settings, client, messages, emit=None, tool_executor=None
+    ):
+        del app_settings, client, messages, emit
+        arguments = {
+            "query": "将杰瑞股份加入自选股",
+        }
+        tool_result = tool_executor("mx_manage_self_select", arguments, "call-2")
+        return (
+            {
+                "final_answer": "已将杰瑞股份加入自选。",
+                "tool_calls": [
+                    {
+                        "id": "call-2",
+                        "name": "mx_manage_self_select",
+                        "arguments": arguments,
+                        "result": tool_result,
+                    }
+                ],
+            },
+            {"messages": []},
+            {"responses": [], "final_message": {"content": "planned"}},
+            {"messages": []},
+        )
+
+    def fake_execute_tool(*, client, app_settings, tool_name, arguments):
+        del client, app_settings, tool_name, arguments
+        return {
+            "ok": False,
+            "tool_name": "mx_manage_self_select",
+            "error": "mock execution boom",
+        }
+
+    monkeypatch.setattr(aniu_service_module, "MXClient", StubClient)
+    monkeypatch.setattr(llm_service, "run_agent_with_messages", fake_run_agent_with_messages)
+    monkeypatch.setattr(aniu_service_module.mx_skill_service, "execute_tool", fake_execute_tool)
+    monkeypatch.setattr(
+        aniu_service,
+        "_prefetch_analysis_context",
+        lambda **kwargs: (None, None),
+    )
+
+    with create_test_client(monkeypatch, tmp_path):
+        with session_scope() as db:
+            settings = aniu_service.get_or_create_settings(db)
+            settings.mx_api_key = "mx-key"
+            settings.llm_base_url = "https://example.com/v1"
+            settings.llm_api_key = "llm-key"
+            settings.llm_model = "demo-model"
+            settings.task_prompt = "请执行自选测试。"
+
+        run = aniu_service.execute_run(trigger_source="manual")
+
+        assert run.status == "failed"
+        assert "执行计划未完全落地" in str(run.error_message or "")
+        assert run.executed_actions == []
+        assert len(run.actions) == 1
+        assert run.actions[0].status == "failed_terminal"
+        assert len(run.actions[0].results) == 2
+        assert all(result.status == "failed" for result in run.actions[0].results)
+        assert "实际新增自选股" not in str(run.final_answer or "")
+
+    reset_db_state()
+
+
 def test_analysis_schedule_followup_adds_self_select_when_new_candidates_are_claimed(
     monkeypatch,
     tmp_path,

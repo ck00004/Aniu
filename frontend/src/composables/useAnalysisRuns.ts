@@ -1,6 +1,18 @@
 import { computed, ref, watch } from 'vue'
 
-import type { ApiDetail, RawToolPreview, RawToolPreviewDetail, RunDetail, RunSummary, RunSummaryPage, TradeDetail, TradeOrder } from '@/types'
+import type {
+  ApiDetail,
+  ExecutionSummary,
+  RawToolPreview,
+  RawToolPreviewDetail,
+  RunAction,
+  RunActionResult,
+  RunDetail,
+  RunSummary,
+  RunSummaryPage,
+  TradeDetail,
+  TradeOrder,
+} from '@/types'
 
 export interface AnalysisRunViewModel {
   id: number
@@ -30,7 +42,48 @@ export interface AnalysisRunViewModel {
   jin10FailureReason: string | null
   selfSelectAdditions: SelfSelectChange[]
   selfSelectRemovals: SelfSelectChange[]
+  executionSummary: ExecutionSummaryViewModel | null
+  runActions: RunActionViewModel[]
 }
+
+export interface ExecutionSummaryViewModel {
+  totalPlanned: number
+  totalExecuted: number
+  fullyExecuted: boolean
+  unresolvedCount: number
+  statusCounts: Array<{ key: string, label: string, value: number, tone: ActionTone }>
+  errorMessage: string | null
+}
+
+export interface RunActionViewModel {
+  id: number
+  sequenceNo: number
+  title: string
+  toolLabel: string
+  toolName: string
+  status: string
+  statusText: string
+  tone: ActionTone
+  resultSummary: string | null
+  errorMessage: string | null
+  argumentsText: string | null
+  plannedText: string | null
+  executedText: string | null
+  attempts: RunActionAttemptViewModel[]
+}
+
+export interface RunActionAttemptViewModel {
+  id: number
+  attemptNo: number
+  status: string
+  statusText: string
+  tone: ActionTone
+  summary: string
+  errorMessage: string | null
+  finishedAt: string | null
+}
+
+type ActionTone = 'neutral' | 'running' | 'success' | 'warning' | 'error'
 
 export interface DiagnosticMetric {
   label: string
@@ -42,6 +95,17 @@ export interface SelfSelectChange {
   action: 'add' | 'remove'
   target: string
   rawQuery: string
+}
+
+function formatJsonBlock(value: unknown) {
+  if (!value || typeof value !== 'object') {
+    return null
+  }
+  try {
+    return JSON.stringify(value, null, 2)
+  } catch {
+    return String(value)
+  }
 }
 
 const RUNS_PAGE_SIZE = 100
@@ -58,6 +122,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function getStringValue(value: unknown) {
   const text = String(value ?? '').trim()
   return text || null
+}
+
+function getObjectValue(value: unknown) {
+  return isRecord(value) ? value : null
 }
 
 function getNumberValue(value: unknown) {
@@ -301,6 +369,184 @@ function parseSelfSelectChange(query: unknown): SelfSelectChange | null {
     target,
     rawQuery,
   }
+}
+
+function getActionStatusMeta(status: unknown): { label: string, tone: ActionTone } {
+  const normalized = String(status ?? '').trim().toLowerCase()
+  const mapping: Record<string, { label: string, tone: ActionTone }> = {
+    planned: { label: '已规划', tone: 'neutral' },
+    executing: { label: '执行中', tone: 'running' },
+    completed: { label: '已完成', tone: 'success' },
+    success: { label: '成功', tone: 'success' },
+    failed: { label: '失败', tone: 'error' },
+    failed_retryable: { label: '待重试', tone: 'warning' },
+    failed_terminal: { label: '终止失败', tone: 'error' },
+  }
+  return mapping[normalized] ?? { label: normalized || '未知状态', tone: 'neutral' }
+}
+
+function formatTradeActionText(payload: Record<string, unknown>) {
+  const action = String(payload.action ?? '').toUpperCase()
+  const symbol = String(payload.symbol ?? '').trim()
+  const name = String(payload.name ?? '').trim()
+  const quantity = Number(payload.quantity ?? 0)
+  const priceType = String(payload.price_type ?? 'MARKET').toUpperCase()
+  const price = payload.price == null ? null : Number(payload.price)
+  const target = name && symbol ? `${name}(${symbol})` : name || symbol || '标的'
+
+  if (action === 'BUY' || action === 'SELL') {
+    const side = action === 'BUY' ? '买入' : '卖出'
+    const priceText = priceType === 'LIMIT' && typeof price === 'number'
+      ? `限价 ${price}`
+      : '市价'
+    return `${side} ${target}${quantity > 0 ? ` ${quantity}股` : ''} ${priceText}`.trim()
+  }
+
+  if (action === 'CANCEL') {
+    const orderId = String(payload.order_id ?? '').trim()
+    return `撤单 ${orderId || target}`.trim()
+  }
+
+  return null
+}
+
+function describeActionPayload(payload: Record<string, unknown> | null) {
+  if (!payload) {
+    return null
+  }
+
+  const query = getStringValue(payload.query)
+  if (query) {
+    const change = parseSelfSelectChange(query)
+    if (change) {
+      return `${change.action === 'add' ? '新增自选' : '移除自选'} ${change.target}`
+    }
+    return query
+  }
+
+  const tradeText = formatTradeActionText(payload)
+  if (tradeText) {
+    return tradeText
+  }
+
+  return formatJsonBlock(payload)
+}
+
+function summarizeActionAttempt(result: RunActionResult) {
+  const response = getObjectValue(result.response_payload)
+  const summary = getStringValue(response?.summary)
+  if (summary) {
+    return summary
+  }
+
+  const responseResult = getObjectValue(response?.result)
+  const orderId = getStringValue(responseResult?.order_id)
+  if (orderId) {
+    return `返回单号 ${orderId}`
+  }
+
+  if (getStringValue(result.error_message)) {
+    return getStringValue(result.error_message) as string
+  }
+
+  return '本次尝试未返回额外摘要。'
+}
+
+function getExecutionSummary(detail: RunDetail): ExecutionSummaryViewModel | null {
+  const skillPayloads = getObjectValue(detail.skill_payloads)
+  const decisionPayload = getObjectValue(detail.decision_payload)
+  const payload = getObjectValue(skillPayloads?.execution_summary)
+    || getObjectValue(decisionPayload?.execution_summary)
+
+  const actions = Array.isArray(detail.actions) ? detail.actions : []
+  const derivedStatusCounts = actions.reduce<Record<string, number>>((acc, item) => {
+    const key = String(item.status ?? '').trim() || 'unknown'
+    acc[key] = (acc[key] ?? 0) + 1
+    return acc
+  }, {})
+
+  const totalPlanned = Number(payload?.total_planned ?? actions.length ?? 0)
+  const totalExecuted = Number(
+    payload?.total_executed
+      ?? actions.filter((item) => String(item.status ?? '').toLowerCase() === 'completed').length,
+  )
+  const unresolvedCount = Number(
+    payload?.unresolved_count
+      ?? actions.filter((item) => String(item.status ?? '').toLowerCase() !== 'completed').length,
+  )
+  const fullyExecuted = typeof payload?.fully_executed === 'boolean'
+    ? payload.fully_executed
+    : totalPlanned === totalExecuted && unresolvedCount === 0
+  const rawStatusCounts = getObjectValue(payload?.status_counts) ?? derivedStatusCounts
+  const statusCounts = Object.entries(rawStatusCounts)
+    .filter(([, value]) => typeof value === 'number' && Number.isFinite(value) && value > 0)
+    .map(([key, value]) => {
+      const meta = getActionStatusMeta(key)
+      return {
+        key,
+        label: meta.label,
+        value: Number(value),
+        tone: meta.tone,
+      }
+    })
+
+  if (!totalPlanned && !statusCounts.length && !actions.length) {
+    return null
+  }
+
+  return {
+    totalPlanned,
+    totalExecuted,
+    fullyExecuted,
+    unresolvedCount,
+    statusCounts,
+    errorMessage: getStringValue(payload?.error_message) || getStringValue(detail.error_message),
+  }
+}
+
+function getRunActions(detail: RunDetail): RunActionViewModel[] {
+  const actions = Array.isArray(detail.actions) ? detail.actions : []
+
+  return actions.map((action) => {
+    const statusMeta = getActionStatusMeta(action.status)
+    const plannedPayload = getObjectValue(action.planned_action_payload)
+    const executedPayload = getObjectValue(action.executed_action_payload)
+    const argumentsPayload = getObjectValue(action.arguments_payload)
+    const attempts = Array.isArray(action.results)
+      ? action.results.map((result) => {
+        const attemptStatus = getActionStatusMeta(result.status)
+        return {
+          id: result.id,
+          attemptNo: result.attempt_no,
+          status: result.status,
+          statusText: attemptStatus.label,
+          tone: attemptStatus.tone,
+          summary: summarizeActionAttempt(result),
+          errorMessage: getStringValue(result.error_message),
+          finishedAt: getStringValue(result.finished_at),
+        }
+      })
+      : []
+
+    return {
+      id: action.id,
+      sequenceNo: action.sequence_no,
+      title: describeActionPayload(executedPayload)
+        || describeActionPayload(plannedPayload)
+        || `${getApiToolText(action.tool_name).label}`,
+      toolLabel: getApiToolText(action.tool_name).label,
+      toolName: action.tool_name,
+      status: action.status,
+      statusText: statusMeta.label,
+      tone: statusMeta.tone,
+      resultSummary: getStringValue(action.result_summary),
+      errorMessage: getStringValue(action.error_message),
+      argumentsText: formatJsonBlock(argumentsPayload),
+      plannedText: describeActionPayload(plannedPayload) || formatJsonBlock(plannedPayload),
+      executedText: describeActionPayload(executedPayload) || formatJsonBlock(executedPayload),
+      attempts,
+    }
+  })
 }
 
 function getSelfSelectChanges(detail: RunDetail) {
@@ -563,6 +809,8 @@ function mapRunSummaryToViewModel(summary: RunSummary): AnalysisRunViewModel {
     jin10FailureReason: null,
     selfSelectAdditions: [],
     selfSelectRemovals: [],
+    executionSummary: null,
+    runActions: [],
   }
 }
 
@@ -574,6 +822,8 @@ function mapRunDetailToViewModel(detail: RunDetail): AnalysisRunViewModel {
   const outputSections = getConsistencyOutputSections(detail)
   const jin10SourceInfo = getJin10SourceInfo(detail)
   const selfSelectChanges = getSelfSelectChanges(detail)
+  const executionSummary = getExecutionSummary(detail)
+  const runActions = getRunActions(detail)
 
   return {
     id: detail.id,
@@ -603,6 +853,8 @@ function mapRunDetailToViewModel(detail: RunDetail): AnalysisRunViewModel {
     jin10FailureReason: jin10SourceInfo.jin10FailureReason,
     selfSelectAdditions: selfSelectChanges.additions,
     selfSelectRemovals: selfSelectChanges.removals,
+    executionSummary,
+    runActions,
   }
 }
 

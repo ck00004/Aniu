@@ -46,9 +46,13 @@ def init_db() -> None:
     _ensure_chat_message_columns(engine)
     _ensure_strategy_schedule_columns(engine)
     _ensure_strategy_run_columns(engine)
+    _ensure_strategy_run_action_columns(engine)
+    _ensure_strategy_run_action_result_columns(engine)
     _ensure_chat_session_indexes(engine)
     _ensure_chat_message_indexes(engine)
     _ensure_strategy_run_indexes(engine)
+    _ensure_strategy_run_action_indexes(engine)
+    _ensure_strategy_run_action_result_indexes(engine)
     _backfill_schedule_run_types(engine)
     _backfill_strategy_run_types(engine)
 
@@ -210,6 +214,110 @@ def _ensure_strategy_schedule_columns(engine) -> None:
             }
             if column_name in current_columns:
                 continue
+            connection.execute(text(statement))
+
+
+def _ensure_strategy_run_action_columns(engine) -> None:
+    inspector = inspect(engine)
+    if "strategy_run_actions" not in set(inspector.get_table_names()):
+        return
+
+    required_columns = {
+        "sequence_no": "ALTER TABLE strategy_run_actions ADD COLUMN sequence_no INTEGER DEFAULT 1",
+        "phase": "ALTER TABLE strategy_run_actions ADD COLUMN phase VARCHAR(32) DEFAULT 'planned'",
+        "tool_name": "ALTER TABLE strategy_run_actions ADD COLUMN tool_name VARCHAR(64)",
+        "action_type": "ALTER TABLE strategy_run_actions ADD COLUMN action_type VARCHAR(32) DEFAULT 'UNKNOWN'",
+        "status": "ALTER TABLE strategy_run_actions ADD COLUMN status VARCHAR(32) DEFAULT 'planned'",
+        "tool_call_id": "ALTER TABLE strategy_run_actions ADD COLUMN tool_call_id VARCHAR(128)",
+        "arguments_payload": "ALTER TABLE strategy_run_actions ADD COLUMN arguments_payload JSON",
+        "planned_action_payload": "ALTER TABLE strategy_run_actions ADD COLUMN planned_action_payload JSON",
+        "executed_action_payload": "ALTER TABLE strategy_run_actions ADD COLUMN executed_action_payload JSON",
+        "result_summary": "ALTER TABLE strategy_run_actions ADD COLUMN result_summary TEXT",
+        "error_message": "ALTER TABLE strategy_run_actions ADD COLUMN error_message TEXT",
+        "updated_at": "ALTER TABLE strategy_run_actions ADD COLUMN updated_at DATETIME",
+        "executed_at": "ALTER TABLE strategy_run_actions ADD COLUMN executed_at DATETIME",
+    }
+
+    with engine.begin() as connection:
+        for column_name, statement in required_columns.items():
+            current_columns = {
+                column["name"]
+                for column in inspect(connection).get_columns("strategy_run_actions")
+            }
+            if column_name in current_columns:
+                continue
+            connection.execute(text(statement))
+
+
+def _ensure_strategy_run_action_result_columns(engine) -> None:
+    inspector = inspect(engine)
+    if "strategy_run_action_results" not in set(inspector.get_table_names()):
+        return
+
+    required_columns = {
+        "attempt_no": "ALTER TABLE strategy_run_action_results ADD COLUMN attempt_no INTEGER DEFAULT 1",
+        "status": "ALTER TABLE strategy_run_action_results ADD COLUMN status VARCHAR(32) DEFAULT 'planned'",
+        "response_payload": "ALTER TABLE strategy_run_action_results ADD COLUMN response_payload JSON",
+        "error_message": "ALTER TABLE strategy_run_action_results ADD COLUMN error_message TEXT",
+        "finished_at": "ALTER TABLE strategy_run_action_results ADD COLUMN finished_at DATETIME",
+    }
+
+    with engine.begin() as connection:
+        for column_name, statement in required_columns.items():
+            current_columns = {
+                column["name"]
+                for column in inspect(connection).get_columns("strategy_run_action_results")
+            }
+            if column_name in current_columns:
+                continue
+            connection.execute(text(statement))
+
+
+def _ensure_strategy_run_action_indexes(engine) -> None:
+    inspector = inspect(engine)
+    if "strategy_run_actions" not in set(inspector.get_table_names()):
+        return
+
+    existing_indexes = {
+        index["name"] for index in inspector.get_indexes("strategy_run_actions")
+    }
+    statements: list[str] = []
+    if "ix_strategy_run_actions_run_id_sequence_no" not in existing_indexes:
+        statements.append(
+            "CREATE INDEX ix_strategy_run_actions_run_id_sequence_no ON strategy_run_actions (run_id, sequence_no)"
+        )
+    if "ix_strategy_run_actions_run_id_status" not in existing_indexes:
+        statements.append(
+            "CREATE INDEX ix_strategy_run_actions_run_id_status ON strategy_run_actions (run_id, status)"
+        )
+
+    if not statements:
+        return
+
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
+
+
+def _ensure_strategy_run_action_result_indexes(engine) -> None:
+    inspector = inspect(engine)
+    if "strategy_run_action_results" not in set(inspector.get_table_names()):
+        return
+
+    existing_indexes = {
+        index["name"] for index in inspector.get_indexes("strategy_run_action_results")
+    }
+    statements: list[str] = []
+    if "ix_strategy_run_action_results_action_id_attempt_no" not in existing_indexes:
+        statements.append(
+            "CREATE INDEX ix_strategy_run_action_results_action_id_attempt_no ON strategy_run_action_results (action_id, attempt_no)"
+        )
+
+    if not statements:
+        return
+
+    with engine.begin() as connection:
+        for statement in statements:
             connection.execute(text(statement))
 
 

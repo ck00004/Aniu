@@ -304,6 +304,122 @@
               </div>
             </div>
 
+            <div v-if="displayExecutionVisible" class="execution-section">
+              <div class="execution-grid">
+                <section v-if="displayExecutionSummary" class="execution-card execution-summary-card">
+                  <div class="execution-card-head">
+                    <div class="execution-card-title">执行概览</div>
+                    <span
+                      class="execution-overview-badge"
+                      :class="displayExecutionSummary.fullyExecuted ? 'success' : 'warning'"
+                    >
+                      {{ displayExecutionSummary.fullyExecuted ? '已完全落地' : '存在未完成动作' }}
+                    </span>
+                  </div>
+                  <div class="execution-stat-grid">
+                    <div class="execution-stat-item">
+                      <span class="execution-stat-label">计划动作</span>
+                      <strong class="execution-stat-value">{{ displayExecutionSummary.totalPlanned }}</strong>
+                    </div>
+                    <div class="execution-stat-item">
+                      <span class="execution-stat-label">实际执行</span>
+                      <strong class="execution-stat-value">{{ displayExecutionSummary.totalExecuted }}</strong>
+                    </div>
+                    <div class="execution-stat-item">
+                      <span class="execution-stat-label">未完成</span>
+                      <strong class="execution-stat-value">{{ displayExecutionSummary.unresolvedCount }}</strong>
+                    </div>
+                  </div>
+                  <div v-if="displayExecutionStatusCounts.length" class="execution-status-chips">
+                    <span
+                      v-for="item in displayExecutionStatusCounts"
+                      :key="`${item.key}-${item.value}`"
+                      class="execution-status-chip"
+                      :class="`tone-${item.tone}`"
+                    >
+                      {{ item.label }} {{ item.value }}
+                    </span>
+                  </div>
+                  <div v-if="displayExecutionSummary.errorMessage" class="execution-summary-error">
+                    {{ displayExecutionSummary.errorMessage }}
+                  </div>
+                </section>
+
+                <section class="execution-card execution-actions-card">
+                  <div class="execution-card-head">
+                    <div class="execution-card-title">动作时间线</div>
+                    <span class="execution-card-subtitle">共 {{ displayRunActions.length }} 条</span>
+                  </div>
+                  <div v-if="displayRunActions.length" class="execution-action-list">
+                    <article
+                      v-for="action in displayRunActions"
+                      :key="action.id"
+                      class="execution-action-item"
+                      :class="`tone-${action.tone}`"
+                    >
+                      <div class="execution-action-head">
+                        <div class="execution-action-main">
+                          <span class="execution-action-seq">#{{ action.sequenceNo }}</span>
+                          <div class="execution-action-texts">
+                            <div class="execution-action-title">{{ action.title }}</div>
+                            <div class="execution-action-meta">
+                              <span>{{ action.toolLabel }}</span>
+                              <span v-if="action.resultSummary">{{ action.resultSummary }}</span>
+                            </div>
+                          </div>
+                        </div>
+                        <span class="execution-action-status" :class="`tone-${action.tone}`">
+                          {{ action.statusText }}
+                        </span>
+                      </div>
+
+                      <div v-if="action.plannedText || action.executedText || action.argumentsText" class="execution-action-payloads">
+                        <div v-if="action.plannedText" class="execution-payload-block">
+                          <div class="execution-payload-label">计划动作</div>
+                          <pre class="execution-payload-text">{{ action.plannedText }}</pre>
+                        </div>
+                        <div v-if="action.executedText" class="execution-payload-block">
+                          <div class="execution-payload-label">实际执行</div>
+                          <pre class="execution-payload-text">{{ action.executedText }}</pre>
+                        </div>
+                        <div v-if="action.argumentsText" class="execution-payload-block">
+                          <div class="execution-payload-label">调用参数</div>
+                          <pre class="execution-payload-text">{{ action.argumentsText }}</pre>
+                        </div>
+                      </div>
+
+                      <div v-if="action.errorMessage" class="execution-action-error">
+                        {{ action.errorMessage }}
+                      </div>
+
+                      <div v-if="action.attempts.length" class="execution-attempt-list">
+                        <div
+                          v-for="attempt in action.attempts"
+                          :key="attempt.id"
+                          class="execution-attempt-item"
+                          :class="`tone-${attempt.tone}`"
+                        >
+                          <div class="execution-attempt-head">
+                            <span class="execution-attempt-title">第 {{ attempt.attemptNo }} 次尝试</span>
+                            <span class="execution-attempt-status" :class="`tone-${attempt.tone}`">
+                              {{ attempt.statusText }}
+                            </span>
+                          </div>
+                          <div class="execution-attempt-summary">{{ attempt.summary }}</div>
+                          <div v-if="attempt.errorMessage" class="execution-attempt-error">
+                            {{ attempt.errorMessage }}
+                          </div>
+                        </div>
+                      </div>
+                    </article>
+                  </div>
+                  <div v-else class="detail-empty-state">
+                    本轮没有生成可展示的执行动作记录。
+                  </div>
+                </section>
+              </div>
+            </div>
+
              <!-- 分析输出内容 / 原始返回联动预览 / 实时结论 -->
              <div class="output-section" v-if="liveVisible || selectedRun?.output || activePreview">
                <div class="output-surface" @click="handleOutputSurfaceClick">
@@ -701,6 +817,20 @@ const displaySelfSelectChangesVisible = computed(
 const displaySelfSelectAdditions = computed(() => selectedRun.value?.selfSelectAdditions ?? [])
 
 const displaySelfSelectRemovals = computed(() => selectedRun.value?.selfSelectRemovals ?? [])
+
+const displayExecutionVisible = computed(
+  () => !liveVisible.value && !!selectedRun.value?.detailLoaded && (
+    !!selectedRun.value?.executionSummary || !!selectedRun.value?.runActions.length
+  ),
+)
+
+const displayExecutionSummary = computed(() => selectedRun.value?.executionSummary ?? null)
+
+const displayExecutionStatusCounts = computed(
+  () => displayExecutionSummary.value?.statusCounts ?? [],
+)
+
+const displayRunActions = computed(() => selectedRun.value?.runActions ?? [])
 
 const displaySplitOutputVisible = computed(() =>
   !liveVisible.value
@@ -1568,5 +1698,262 @@ onBeforeUnmount(() => {
 .self-select-empty {
   min-height: auto;
   padding: 0;
+}
+
+.execution-section {
+  margin-top: 12px;
+}
+
+.execution-grid {
+  display: grid;
+  grid-template-columns: minmax(240px, 0.9fr) minmax(0, 1.6fr);
+  gap: 12px;
+}
+
+.execution-card {
+  padding: 12px;
+  border: 1px solid rgba(145, 170, 214, 0.12);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.34);
+}
+
+.execution-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.execution-card-title {
+  color: #e2e8f0;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.execution-card-subtitle {
+  color: #8ea4c5;
+  font-size: 11px;
+}
+
+.execution-overview-badge,
+.execution-action-status,
+.execution-attempt-status,
+.execution-status-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 24px;
+  padding: 0 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 1.3;
+  border: 1px solid transparent;
+}
+
+.tone-success,
+.execution-overview-badge.success {
+  color: #d1fae5;
+  background: rgba(16, 185, 129, 0.16);
+  border-color: rgba(16, 185, 129, 0.22);
+}
+
+.tone-warning,
+.execution-overview-badge.warning {
+  color: #fef3c7;
+  background: rgba(245, 158, 11, 0.16);
+  border-color: rgba(245, 158, 11, 0.24);
+}
+
+.tone-error {
+  color: #fee2e2;
+  background: rgba(239, 68, 68, 0.16);
+  border-color: rgba(239, 68, 68, 0.24);
+}
+
+.tone-running {
+  color: #cffafe;
+  background: rgba(6, 182, 212, 0.16);
+  border-color: rgba(6, 182, 212, 0.24);
+}
+
+.tone-neutral {
+  color: #dbeafe;
+  background: rgba(59, 130, 246, 0.12);
+  border-color: rgba(96, 165, 250, 0.22);
+}
+
+.execution-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.execution-stat-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px;
+  border-radius: 8px;
+  background: rgba(2, 6, 23, 0.22);
+  border: 1px solid rgba(145, 170, 214, 0.08);
+}
+
+.execution-stat-label {
+  color: #8ea4c5;
+  font-size: 10px;
+}
+
+.execution-stat-value {
+  color: #f8fafc;
+  font-size: 18px;
+  line-height: 1.1;
+}
+
+.execution-status-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.execution-summary-error {
+  margin-top: 12px;
+  color: #fecaca;
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+
+.execution-action-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.execution-action-item {
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(145, 170, 214, 0.1);
+  background: rgba(2, 6, 23, 0.22);
+}
+
+.execution-action-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.execution-action-main {
+  display: flex;
+  gap: 10px;
+  min-width: 0;
+}
+
+.execution-action-seq {
+  color: #8ea4c5;
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.execution-action-texts {
+  min-width: 0;
+}
+
+.execution-action-title {
+  color: #f8fafc;
+  font-size: 12px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.execution-action-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 4px;
+  color: #8ea4c5;
+  font-size: 10px;
+}
+
+.execution-action-payloads {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.execution-payload-block {
+  padding: 8px;
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.36);
+  border: 1px solid rgba(145, 170, 214, 0.08);
+}
+
+.execution-payload-label {
+  margin-bottom: 6px;
+  color: #8ea4c5;
+  font-size: 10px;
+}
+
+.execution-payload-text {
+  margin: 0;
+  color: #e2e8f0;
+  font-size: 11px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: inherit;
+}
+
+.execution-action-error,
+.execution-attempt-error {
+  margin-top: 8px;
+  color: #fecaca;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.execution-attempt-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.execution-attempt-item {
+  padding: 8px;
+  border-radius: 8px;
+  border: 1px solid rgba(145, 170, 214, 0.08);
+  background: rgba(15, 23, 42, 0.32);
+}
+
+.execution-attempt-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.execution-attempt-title {
+  color: #e2e8f0;
+  font-size: 11px;
+}
+
+.execution-attempt-summary {
+  margin-top: 6px;
+  color: #cbd5e1;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+@media (max-width: 1180px) {
+  .execution-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 </style>
