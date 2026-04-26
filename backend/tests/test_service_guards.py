@@ -1299,6 +1299,36 @@ def test_call_llm_stream_retries_without_include_usage_on_400(monkeypatch) -> No
     assert "stream_options" not in seen_payloads[1]
 
 
+def test_call_llm_stream_retries_on_retryable_upstream_error(monkeypatch) -> None:
+    service = LLMService()
+    seen_payloads: list[dict[str, object]] = []
+    sleep_calls: list[float] = []
+
+    def fake_consume_llm_stream(*, payload, **kwargs):
+        del kwargs
+        seen_payloads.append(payload)
+        if len(seen_payloads) == 1:
+            raise LLMUpstreamError(
+                "大模型接口返回错误 (502): Upstream request failed",
+                status_code=502,
+            )
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    monkeypatch.setattr(service, "_consume_llm_stream", fake_consume_llm_stream)
+    monkeypatch.setattr("app.services.llm_service.time.sleep", sleep_calls.append)
+
+    result = service._call_llm_stream(
+        base_url="https://example.com/v1",
+        api_key="token",
+        payload={"messages": [], "model": "demo"},
+        timeout_seconds=5,
+    )
+
+    assert result["choices"][0]["message"]["content"] == "ok"
+    assert len(seen_payloads) == 2
+    assert sleep_calls == [1.0]
+
+
 def test_agent_loop_retries_when_final_answer_is_empty_after_tools() -> None:
     service = LLMService()
     seen_payloads: list[dict[str, object]] = []

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
+import time
 from typing import Any, Callable, Iterable
 
 import httpx
@@ -11,10 +13,14 @@ from app.skills import skill_registry
 from app.services.mx_service import MXClient
 from app.services.skill_stack_service import skill_stack_service
 
+logger = logging.getLogger(__name__)
+
 _LLM_TEMPERATURE = 0.2
 _MAX_TOOL_ITERATIONS = 100
 _FINAL_STREAM_CHUNK_SIZE = 96
 _EMPTY_FINAL_ANSWER_RETRY_LIMIT = 1
+_LLM_UPSTREAM_MAX_RETRIES = 3
+_LLM_UPSTREAM_RETRY_DELAY_SECONDS = 1.0
 
 class LLMStreamCancelled(RuntimeError):
     """Raised when a streaming chat/run should stop because the client disconnected."""
@@ -36,6 +42,25 @@ def _format_error_message(prefix: str, detail: str) -> str:
     if detail_text:
         return f"{prefix}: {detail_text}"
     return f"{prefix}。"
+
+
+def _is_retryable_upstream_error(exc: LLMUpstreamError) -> bool:
+    return exc.status_code is None or exc.status_code >= 500
+
+
+def _sleep_before_retry(
+    delay_seconds: float,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> None:
+    if delay_seconds <= 0:
+        _raise_if_cancelled(cancel_event)
+        return
+    if cancel_event is not None:
+        if cancel_event.wait(delay_seconds):
+            raise LLMStreamCancelled("客户端连接已断开。")
+        return
+    time.sleep(delay_seconds)
 
 
 def _extract_error_text(value: Any) -> str:
@@ -638,24 +663,55 @@ class LLMService:
         stream_payload["stream"] = True
 
         last_error: LLMUpstreamError | None = None
-        for include_usage in (True, False):
-            _raise_if_cancelled(cancel_event)
-            attempt_payload = dict(stream_payload)
-            if include_usage:
-                attempt_payload["stream_options"] = {"include_usage": True}
-            try:
-                return self._consume_llm_stream(
-                    base_url=base_url,
-                    api_key=api_key,
-                    payload=attempt_payload,
-                    timeout_seconds=timeout_seconds,
-                    emit=emit,
-                    cancel_event=cancel_event,
+        for attempt in range(_LLM_UPSTREAM_MAX_RETRIES):
+            last_error = None
+            for include_usage in (True, False):
+                _raise_if_cancelled(cancel_event)
+                attempt_payload = dict(stream_payload)
+                if include_usage:
+                    attempt_payload["stream_options"] = {"include_usage": True}
+                try:
+                    return self._consume_llm_stream(
+                        base_url=base_url,
+                        api_key=api_key,
+                        payload=attempt_payload,
+                        timeout_seconds=timeout_seconds,
+                        emit=emit,
+                        cancel_event=cancel_event,
+                    )
+                except LLMUpstreamError as exc:
+                    last_error = exc
+                    if include_usage and exc.status_code == 400:
+                        continue
+                    break
+
+            if last_error is None:
+                continue
+            if (
+                not _is_retryable_upstream_error(last_error)
+                or attempt >= _LLM_UPSTREAM_MAX_RETRIES - 1
+            ):
+                raise last_error
+
+            if callable(emit):
+                emit(
+                    "stage",
+                    stage="llm",
+                    message=(
+                        "大模型上游暂时不可用，正在重试 "
+                        f"({attempt + 1}/{_LLM_UPSTREAM_MAX_RETRIES})"
+                    ),
                 )
-            except LLMUpstreamError as exc:
-                last_error = exc
-                if not include_usage or exc.status_code != 400:
-                    raise
+            logger.warning(
+                "LLM upstream temporary failure, retrying (%s/%s): %s",
+                attempt + 1,
+                _LLM_UPSTREAM_MAX_RETRIES,
+                last_error,
+            )
+            _sleep_before_retry(
+                _LLM_UPSTREAM_RETRY_DELAY_SECONDS,
+                cancel_event=cancel_event,
+            )
 
         if last_error is not None:
             raise last_error
@@ -700,11 +756,11 @@ class LLMService:
         except LLMUpstreamError:
             raise
         except httpx.TimeoutException as exc:
-            raise RuntimeError(
+            raise LLMUpstreamError(
                 f"大模型接口请求超时 ({timeout_seconds}s)，请检查网络或增加超时时间。"
             ) from exc
-        except httpx.HTTPError as exc:
-            raise RuntimeError(f"大模型接口请求失败: {exc}") from exc
+        except httpx.RequestError as exc:
+            raise LLMUpstreamError(f"大模型接口请求失败: {exc}") from exc
 
     def _parse_llm_stream_response(
         self,
@@ -877,35 +933,56 @@ class LLMService:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
-        try:
-            with self._create_http_client(timeout_seconds) as http_client:
-                response = http_client.post(url, headers=headers, json=payload)
-                response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            status = exc.response.status_code
-            if status == 401:
-                raise RuntimeError("大模型 API Key 无效或已过期 (401)。") from exc
-            if status == 400:
-                detail = ""
-                try:
-                    detail = exc.response.json().get("error", {}).get("message", "")
-                except Exception:
-                    pass
-                raise RuntimeError(
-                    f"大模型请求参数错误 (400): {detail or exc.response.text[:200]}"
-                ) from exc
-            if status == 429:
-                raise RuntimeError(
-                    "大模型接口请求频率超限 (429)，请稍后重试。"
-                ) from exc
-            raise RuntimeError(
-                f"大模型接口返回错误 ({status}): {exc.response.text[:200]}"
-            ) from exc
-        except httpx.TimeoutException as exc:
-            raise RuntimeError(
-                f"大模型接口请求超时 ({timeout_seconds}s)，请检查网络或增加超时时间。"
-            ) from exc
-        return response.json()
+        last_error: LLMUpstreamError | None = None
+        for attempt in range(_LLM_UPSTREAM_MAX_RETRIES):
+            try:
+                with self._create_http_client(timeout_seconds) as http_client:
+                    response = http_client.post(url, headers=headers, json=payload)
+                    if response.is_error:
+                        _raise_upstream_http_error(response, response.content)
+                    return response.json()
+            except LLMUpstreamError as exc:
+                last_error = exc
+                if (
+                    not _is_retryable_upstream_error(exc)
+                    or attempt >= _LLM_UPSTREAM_MAX_RETRIES - 1
+                ):
+                    raise
+                logger.warning(
+                    "LLM upstream temporary failure, retrying (%s/%s): %s",
+                    attempt + 1,
+                    _LLM_UPSTREAM_MAX_RETRIES,
+                    exc,
+                )
+                time.sleep(_LLM_UPSTREAM_RETRY_DELAY_SECONDS)
+            except httpx.TimeoutException as exc:
+                last_error = LLMUpstreamError(
+                    f"大模型接口请求超时 ({timeout_seconds}s)，请检查网络或增加超时时间。"
+                )
+                if attempt >= _LLM_UPSTREAM_MAX_RETRIES - 1:
+                    raise last_error from exc
+                logger.warning(
+                    "LLM upstream timeout, retrying (%s/%s): %s",
+                    attempt + 1,
+                    _LLM_UPSTREAM_MAX_RETRIES,
+                    exc,
+                )
+                time.sleep(_LLM_UPSTREAM_RETRY_DELAY_SECONDS)
+            except httpx.RequestError as exc:
+                last_error = LLMUpstreamError(f"大模型接口请求失败: {exc}")
+                if attempt >= _LLM_UPSTREAM_MAX_RETRIES - 1:
+                    raise last_error from exc
+                logger.warning(
+                    "LLM request transport failure, retrying (%s/%s): %s",
+                    attempt + 1,
+                    _LLM_UPSTREAM_MAX_RETRIES,
+                    exc,
+                )
+                time.sleep(_LLM_UPSTREAM_RETRY_DELAY_SECONDS)
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("大模型请求失败。")
 
 
 llm_service = LLMService()
