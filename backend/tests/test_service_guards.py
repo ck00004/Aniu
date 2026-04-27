@@ -727,6 +727,43 @@ def test_enforce_self_select_consistency_corrects_followup_text_when_actions_exi
     assert "实际移除自选股：工业富联" in str(merged_decision.get("final_answer") or "")
 
 
+def test_enforce_self_select_consistency_auto_fills_missing_actions(
+    monkeypatch,
+) -> None:
+    def fail_run_agent_with_messages(*, messages, **kwargs):
+        del messages, kwargs
+        raise AssertionError("不应进入二次 LLM 一致性改写")
+
+    monkeypatch.setattr(llm_service, "run_agent_with_messages", fail_run_agent_with_messages)
+
+    decision = {
+        "final_answer": "新增自选股：杰瑞股份\n移除自选股：工业富联",
+        "tool_calls": [],
+    }
+    settings = SimpleNamespace(run_type="analysis", prompt_templates={}, task_prompt="")
+
+    merged_decision, _, _, _, executed_actions = aniu_service._enforce_self_select_consistency(
+        settings=settings,
+        client=None,
+        decision=decision,
+        llm_request={},
+        llm_response={},
+        runtime_trace={"messages": [{"role": "assistant", "content": decision["final_answer"]}]},
+    )
+
+    assert merged_decision.get("consistency_autofill_applied") is True
+    assert len(executed_actions) == 2
+    assert {
+        str(item.get("query") or "") for item in executed_actions
+    } == {"将杰瑞股份加入自选股", "将工业富联从自选股删除"}
+    assert "系统一致性提示" not in str(merged_decision.get("final_answer") or "")
+    assert len(merged_decision.get("tool_calls") or []) == 2
+    assert all(
+        str(item.get("name") or "") == "mx_manage_self_select"
+        for item in (merged_decision.get("tool_calls") or [])
+    )
+
+
 def test_merge_consistency_followup_final_answer_preserves_original_analysis() -> None:
     original = "一、行情判断\n今天市场偏强。\n\n七、自选股维护结论\n新增自选股：光迅科技（002281）"
     revised = "一、行情判断\n今天市场偏强。\n\n七、自选股维护结论\n本轮没有实际新增或移除任何自选股。"
@@ -848,6 +885,40 @@ def test_enforce_trade_consistency_corrects_followup_text_when_actions_exist(
     assert len(executed_actions) == 1
     assert "[系统一致性修正]" in str(merged_decision.get("final_answer") or "")
     assert "实际卖出：立讯精密(002475) 5000股" in str(merged_decision.get("final_answer") or "")
+
+
+def test_enforce_trade_consistency_auto_fills_missing_actions_when_code_and_quantity_are_explicit(
+    monkeypatch,
+) -> None:
+    def fail_run_agent_with_messages(*, messages, **kwargs):
+        del messages, kwargs
+        raise AssertionError("不应进入二次 LLM 交易一致性改写")
+
+    monkeypatch.setattr(llm_service, "run_agent_with_messages", fail_run_agent_with_messages)
+
+    decision = {
+        "final_answer": "执行：卖出立讯精密（002475）5000股",
+        "tool_calls": [],
+    }
+    settings = SimpleNamespace(run_type="trade", prompt_templates={}, task_prompt="")
+
+    merged_decision, _, _, _, executed_actions = aniu_service._enforce_trade_consistency(
+        settings=settings,
+        client=None,
+        decision=decision,
+        llm_request={},
+        llm_response={},
+        runtime_trace={"messages": [{"role": "assistant", "content": decision["final_answer"]}]},
+    )
+
+    assert merged_decision.get("consistency_autofill_applied") is True
+    assert len(executed_actions) == 1
+    assert executed_actions[0]["action"] == "SELL"
+    assert executed_actions[0]["symbol"] == "002475"
+    assert executed_actions[0]["quantity"] == 5000
+    assert "系统一致性提示" not in str(merged_decision.get("final_answer") or "")
+    assert len(merged_decision.get("tool_calls") or []) == 1
+    assert str(merged_decision["tool_calls"][0].get("name") or "") == "mx_moni_trade"
 
 
 def test_jin10_news_service_fetches_raw_news_items(monkeypatch) -> None:

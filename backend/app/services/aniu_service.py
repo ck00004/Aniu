@@ -3471,6 +3471,182 @@ class AniuService:
 
         return changes
 
+    def _extract_executable_trade_claims(
+        self, final_answer: Any
+    ) -> list[dict[str, Any]]:
+        text = str(final_answer or "").strip()
+        if not text:
+            return []
+
+        claims: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, int, str, str | None]] = set()
+        conditional_markers = (
+            "若",
+            "如果",
+            "如",
+            "观察",
+            "计划",
+            "预案",
+            "等待",
+            "可能",
+            "考虑",
+        )
+        patterns: list[tuple[str, re.Pattern[str]]] = [
+            (
+                "BUY",
+                re.compile(
+                    r"(?:^|[：:\-\s]|执行[：:]?)"
+                    r"(?:(?:直接)?买入|加仓)\s*"
+                    r"(?:(?P<name>[A-Za-z\u4e00-\u9fa5]{2,20})\s*[（(]\s*(?P<code>\d{6})\s*[)）]|(?P<code_only>\d{6}))"
+                    r"\s*(?P<quantity>\d{1,7})\s*股",
+                ),
+            ),
+            (
+                "SELL",
+                re.compile(
+                    r"(?:^|[：:\-\s]|执行[：:]?)"
+                    r"(?:(?:直接)?卖出|先卖|优先卖|减仓)\s*"
+                    r"(?:(?P<name>[A-Za-z\u4e00-\u9fa5]{2,20})\s*[（(]\s*(?P<code>\d{6})\s*[)）]|(?P<code_only>\d{6}))"
+                    r"\s*(?P<quantity>\d{1,7})\s*股",
+                ),
+            ),
+        ]
+
+        for raw_line in text.splitlines():
+            line = str(raw_line or "").strip()
+            if not line:
+                continue
+            if any(marker in line for marker in conditional_markers):
+                continue
+
+            upper_line = line.upper()
+            price_type = "MARKET"
+            price: float | None = None
+            if "LIMIT" in upper_line or "限价" in line:
+                price_match = re.search(
+                    r"(?:LIMIT|限价|价格)\s*[:：]?\s*(\d+(?:\.\d+)?)",
+                    line,
+                    re.IGNORECASE,
+                )
+                if price_match is None:
+                    continue
+                price_type = "LIMIT"
+                price = float(price_match.group(1))
+
+            for action, pattern in patterns:
+                match = pattern.search(line)
+                if not match:
+                    continue
+                symbol = str(match.group("code") or match.group("code_only") or "").strip()
+                if not symbol:
+                    continue
+                try:
+                    quantity = int(match.group("quantity") or 0)
+                except ValueError:
+                    continue
+                if quantity <= 0:
+                    continue
+                name = self._clean_self_select_target(match.group("name") or "") or None
+                key = (action, symbol, quantity, price_type, str(price) if price is not None else None)
+                if key in seen:
+                    continue
+                seen.add(key)
+                claims.append(
+                    {
+                        "action": action,
+                        "symbol": symbol,
+                        "name": name,
+                        "quantity": quantity,
+                        "price_type": price_type,
+                        "price": price,
+                        "raw_query": line,
+                    }
+                )
+                break
+
+        return claims
+
+    def _build_trade_consistency_autofill_tool_calls(
+        self,
+        *,
+        settings: Any,
+        client: MXClient,
+        final_answer: Any,
+        tool_calls: Any,
+    ) -> list[dict[str, Any]]:
+        existing_tool_calls = tool_calls if isinstance(tool_calls, list) else []
+        existing_actions = self._extract_planned_actions(existing_tool_calls)
+        if not existing_actions:
+            existing_actions = self._extract_executed_actions(existing_tool_calls)
+
+        existing_trade_keys: set[tuple[str, str]] = set()
+        for item in existing_actions:
+            if not isinstance(item, dict):
+                continue
+            action = str(item.get("action") or "").upper()
+            symbol = str(item.get("symbol") or "").strip()
+            if action in {"BUY", "SELL"} and symbol:
+                existing_trade_keys.add((action, symbol))
+
+        sequence_no = len(existing_actions)
+        autofill_tool_calls: list[dict[str, Any]] = []
+        for claim in self._extract_executable_trade_claims(final_answer):
+            action = str(claim.get("action") or "").upper()
+            symbol = str(claim.get("symbol") or "").strip()
+            if action not in {"BUY", "SELL"} or not symbol:
+                continue
+            key = (action, symbol)
+            if key in existing_trade_keys:
+                continue
+
+            arguments: dict[str, Any] = {
+                "action": action,
+                "symbol": symbol,
+                "quantity": int(claim.get("quantity") or 0),
+                "price_type": str(claim.get("price_type") or "MARKET"),
+                "reason": "交易一致性自动补执行",
+            }
+            if claim.get("name"):
+                arguments["name"] = str(claim.get("name") or "")
+            if claim.get("price") is not None:
+                arguments["price"] = claim.get("price")
+
+            sequence_no += 1
+            try:
+                tool_result, _draft = execution_plan_service.execute_tool(
+                    tool_name="mx_moni_trade",
+                    arguments=arguments,
+                    tool_call_id=f"consistency-trade-{sequence_no}",
+                    context={
+                        "client": client,
+                        "app_settings": settings,
+                        "run_type": str(
+                            getattr(settings, "run_type", "trade") or "trade"
+                        ),
+                    },
+                    sequence_no=sequence_no,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "trade consistency autofill skipped: action=%s symbol=%s error=%s",
+                    action,
+                    symbol,
+                    exc,
+                )
+                continue
+
+            autofill_tool_calls.append(
+                {
+                    "id": f"consistency-trade-{sequence_no}",
+                    "name": "mx_moni_trade",
+                    "arguments": arguments,
+                    "result": tool_result,
+                }
+            )
+            existing_trade_keys.add(key)
+
+        return autofill_tool_calls
+
     def _extract_actual_trade_changes(
         self, executed_actions: list[dict[str, Any]] | Any
     ) -> list[dict[str, str]]:
@@ -3633,6 +3809,92 @@ class AniuService:
             if parsed is not None:
                 changes.append(parsed)
         return changes
+
+    def _build_self_select_consistency_autofill_tool_calls(
+        self,
+        *,
+        settings: Any,
+        client: MXClient,
+        final_answer: Any,
+        tool_calls: Any,
+    ) -> list[dict[str, Any]]:
+        existing_tool_calls = tool_calls if isinstance(tool_calls, list) else []
+        existing_actions = self._extract_planned_actions(existing_tool_calls)
+        if not existing_actions:
+            existing_actions = self._extract_executed_actions(existing_tool_calls)
+
+        claimed_changes = self._extract_claimed_self_select_changes(final_answer)
+        if not claimed_changes:
+            return []
+
+        actual_targets_by_action: dict[str, set[str]] = {
+            "add": set(),
+            "remove": set(),
+        }
+        for item in self._extract_actual_self_select_changes(existing_actions):
+            action = item.get("action")
+            target = self._clean_self_select_target(item.get("target"))
+            if action in actual_targets_by_action and target:
+                actual_targets_by_action[action].add(target)
+                actual_targets_by_action[action].update(
+                    self._extract_stock_mentions(target)
+                )
+
+        sequence_no = len(existing_actions)
+        autofill_tool_calls: list[dict[str, Any]] = []
+        for item in claimed_changes:
+            action = str(item.get("action") or "").strip()
+            target = self._clean_self_select_target(item.get("target"))
+            if action not in actual_targets_by_action or not target:
+                continue
+
+            claimed_tokens = {target}
+            claimed_tokens.update(self._extract_stock_mentions(target))
+            if not claimed_tokens.isdisjoint(actual_targets_by_action[action]):
+                continue
+
+            query = (
+                f"将{target}加入自选股"
+                if action == "add"
+                else f"将{target}从自选股删除"
+            )
+            arguments = {"query": query}
+            sequence_no += 1
+            try:
+                tool_result, _draft = execution_plan_service.execute_tool(
+                    tool_name="mx_manage_self_select",
+                    arguments=arguments,
+                    tool_call_id=f"consistency-self-select-{sequence_no}",
+                    context={
+                        "client": client,
+                        "app_settings": settings,
+                        "run_type": str(
+                            getattr(settings, "run_type", "analysis")
+                            or "analysis"
+                        ),
+                    },
+                    sequence_no=sequence_no,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "self-select consistency autofill skipped: action=%s target=%s error=%s",
+                    action,
+                    target,
+                    exc,
+                )
+                continue
+
+            autofill_tool_calls.append(
+                {
+                    "id": f"consistency-self-select-{sequence_no}",
+                    "name": "mx_manage_self_select",
+                    "arguments": arguments,
+                    "result": tool_result,
+                }
+            )
+            actual_targets_by_action[action].update(claimed_tokens)
+
+        return autofill_tool_calls
 
     def _has_self_select_consistency_gap(
         self, final_answer: Any, executed_actions: list[dict[str, Any]] | Any
@@ -3864,6 +4126,46 @@ class AniuService:
                 planned_actions,
             )
 
+        autofill_tool_calls = self._build_self_select_consistency_autofill_tool_calls(
+            settings=settings,
+            client=client,
+            final_answer=final_answer,
+            tool_calls=tool_calls,
+        )
+        if autofill_tool_calls:
+            _emit(
+                "stage",
+                stage="execution",
+                message="检测到自选股声明未执行，正在自动补齐缺失操作",
+            )
+            combined_tool_calls = list(tool_calls) if isinstance(tool_calls, list) else []
+            combined_tool_calls.extend(autofill_tool_calls)
+            merged_decision = dict(decision)
+            merged_decision["tool_calls"] = combined_tool_calls
+            merged_decision["original_final_answer"] = (
+                str(final_answer or "").strip() or None
+            )
+            merged_decision["consistency_autofill_applied"] = True
+            merged_planned_actions = self._extract_planned_actions(combined_tool_calls)
+            if not merged_planned_actions:
+                merged_planned_actions = self._extract_executed_actions(
+                    combined_tool_calls
+                )
+            merged_decision["final_answer"] = self._finalize_self_select_consistency(
+                final_answer,
+                merged_planned_actions,
+            )
+            merged_runtime_trace = (
+                dict(runtime_trace) if isinstance(runtime_trace, dict) else {}
+            )
+            return (
+                merged_decision,
+                llm_request,
+                llm_response,
+                merged_runtime_trace,
+                merged_planned_actions,
+            )
+
         messages = runtime_trace.get("messages") if isinstance(runtime_trace, dict) else None
         if not isinstance(messages, list) or not messages:
             normalized_decision = dict(decision)
@@ -3981,6 +4283,46 @@ class AniuService:
                 llm_response,
                 runtime_trace,
                 planned_actions,
+            )
+
+        autofill_tool_calls = self._build_trade_consistency_autofill_tool_calls(
+            settings=settings,
+            client=client,
+            final_answer=final_answer,
+            tool_calls=tool_calls,
+        )
+        if autofill_tool_calls:
+            _emit(
+                "stage",
+                stage="execution",
+                message="检测到交易声明未执行，正在自动补齐缺失委托",
+            )
+            combined_tool_calls = list(tool_calls) if isinstance(tool_calls, list) else []
+            combined_tool_calls.extend(autofill_tool_calls)
+            merged_decision = dict(decision)
+            merged_decision["tool_calls"] = combined_tool_calls
+            merged_decision["original_final_answer"] = (
+                str(final_answer or "").strip() or None
+            )
+            merged_decision["consistency_autofill_applied"] = True
+            merged_planned_actions = self._extract_planned_actions(combined_tool_calls)
+            if not merged_planned_actions:
+                merged_planned_actions = self._extract_executed_actions(
+                    combined_tool_calls
+                )
+            merged_decision["final_answer"] = self._finalize_trade_consistency(
+                final_answer,
+                merged_planned_actions,
+            )
+            merged_runtime_trace = (
+                dict(runtime_trace) if isinstance(runtime_trace, dict) else {}
+            )
+            return (
+                merged_decision,
+                llm_request,
+                llm_response,
+                merged_runtime_trace,
+                merged_planned_actions,
             )
 
         messages = runtime_trace.get("messages") if isinstance(runtime_trace, dict) else None

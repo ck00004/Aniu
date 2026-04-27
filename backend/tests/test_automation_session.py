@@ -443,56 +443,55 @@ def test_execute_run_marks_failed_when_planned_action_execution_fails(
     reset_db_state()
 
 
-def test_analysis_schedule_followup_adds_self_select_when_new_candidates_are_claimed(
+def test_analysis_schedule_consistency_autofills_missing_self_select_actions(
     monkeypatch,
     tmp_path,
 ) -> None:
+    from app.services import aniu_service as aniu_service_module
+
     captured_messages: list[list[dict[str, object]]] = []
+
+    class StubClient:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+        def close(self) -> None:
+            return None
 
     def fake_run_agent_with_messages(*, messages, **kwargs):
         del kwargs
         captured_messages.append(messages)
-        if len(captured_messages) == 1:
-            return (
-                {
-                    "final_answer": (
-                        "五、条件选股筛选后的新增候选结论\n"
-                        "其中，我认为今天最值得重点跟踪的新增候选只有3个：\n"
-                        "1. 亨通光电\n2. 三环集团\n3. 中船防务"
-                    ),
-                    "tool_calls": [
-                        {"name": "mx_get_self_selects", "result": {"ok": True, "summary": "已查询自选股列表。"}},
-                        {"name": "mx_search_news", "result": {"ok": True, "summary": "已查询资讯。"}},
-                        {"name": "mx_screen_stocks", "result": {"ok": True, "summary": "已执行选股。"}},
-                    ],
-                },
-                {"messages": []},
-                {"responses": [], "final_message": {"content": "first"}},
-                {"messages": messages},
-            )
         return (
             {
-                "final_answer": "已将亨通光电加入自选，作为新增重点跟踪标的。",
+                "final_answer": "本轮自选股变更结果\n新增自选股：仕佳光子\n移除自选股：无",
                 "tool_calls": [
-                    {
-                        "name": "mx_manage_self_select",
-                        "result": {
-                            "ok": True,
-                            "summary": "已加入自选。",
-                            "executed_action": {
-                                "action": "MANAGE_SELF_SELECT",
-                                "query": "将亨通光电加入自选股",
-                            },
-                        },
-                    }
+                    {"name": "mx_get_self_selects", "result": {"ok": True, "summary": "已查询自选股列表。"}},
+                    {"name": "mx_search_news", "result": {"ok": True, "summary": "已查询资讯。"}},
+                    {"name": "mx_screen_stocks", "result": {"ok": True, "summary": "已执行选股。"}},
                 ],
             },
             {"messages": []},
-            {"responses": [], "final_message": {"content": "followup"}},
+            {"responses": [], "final_message": {"content": "first"}},
             {"messages": messages},
         )
 
+    def fake_execute_tool(*, client, app_settings, tool_name, arguments):
+        del client, app_settings
+        assert tool_name == "mx_manage_self_select"
+        return {
+            "ok": True,
+            "tool_name": tool_name,
+            "summary": f"已执行自选股操作：{arguments['query']}",
+            "result": {"ok": True},
+            "executed_action": {
+                "action": "MANAGE_SELF_SELECT",
+                "query": str(arguments.get("query") or ""),
+            },
+        }
+
+    monkeypatch.setattr(aniu_service_module, "MXClient", StubClient)
     monkeypatch.setattr(llm_service, "run_agent_with_messages", fake_run_agent_with_messages)
+    monkeypatch.setattr(aniu_service_module.mx_skill_service, "execute_tool", fake_execute_tool)
     monkeypatch.setattr(
         aniu_service,
         "_prefetch_analysis_context",
@@ -511,13 +510,14 @@ def test_analysis_schedule_followup_adds_self_select_when_new_candidates_are_cla
 
         run = aniu_service.execute_run(trigger_source="schedule", schedule_id=schedule_id)
 
-        assert len(captured_messages) == 2
-        assert "新增候选" in str(captured_messages[1][-1].get("content") or "")
+        assert len(captured_messages) == 1
         assert run.executed_actions is not None
         assert any(str(item.get("action") or "") == "MANAGE_SELF_SELECT" for item in run.executed_actions)
+        assert any("仕佳光子" in str(item.get("query") or "") for item in run.executed_actions)
         assert run.decision_payload is not None
         assert run.decision_payload.get("original_final_answer")
-        assert "一致性检查修正说明" in str(run.final_answer or "")
+        assert run.decision_payload.get("consistency_autofill_applied") is True
+        assert "系统一致性提示" not in str(run.final_answer or "")
 
     reset_db_state()
 
@@ -597,6 +597,88 @@ def test_trade_schedule_followup_executes_trade_when_final_answer_claims_sell(
             assert len(orders) == 1
             assert orders[0].action == "SELL"
         assert "一致性检查修正说明" in str(run.final_answer or "")
+
+    reset_db_state()
+
+
+def test_trade_schedule_consistency_autofills_missing_trade_when_code_and_quantity_are_explicit(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from app.services import aniu_service as aniu_service_module
+
+    captured_messages: list[list[dict[str, object]]] = []
+
+    class StubClient:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+        def close(self) -> None:
+            return None
+
+    def fake_run_agent_with_messages(*, messages, **kwargs):
+        del kwargs
+        captured_messages.append(messages)
+        return (
+            {
+                "final_answer": "09:30这一轮直接结论：\n执行：卖出立讯精密（002475）5000股",
+                "tool_calls": [],
+            },
+            {"messages": []},
+            {"responses": [], "final_message": {"content": "first"}},
+            {"messages": messages},
+        )
+
+    def fake_execute_tool(*, client, app_settings, tool_name, arguments):
+        del client, app_settings
+        assert tool_name == "mx_moni_trade"
+        return {
+            "ok": True,
+            "tool_name": tool_name,
+            "summary": f"已提交{arguments['action']}委托：{arguments['symbol']} {arguments['quantity']} 股。",
+            "result": {"order_id": "SELL-AUTOFILL-1"},
+            "executed_action": {
+                "action": str(arguments.get("action") or ""),
+                "symbol": str(arguments.get("symbol") or ""),
+                "name": str(arguments.get("name") or ""),
+                "quantity": int(arguments.get("quantity") or 0),
+                "price_type": str(arguments.get("price_type") or "MARKET"),
+            },
+        }
+
+    monkeypatch.setattr(aniu_service_module, "MXClient", StubClient)
+    monkeypatch.setattr(llm_service, "run_agent_with_messages", fake_run_agent_with_messages)
+    monkeypatch.setattr(aniu_service_module.mx_skill_service, "execute_tool", fake_execute_tool)
+    monkeypatch.setattr(
+        aniu_service,
+        "_prefetch_analysis_context",
+        lambda **kwargs: (None, None),
+    )
+
+    with create_test_client(monkeypatch, tmp_path):
+        with session_scope() as db:
+            settings = aniu_service.get_or_create_settings(db)
+            settings.mx_api_key = "mx-key"
+            settings.llm_base_url = "https://example.com/v1"
+            settings.llm_api_key = "llm-key"
+            settings.llm_model = "demo-model"
+            schedule = _prepare_schedule(db, name="上午运行1号", run_type="trade")
+            schedule_id = schedule.id
+
+        run = aniu_service.execute_run(trigger_source="schedule", schedule_id=schedule_id)
+
+        assert len(captured_messages) == 1
+        assert run.executed_actions is not None
+        assert any(str(item.get("action") or "") == "SELL" for item in run.executed_actions)
+        assert any(str(item.get("symbol") or "") == "002475" for item in run.executed_actions)
+        assert run.decision_payload is not None
+        assert run.decision_payload.get("consistency_autofill_applied") is True
+        with session_scope() as db:
+            stored_run = db.get(StrategyRun, run.id)
+            orders = db.query(TradeOrder).filter(TradeOrder.run_id == run.id).all()
+            assert stored_run is not None
+            assert len(orders) == 1
+            assert orders[0].action == "SELL"
 
     reset_db_state()
 
