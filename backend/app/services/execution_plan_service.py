@@ -57,12 +57,24 @@ class ExecutionPlanService:
                 "error": f"未知计划工具: {tool_name}",
             }, None
 
-        return planner(
-            arguments=arguments,
-            tool_call_id=tool_call_id,
-            sequence_no=sequence_no,
-            app_settings=context.get("app_settings"),
-        )
+        try:
+            return planner(
+                arguments=arguments,
+                tool_call_id=tool_call_id,
+                sequence_no=sequence_no,
+                app_settings=context.get("app_settings"),
+            )
+        except Exception as exc:
+            error_text = str(exc)
+            build_error_guidance = getattr(mx_skill_service, "_build_error_guidance", None)
+            guidance = ""
+            if callable(build_error_guidance):
+                guidance = str(build_error_guidance(error_text) or "")
+            return {
+                "ok": False,
+                "tool_name": tool_name,
+                "error": f"{error_text}{guidance}",
+            }, None
 
     def _plan_manage_self_select(
         self,

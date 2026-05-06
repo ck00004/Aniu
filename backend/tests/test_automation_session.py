@@ -443,6 +443,76 @@ def test_execute_run_marks_failed_when_planned_action_execution_fails(
     reset_db_state()
 
 
+def test_execute_run_does_not_fail_on_invalid_multi_target_self_select_plan(
+    monkeypatch, tmp_path
+) -> None:
+    from app.services import aniu_service as aniu_service_module
+
+    class StubClient:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+        def close(self) -> None:
+            return None
+
+    def fake_run_agent_with_messages(
+        *, app_settings, client, messages, emit=None, tool_executor=None
+    ):
+        del app_settings, client, messages, emit
+        arguments = {
+            "query": "把贵州茅台和东方财富加入自选股",
+        }
+        tool_result = tool_executor("mx_manage_self_select", arguments, "call-2")
+        return (
+            {
+                "final_answer": "新增重点跟踪：贵州茅台、东方财富。",
+                "tool_calls": [
+                    {
+                        "id": "call-2",
+                        "name": "mx_manage_self_select",
+                        "arguments": arguments,
+                        "result": tool_result,
+                    }
+                ],
+            },
+            {"messages": []},
+            {"responses": [], "final_message": {"content": "planned"}},
+            {"messages": []},
+        )
+
+    monkeypatch.setattr(aniu_service_module, "MXClient", StubClient)
+    monkeypatch.setattr(llm_service, "run_agent_with_messages", fake_run_agent_with_messages)
+    monkeypatch.setattr(
+        aniu_service,
+        "_prefetch_analysis_context",
+        lambda **kwargs: (None, None),
+    )
+
+    with create_test_client(monkeypatch, tmp_path):
+        with session_scope() as db:
+            settings = aniu_service.get_or_create_settings(db)
+            settings.mx_api_key = "mx-key"
+            settings.llm_base_url = "https://example.com/v1"
+            settings.llm_api_key = "llm-key"
+            settings.llm_model = "demo-model"
+            settings.task_prompt = "请执行自选测试。"
+
+        run = aniu_service.execute_run(trigger_source="manual")
+
+        assert run.status == "completed"
+        assert run.error_message is None
+        assert run.executed_actions == []
+        assert run.decision_payload is not None
+        tool_calls = run.decision_payload.get("tool_calls") or []
+        assert len(tool_calls) == 1
+        assert tool_calls[0]["result"]["ok"] is False
+        assert "一次只能添加或删除一只自选股" in str(
+            tool_calls[0]["result"].get("error") or ""
+        )
+
+    reset_db_state()
+
+
 def test_analysis_schedule_consistency_autofills_missing_self_select_actions(
     monkeypatch,
     tmp_path,

@@ -11,6 +11,7 @@ from app.db.database import init_db
 from app.db.models import StrategyRun, StrategySchedule
 from app.schemas.aniu import ScheduleUpdate
 from app.services.aniu_service import aniu_service
+from app.services.execution_plan_service import execution_plan_service
 from app.services.jin10_news_service import Jin10NewsService
 from app.services.mx_skill_service import mx_skill_service
 from app.services.llm_service import LLMService, LLMUpstreamError, llm_service
@@ -78,6 +79,38 @@ def test_manage_self_select_rejects_multiple_targets() -> None:
                 "query": "把贵州茅台和东方财富加入自选股",
             },
         )
+
+
+def test_manage_self_select_execute_tool_adds_split_guidance() -> None:
+    result = mx_skill_service.execute_tool(
+        client=None,
+        app_settings=None,
+        tool_name="mx_manage_self_select",
+        arguments={"query": "把贵州茅台和东方财富加入自选股"},
+    )
+
+    assert result["ok"] is False
+    assert "一次只能添加或删除一只自选股" in str(result.get("error") or "")
+    assert "请把每只股票拆成一次单独的 mx_manage_self_select 调用" in str(
+        result.get("error") or ""
+    )
+
+
+def test_execution_plan_manage_self_select_returns_error_for_multiple_targets() -> None:
+    result, draft = execution_plan_service.execute_tool(
+        tool_name="mx_manage_self_select",
+        arguments={"query": "把贵州茅台和东方财富加入自选股"},
+        tool_call_id="call-1",
+        context={"app_settings": None},
+        sequence_no=1,
+    )
+
+    assert draft is None
+    assert result["ok"] is False
+    assert "一次只能添加或删除一只自选股" in str(result.get("error") or "")
+    assert "请把每只股票拆成一次单独的 mx_manage_self_select 调用" in str(
+        result.get("error") or ""
+    )
 
 
 def test_moni_trade_rejects_multiple_symbols() -> None:
