@@ -1203,6 +1203,35 @@ def test_build_initial_request_payload_uses_run_type_tool_profile() -> None:
     assert "mx_query_market" in names
 
 
+def test_build_initial_request_payload_enables_thinking_for_mimo_models() -> None:
+    app_settings = SimpleNamespace(
+        llm_model="mimo-v2.5-pro",
+        system_prompt="system",
+        task_prompt="task",
+        run_type="analysis",
+    )
+
+    payload = llm_service.build_initial_request_payload(app_settings)
+
+    assert payload["thinking"] == {"type": "enabled"}
+
+
+def test_build_request_payload_from_messages_does_not_enable_thinking_for_other_models() -> None:
+    app_settings = SimpleNamespace(
+        llm_model="gpt-4o-mini",
+        system_prompt="system",
+        run_type="analysis",
+        prompt_templates=None,
+    )
+
+    payload = llm_service.build_request_payload_from_messages(
+        app_settings=app_settings,
+        messages=[{"role": "user", "content": "hi"}],
+    )
+
+    assert "thinking" not in payload
+
+
 def test_consume_llm_stream_uses_fresh_http_client_per_request(monkeypatch) -> None:
     service = LLMService()
     created_timeouts: list[int] = []
@@ -1370,6 +1399,32 @@ def test_parse_llm_stream_response_raises_for_error_chunk() -> None:
 
     with pytest.raises(RuntimeError, match="大模型流式响应错误: quota exceeded"):
         service._parse_llm_stream_response(lines=lines, emit=lambda *_a, **_kw: None)
+
+
+def test_parse_llm_stream_response_preserves_reasoning_content() -> None:
+    service = LLMService()
+
+    lines = iter(
+        [
+            'data: {"choices":[{"delta":{"reasoning_content":"先看持仓。"}}]}',
+            "",
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"demo_tool","arguments":"{}"}}]}}]}',
+            "",
+            'data: {"choices":[{"delta":{"reasoning_content":"再决定是否调用工具。"}}]}',
+            "",
+            'data: [DONE]',
+            "",
+        ]
+    )
+
+    response = service._parse_llm_stream_response(
+        lines=lines,
+        emit=lambda *_a, **_kw: None,
+    )
+
+    message = response["choices"][0]["message"]
+    assert message["reasoning_content"] == "先看持仓。再决定是否调用工具。"
+    assert message["tool_calls"][0]["id"] == "call-1"
 
 
 def test_call_llm_stream_retries_without_include_usage_on_400(monkeypatch) -> None:
@@ -1557,6 +1612,77 @@ def test_agent_loop_retries_when_final_answer_is_empty_after_tools() -> None:
         and "请基于上面的工具结果直接输出最终结论" in str(message.get("content") or "")
         for message in last_messages
     )
+
+
+def test_agent_loop_replays_reasoning_content_for_mimo_tool_turns() -> None:
+    service = LLMService()
+    seen_payloads: list[dict[str, object]] = []
+
+    responses = [
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "reasoning_content": "我先查账户和持仓。",
+                        "tool_calls": [
+                            {
+                                "id": "tool-1",
+                                "function": {
+                                    "name": "demo_tool",
+                                    "arguments": "{}",
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        },
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": "最终结论。",
+                        "reasoning_content": "工具结果已经足够。",
+                    },
+                    "finish_reason": "stop",
+                }
+            ]
+        },
+    ]
+
+    def fake_call_llm_stream(*, payload, **kwargs):
+        del kwargs
+        seen_payloads.append(payload)
+        return responses[len(seen_payloads) - 1]
+
+    service._call_llm_stream = fake_call_llm_stream  # type: ignore[method-assign]
+
+    result = service._agent_loop(
+        model="mimo-v2.5-pro",
+        base_url="https://example.com/v1",
+        api_key="token",
+        initial_messages=[{"role": "user", "content": "请分析市场"}],
+        run_type="analysis",
+        timeout_seconds=1800,
+        tool_executor=lambda tool_name, arguments: {
+            "ok": True,
+            "tool_name": tool_name,
+            "summary": "工具执行成功",
+            "result": {"arguments": arguments},
+        },
+        emit=lambda *_a, **_kw: None,
+    )
+
+    assert result["final_answer"] == "最终结论。"
+    assert seen_payloads[0]["thinking"] == {"type": "enabled"}
+    second_messages = seen_payloads[1]["messages"]
+    assistant_message = next(
+        message
+        for message in second_messages
+        if message.get("role") == "assistant" and message.get("tool_calls")
+    )
+    assert assistant_message["reasoning_content"] == "我先查账户和持仓。"
 
 
 def test_execute_tool_adds_guidance_for_api_key_error() -> None:

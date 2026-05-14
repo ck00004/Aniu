@@ -21,6 +21,13 @@ _FINAL_STREAM_CHUNK_SIZE = 96
 _EMPTY_FINAL_ANSWER_RETRY_LIMIT = 1
 _LLM_UPSTREAM_MAX_RETRIES = 3
 _LLM_UPSTREAM_RETRY_DELAY_SECONDS = 1.0
+_MIMO_THINKING_MODEL_PREFIXES = (
+    "mimo-v2.5-pro",
+    "mimo-v2.5",
+    "mimo-v2-pro",
+    "mimo-v2-omni",
+    "mimo-v2-flash",
+)
 
 class LLMStreamCancelled(RuntimeError):
     """Raised when a streaming chat/run should stop because the client disconnected."""
@@ -50,6 +57,20 @@ def _is_retryable_upstream_error(exc: LLMUpstreamError) -> bool:
 
 def _should_fallback_to_non_stream(exc: LLMUpstreamError) -> bool:
     return exc.status_code == 400
+
+
+def _should_enable_mimo_thinking(model: Any) -> bool:
+    normalized = str(model or "").strip().lower()
+    if not normalized:
+        return False
+    return normalized.startswith(_MIMO_THINKING_MODEL_PREFIXES)
+
+
+def _apply_reasoning_options(payload: dict[str, Any]) -> dict[str, Any]:
+    adjusted = dict(payload)
+    if _should_enable_mimo_thinking(adjusted.get("model")):
+        adjusted["thinking"] = {"type": "enabled"}
+    return adjusted
 
 
 def _sleep_before_retry(
@@ -206,6 +227,26 @@ def _to_stream_text_content(value: Any) -> str:
     return ""
 
 
+def _to_reasoning_content(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            if isinstance(item.get("text"), str):
+                parts.append(item["text"])
+                continue
+            if isinstance(item.get("content"), str):
+                parts.append(item["content"])
+        return "".join(parts)
+    return ""
+
+
 def _merge_stream_tool_call(
     tool_calls: dict[int, dict[str, Any]],
     delta_payload: dict[str, Any],
@@ -327,11 +368,11 @@ class LLMService:
             )
         payload_messages.extend(dict(message) for message in messages)
 
-        payload = {
+        payload = _apply_reasoning_options({
             "model": model,
             "temperature": _LLM_TEMPERATURE,
             "messages": payload_messages,
-        }
+        })
         response_payload = self._call_llm_stream(
             base_url=base_url,
             api_key=api_key,
@@ -352,7 +393,7 @@ class LLMService:
             run_type=run_type,
             prompt_templates=getattr(app_settings, "prompt_templates", None),
         )
-        return {
+        return _apply_reasoning_options({
             "model": app_settings.llm_model,
             "temperature": _LLM_TEMPERATURE,
             "messages": [
@@ -361,7 +402,7 @@ class LLMService:
             ],
             "tools": skill_stack_service.runtime.build_tools(run_type=run_type),
             "tool_choice": "auto",
-        }
+        })
 
     def build_request_payload_from_messages(
         self,
@@ -379,13 +420,13 @@ class LLMService:
         if system_prompt:
             payload_messages.append({"role": "system", "content": system_prompt})
         payload_messages.extend(dict(message) for message in messages)
-        return {
+        return _apply_reasoning_options({
             "model": app_settings.llm_model,
             "temperature": _LLM_TEMPERATURE,
             "messages": payload_messages,
             "tools": skill_stack_service.runtime.build_tools(run_type=run_type),
             "tool_choice": "auto",
-        }
+        })
 
     @staticmethod
     def _augment_system_prompt(
@@ -507,13 +548,13 @@ class LLMService:
 
         for iteration in range(_MAX_TOOL_ITERATIONS):
             _raise_if_cancelled(cancel_event)
-            iteration_payload = {
+            iteration_payload = _apply_reasoning_options({
                 "model": model,
                 "temperature": _LLM_TEMPERATURE,
                 "messages": messages,
                 "tools": skill_stack_service.runtime.build_tools(run_type=run_type),
                 "tool_choice": "auto",
-            }
+            })
             _emit("llm_request", iteration=iteration + 1, model=model)
             response_payload = self._call_llm_stream(
                 base_url=base_url,
@@ -534,6 +575,11 @@ class LLMService:
                 "role": "assistant",
                 "content": message.get("content") or "",
             }
+            reasoning_content = _to_reasoning_content(
+                message.get("reasoning_content")
+            )
+            if reasoning_content:
+                assistant_entry["reasoning_content"] = reasoning_content
             if message.get("tool_calls"):
                 assistant_entry["tool_calls"] = message["tool_calls"]
             messages.append(assistant_entry)
@@ -800,6 +846,7 @@ class LLMService:
     ) -> dict[str, Any]:
         data_lines: list[str] = []
         content_parts: list[str] = []
+        reasoning_parts: list[str] = []
         tool_calls: dict[int, dict[str, Any]] = {}
         usage: dict[str, Any] | None = None
         finish_reason: str | None = None
@@ -873,6 +920,10 @@ class LLMService:
             if not isinstance(delta, dict):
                 return
 
+            delta_reasoning = _to_reasoning_content(delta.get("reasoning_content"))
+            if delta_reasoning:
+                reasoning_parts.append(delta_reasoning)
+
             delta_tool_calls = delta.get("tool_calls")
             if isinstance(delta_tool_calls, list) and delta_tool_calls:
                 if stream_mode is None:
@@ -922,6 +973,9 @@ class LLMService:
             "role": "assistant",
             "content": final_text,
         }
+        reasoning_content = "".join(reasoning_parts)
+        if reasoning_content:
+            message["reasoning_content"] = reasoning_content
         ordered_tool_calls = [tool_calls[idx] for idx in sorted(tool_calls)]
         if ordered_tool_calls:
             message["tool_calls"] = ordered_tool_calls
