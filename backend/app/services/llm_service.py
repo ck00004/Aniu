@@ -48,6 +48,10 @@ def _is_retryable_upstream_error(exc: LLMUpstreamError) -> bool:
     return exc.status_code is None or exc.status_code >= 500
 
 
+def _should_fallback_to_non_stream(exc: LLMUpstreamError) -> bool:
+    return exc.status_code == 400
+
+
 def _sleep_before_retry(
     delay_seconds: float,
     *,
@@ -687,6 +691,31 @@ class LLMService:
 
             if last_error is None:
                 continue
+            if _should_fallback_to_non_stream(last_error):
+                if callable(emit):
+                    emit(
+                        "stage",
+                        stage="llm",
+                        message="流式请求被上游拒绝，正在切换为非流式请求重试",
+                    )
+                logger.warning(
+                    "LLM stream request rejected with 400, falling back to non-stream request: %s",
+                    last_error,
+                )
+                fallback_payload = self._call_llm(
+                    base_url=base_url,
+                    api_key=api_key,
+                    payload=dict(payload),
+                    timeout_seconds=timeout_seconds,
+                )
+                if isinstance(fallback_payload, dict):
+                    stream_meta = fallback_payload.get("stream_meta")
+                    if not isinstance(stream_meta, dict):
+                        stream_meta = {}
+                    stream_meta.setdefault("fallback_mode", "non_stream")
+                    stream_meta.setdefault("final_streamed", False)
+                    fallback_payload["stream_meta"] = stream_meta
+                return fallback_payload
             if (
                 not _is_retryable_upstream_error(last_error)
                 or attempt >= _LLM_UPSTREAM_MAX_RETRIES - 1

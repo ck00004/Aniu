@@ -524,6 +524,14 @@ def get_persistent_session(
     return aniu_service.get_persistent_session(db)
 
 
+@router.post("/persistent-session/reset", response_model=PersistentSessionRead)
+def reset_persistent_session(
+    db: Session = Depends(get_db),
+    _user: str = Depends(get_current_user),
+) -> PersistentSessionRead:
+    return aniu_service.reset_persistent_session(db)
+
+
 @router.get(
     "/persistent-session/messages",
     response_model=PersistentSessionMessagesPageRead,

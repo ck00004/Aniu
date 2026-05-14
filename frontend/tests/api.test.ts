@@ -176,3 +176,42 @@ test('fetchChatAttachmentBlob 使用认证头并携带超时 signal', async () =
     browser.restore()
   }
 })
+
+test('resetPersistentSession 以 POST 调用持久会话重置接口', async () => {
+  const browser = installBrowserMocks()
+
+  try {
+    setStoredToken('persistent-token')
+
+    browser.setFetch(async (input, init) => {
+      assert.equal(String(input), '/api/aniu/persistent-session/reset')
+      assert.equal(init?.method, 'POST')
+      const headers = new Headers(init?.headers)
+      assert.equal(headers.get('Authorization'), 'Bearer persistent-token')
+      return new Response(JSON.stringify({
+        id: 12,
+        title: '自动化交易会话',
+        kind: 'automation',
+        slug: 'automation-default',
+        created_at: '2026-05-13T00:00:00Z',
+        updated_at: '2026-05-13T00:00:00Z',
+        last_message_at: null,
+        message_count: 0,
+        archived_summary: null,
+        summary_revision: 0,
+        last_compacted_message_id: null,
+        last_compacted_run_id: null,
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    })
+
+    const result = await api.resetPersistentSession()
+
+    assert.equal(result.id, 12)
+    assert.equal(result.message_count, 0)
+  } finally {
+    browser.restore()
+  }
+})

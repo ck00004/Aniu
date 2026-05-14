@@ -416,6 +416,11 @@ export const api = {
   getPersistentSession() {
     return request<PersistentSession>(`${API_PREFIX}/persistent-session`)
   },
+  resetPersistentSession() {
+    return request<PersistentSession>(`${API_PREFIX}/persistent-session/reset`, {
+      method: 'POST',
+    })
+  },
   getPersistentSessionMessages(options: ListChatMessagesOptions = {}) {
     const params = new URLSearchParams()
     params.set('limit', String(options.limit ?? 50))

@@ -38,6 +38,17 @@
               <span class="chat-session-title">持久会话</span>
               <span class="chat-session-meta">{{ persistentMeta }}</span>
             </div>
+            <div class="chat-session-actions" @click.stop>
+              <button
+                type="button"
+                class="chat-session-action danger"
+                :disabled="!persistentSession"
+                title="清空自动化上下文"
+                @click="handleResetPersistentSession"
+              >
+                清空上下文
+              </button>
+            </div>
           </li>
         </ul>
       </section>
@@ -94,6 +105,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: 'select', sessionId: number): void
   (e: 'selectPersistent'): void
+  (e: 'resetPersistent'): void
   (e: 'create'): void
   (e: 'delete', sessionId: number): void
 }>()
@@ -114,6 +126,13 @@ function handleDelete(session: ChatSession) {
   const confirmed = window.confirm(`确定删除对话“${session.title || '新对话'}”吗？`)
   if (!confirmed) return
   emit('delete', session.id)
+}
+
+function handleResetPersistentSession() {
+  if (!props.persistentSession) return
+  const confirmed = window.confirm('确定清空自动化上下文吗？这会创建一个新的空白自动化会话，旧上下文仍保留在历史运行记录里。')
+  if (!confirmed) return
+  emit('resetPersistent')
 }
 
 function formatTime(value: string | null): string {

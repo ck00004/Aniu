@@ -73,6 +73,22 @@ export function usePersistentSession() {
     }
   }
 
+  async function resetSession(): Promise<void> {
+    loading.value = true
+    errorMessage.value = ''
+    try {
+      session.value = await api.resetPersistentSession()
+      messages.value = []
+      hasMoreMessages.value = false
+      nextBeforeId.value = null
+    } catch (error) {
+      errorMessage.value = (error as Error).message
+      throw error
+    } finally {
+      loading.value = false
+    }
+  }
+
   function clear() {
     session.value = null
     messages.value = []
@@ -91,6 +107,7 @@ export function usePersistentSession() {
     loadSession,
     refreshSummaryOnly,
     loadOlderMessages,
+    resetSession,
     clear,
   }
 }

@@ -1433,6 +1433,53 @@ def test_call_llm_stream_retries_on_retryable_upstream_error(monkeypatch) -> Non
     assert sleep_calls == [1.0]
 
 
+def test_call_llm_stream_falls_back_to_non_stream_on_400(monkeypatch) -> None:
+    service = LLMService()
+    seen_stream_payloads: list[dict[str, object]] = []
+    seen_fallback_payloads: list[dict[str, object]] = []
+
+    def fake_consume_llm_stream(*, payload, **kwargs):
+        del kwargs
+        seen_stream_payloads.append(payload)
+        raise LLMUpstreamError(
+            "大模型请求参数错误 (400): Param Incorrect",
+            status_code=400,
+        )
+
+    def fake_call_llm(*, payload, **kwargs):
+        del kwargs
+        seen_fallback_payloads.append(payload)
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": "ok",
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr(service, "_consume_llm_stream", fake_consume_llm_stream)
+    monkeypatch.setattr(service, "_call_llm", fake_call_llm)
+
+    result = service._call_llm_stream(
+        base_url="https://example.com/v1",
+        api_key="token",
+        payload={"messages": [], "model": "demo"},
+        timeout_seconds=5,
+    )
+
+    assert result["choices"][0]["message"]["content"] == "ok"
+    assert len(seen_stream_payloads) == 2
+    assert seen_stream_payloads[0]["stream"] is True
+    assert seen_stream_payloads[0]["stream_options"] == {"include_usage": True}
+    assert seen_stream_payloads[1]["stream"] is True
+    assert "stream_options" not in seen_stream_payloads[1]
+    assert seen_fallback_payloads == [{"messages": [], "model": "demo"}]
+    assert result["stream_meta"]["fallback_mode"] == "non_stream"
+    assert result["stream_meta"]["final_streamed"] is False
+
+
 def test_agent_loop_retries_when_final_answer_is_empty_after_tools() -> None:
     service = LLMService()
     seen_payloads: list[dict[str, object]] = []

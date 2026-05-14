@@ -17,6 +17,7 @@
           :loading="sessionsLoading"
           @select="handleSelect"
           @select-persistent="handleSelectPersistent"
+          @reset-persistent="handleResetPersistent"
           @create="handleCreate"
           @delete="handleDelete"
         />
@@ -94,6 +95,7 @@ const {
   loadSession: loadPersistentSession,
   loadOlderMessages: loadOlderPersistentMessages,
   refreshSummaryOnly: refreshPersistentSummaryOnly,
+  resetSession: resetPersistentSession,
   clear: clearPersistentSession,
 } = usePersistentSession()
 
@@ -158,6 +160,16 @@ async function handleSelectPersistent() {
   persistentSelected.value = true
   activeSessionId.value = null
   await loadPersistentSession()
+}
+
+async function handleResetPersistent() {
+  persistentSelected.value = true
+  activeSessionId.value = null
+  try {
+    await resetPersistentSession()
+  } catch {
+    return
+  }
 }
 
 async function ensureSessionReady(): Promise<number | null> {

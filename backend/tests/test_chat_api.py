@@ -1144,6 +1144,67 @@ def test_persistent_session_messages_endpoint_returns_messages(monkeypatch, tmp_
     get_settings.cache_clear()
 
 
+def test_persistent_session_reset_endpoint_rotates_automation_context(
+    monkeypatch, tmp_path
+) -> None:
+    with create_test_client(monkeypatch, tmp_path) as client:
+        with session_scope() as db:
+            session = ChatSession(
+                title="自动化交易会话",
+                kind="automation",
+                slug="automation-default",
+                archived_summary="旧摘要",
+                summary_revision=5,
+            )
+            db.add(session)
+            db.flush()
+            db.add(
+                ChatMessageRecord(
+                    session_id=session.id,
+                    role="assistant",
+                    content="old message",
+                )
+            )
+            db.add(
+                StrategyRun(
+                    trigger_source="schedule",
+                    run_type="analysis",
+                    schedule_name="盘前分析",
+                    status="failed",
+                    chat_session_id=session.id,
+                )
+            )
+
+        headers = _auth_headers(client)
+        response = client.post("/api/aniu/persistent-session/reset", headers=headers)
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["slug"] == "automation-default"
+        assert payload["title"] == "自动化交易会话"
+        assert payload["message_count"] == 0
+        assert payload["archived_summary"] is None
+        assert payload["summary_revision"] == 0
+
+        with session_scope() as db:
+            sessions = db.query(ChatSession).filter(ChatSession.kind == "automation").order_by(ChatSession.id.asc()).all()
+            assert len(sessions) == 2
+            assert sessions[0].slug.startswith("automation-default-archived-")
+            assert sessions[1].slug == "automation-default"
+
+            run = db.query(StrategyRun).one()
+            assert run.chat_session_id == sessions[0].id
+
+            old_messages = db.query(ChatMessageRecord).filter(ChatMessageRecord.session_id == sessions[0].id).all()
+            new_messages = db.query(ChatMessageRecord).filter(ChatMessageRecord.session_id == sessions[1].id).all()
+            assert len(old_messages) == 1
+            assert new_messages == []
+
+    database_module._engine = None
+    database_module._session_local = None
+    get_settings.cache_clear()
+
+
 def test_account_endpoint_excludes_raw_payloads_by_default(monkeypatch, tmp_path) -> None:
     from app.services.aniu_service import aniu_service
 

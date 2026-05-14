@@ -645,20 +645,32 @@ class AniuService:
                 ChatMessageRecord.session_id == session.id
             )
         ).scalar_one()
-        return PersistentSessionRead(
-            id=session.id,
-            title=session.title,
-            kind=str(session.kind or "automation"),
-            slug=session.slug,
-            created_at=_assume_utc(session.created_at),
-            updated_at=_assume_utc(session.updated_at),
-            last_message_at=_assume_utc(session.last_message_at),
-            message_count=int(total_count),
-            archived_summary=session.archived_summary,
-            summary_revision=int(session.summary_revision or 0),
-            last_compacted_message_id=session.last_compacted_message_id,
-            last_compacted_run_id=session.last_compacted_run_id,
+        return self._build_persistent_session_read(session, total_count=total_count)
+
+    def reset_persistent_session(self, db: Session) -> PersistentSessionRead:
+        settings = self.get_or_create_settings(db)
+        previous_session = self._get_or_create_persistent_session(db)
+        archived_slug = self._build_archived_automation_session_slug(previous_session.id)
+        previous_session.slug = archived_slug
+
+        archived_title = str(previous_session.title or AUTOMATION_SESSION_TITLE).strip()
+        if archived_title == AUTOMATION_SESSION_TITLE:
+            previous_session.title = f"{AUTOMATION_SESSION_TITLE}（已清空）"
+
+        new_session = ChatSession(
+            title=AUTOMATION_SESSION_TITLE,
+            kind="automation",
+            slug=AUTOMATION_SESSION_SLUG,
         )
+        db.add(new_session)
+        db.flush()
+
+        settings.automation_session_id = new_session.id
+        db.add(settings)
+        db.commit()
+        db.refresh(new_session)
+
+        return self._build_persistent_session_read(new_session, total_count=0)
 
     def list_persistent_session_messages(
         self,
@@ -692,19 +704,9 @@ class AniuService:
         records.reverse()
         next_before_id = records[0].id if has_more and records else None
 
-        session_read = PersistentSessionRead(
-            id=session.id,
-            title=session.title,
-            kind=str(session.kind or "automation"),
-            slug=session.slug,
-            created_at=_assume_utc(session.created_at),
-            updated_at=_assume_utc(session.updated_at),
-            last_message_at=_assume_utc(session.last_message_at),
-            message_count=int(total_count),
-            archived_summary=session.archived_summary,
-            summary_revision=int(session.summary_revision or 0),
-            last_compacted_message_id=session.last_compacted_message_id,
-            last_compacted_run_id=session.last_compacted_run_id,
+        session_read = self._build_persistent_session_read(
+            session,
+            total_count=total_count,
         )
         return (
             session_read,
@@ -722,6 +724,31 @@ class AniuService:
             next_before_id,
             has_more,
         )
+
+    def _build_persistent_session_read(
+        self,
+        session: ChatSession,
+        *,
+        total_count: int,
+    ) -> PersistentSessionRead:
+        return PersistentSessionRead(
+            id=session.id,
+            title=session.title,
+            kind=str(session.kind or "automation"),
+            slug=session.slug,
+            created_at=_assume_utc(session.created_at),
+            updated_at=_assume_utc(session.updated_at),
+            last_message_at=_assume_utc(session.last_message_at),
+            message_count=int(total_count),
+            archived_summary=session.archived_summary,
+            summary_revision=int(session.summary_revision or 0),
+            last_compacted_message_id=session.last_compacted_message_id,
+            last_compacted_run_id=session.last_compacted_run_id,
+        )
+
+    def _build_archived_automation_session_slug(self, session_id: int) -> str:
+        timestamp = now_utc().strftime("%Y%m%d%H%M%S")
+        return f"{AUTOMATION_SESSION_SLUG}-archived-{session_id}-{timestamp}"
 
     def delete_run(self, db: Session, run_id: int, *, force: bool = False) -> None:
         run = db.get(StrategyRun, run_id)
