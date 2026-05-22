@@ -785,6 +785,13 @@ def test_enforce_self_select_consistency_auto_fills_missing_actions(
     )
 
     assert merged_decision.get("consistency_autofill_applied") is True
+    consistency_analysis = (merged_decision.get("consistency_analysis") or {}).get(
+        "self_select"
+    )
+    assert isinstance(consistency_analysis, dict)
+    assert consistency_analysis.get("schema") == "consistency_operation_v1"
+    assert consistency_analysis.get("autofill_applied") is True
+    assert len(consistency_analysis.get("operations") or []) == 2
     assert len(executed_actions) == 2
     assert {
         str(item.get("query") or "") for item in executed_actions
@@ -945,6 +952,13 @@ def test_enforce_trade_consistency_auto_fills_missing_actions_when_code_and_quan
     )
 
     assert merged_decision.get("consistency_autofill_applied") is True
+    consistency_analysis = (merged_decision.get("consistency_analysis") or {}).get(
+        "trade"
+    )
+    assert isinstance(consistency_analysis, dict)
+    assert consistency_analysis.get("schema") == "consistency_operation_v1"
+    assert consistency_analysis.get("autofill_applied") is True
+    assert len(consistency_analysis.get("operations") or []) == 1
     assert len(executed_actions) == 1
     assert executed_actions[0]["action"] == "SELL"
     assert executed_actions[0]["symbol"] == "002475"

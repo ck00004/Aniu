@@ -743,12 +743,101 @@ def test_trade_schedule_consistency_autofills_missing_trade_when_code_and_quanti
         assert any(str(item.get("symbol") or "") == "002475" for item in run.executed_actions)
         assert run.decision_payload is not None
         assert run.decision_payload.get("consistency_autofill_applied") is True
+        consistency_analysis = (run.decision_payload.get("consistency_analysis") or {}).get(
+            "trade"
+        )
+        assert isinstance(consistency_analysis, dict)
+        assert consistency_analysis.get("schema") == "consistency_operation_v1"
+        assert len(consistency_analysis.get("materialized_operations") or []) == 1
         with session_scope() as db:
             stored_run = db.get(StrategyRun, run.id)
             orders = db.query(TradeOrder).filter(TradeOrder.run_id == run.id).all()
             assert stored_run is not None
             assert len(orders) == 1
             assert orders[0].action == "SELL"
+
+    reset_db_state()
+
+
+def test_trade_execution_does_not_retry_sell_after_first_failure(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from app.services import aniu_service as aniu_service_module
+
+    class StubClient:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+        def close(self) -> None:
+            return None
+
+    def fake_run_agent_with_messages(
+        *, app_settings, client, messages, emit=None, tool_executor=None
+    ):
+        del app_settings, client, messages, emit
+        arguments = {
+            "action": "SELL",
+            "symbol": "002475",
+            "name": "立讯精密",
+            "quantity": 5000,
+            "price_type": "MARKET",
+        }
+        tool_result = tool_executor("mx_moni_trade", arguments, "call-sell-1")
+        return (
+            {
+                "final_answer": "执行：卖出立讯精密（002475）5000股",
+                "tool_calls": [
+                    {
+                        "id": "call-sell-1",
+                        "name": "mx_moni_trade",
+                        "arguments": arguments,
+                        "result": tool_result,
+                    }
+                ],
+            },
+            {"messages": []},
+            {"responses": [], "final_message": {"content": "planned"}},
+            {"messages": []},
+        )
+
+    call_count = {"value": 0}
+
+    def fake_execute_tool(*, client, app_settings, tool_name, arguments):
+        del client, app_settings, arguments
+        assert tool_name == "mx_moni_trade"
+        call_count["value"] += 1
+        return {
+            "ok": False,
+            "tool_name": tool_name,
+            "error": "upstream uncertain after submit",
+        }
+
+    monkeypatch.setattr(aniu_service_module, "MXClient", StubClient)
+    monkeypatch.setattr(llm_service, "run_agent_with_messages", fake_run_agent_with_messages)
+    monkeypatch.setattr(aniu_service_module.mx_skill_service, "execute_tool", fake_execute_tool)
+    monkeypatch.setattr(
+        aniu_service,
+        "_prefetch_analysis_context",
+        lambda **kwargs: (None, None),
+    )
+
+    with create_test_client(monkeypatch, tmp_path):
+        with session_scope() as db:
+            settings = aniu_service.get_or_create_settings(db)
+            settings.mx_api_key = "mx-key"
+            settings.llm_base_url = "https://example.com/v1"
+            settings.llm_api_key = "llm-key"
+            settings.llm_model = "demo-model"
+            settings.task_prompt = "请执行卖出测试。"
+
+        run = aniu_service.execute_run(trigger_source="manual", manual_run_type="trade")
+
+        assert run.status == "failed"
+        assert call_count["value"] == 1
+        assert len(run.actions) == 1
+        assert run.actions[0].status == "failed_terminal"
+        assert len(run.actions[0].results) == 1
 
     reset_db_state()
 

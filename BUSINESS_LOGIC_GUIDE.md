@@ -371,6 +371,481 @@ Aniu-main 当前是单用户模型，而不是多租户用户系统。
 - TradeOrder 是交易动作结构化存档
 - 账户快照是账户页的兜底数据源
 
+### 6.6 分析任务的完整行为拆解
+
+这里说的“分析任务”包括两类入口：
+
+- 定时任务中 run_type = analysis 的任务
+- 手动运行时未显式指定 trade 的任务
+
+#### 6.6.1 进入分析任务前，系统先冻结哪些输入
+
+在 _prepare_run 阶段，系统会先生成一份 settings_snapshot，并把下面这些信息冻结到本轮运行中：
+
+- 当前 run_type
+- 当前日期是交易日还是非交易日
+- 当前使用的 task_prompt
+- 当前的大模型配置
+- 当前的自动化上下文配置
+- 当前的 Jin10 / CLS 预分析配置
+
+业务含义：
+
+- 分析任务一旦开始，本轮不会再受设置页中途修改影响
+- 手动运行分析时，如果 settings.task_prompt 非空，会优先用它；否则退回手动分析默认 prompt
+
+#### 6.6.2 分析任务的固定前置动作
+
+分析任务在进入大模型前，并不会直接开始问答，而是先做两件事：
+
+1. 资讯预分析
+2. 自动化会话上下文拼装
+
+资讯预分析行为：
+
+- 如果配置了 Jin10 base_url，就先抓取当天 Jin10 新闻并做分块预分析
+- 如果配置了 CLS base_url，就先抓取当天 CLS 电报并做分块预分析
+- 两个来源的诊断结果会合并成 prefetched_context
+- 同时保留 prefetched_context_meta，供运行记录和前端展示使用
+
+自动化会话拼装行为：
+
+- 读取共享 automation 会话
+- 写入一条 user 消息，内容包括时间、触发来源、任务类型、本轮提示词、资讯摘要与运行引导
+- 取最近未压缩的历史消息
+- 必要时把 archived_summary 作为系统级摘要注入
+
+业务含义：
+
+- 分析任务不是“只看本轮 prompt”
+- 它会同时看到长期自动化记忆和当天资讯预分析结果
+
+#### 6.6.3 分析任务实际能看到哪些工具
+
+analysis 模式下，模型能看到的工具集合来自 TOOL_PROFILES.analysis。
+
+当前包括：
+
+- mx_query_market
+- mx_search_news
+- mx_screen_stocks
+- mx_get_positions
+- mx_get_balance
+- mx_get_orders
+- mx_get_self_selects
+- mx_manage_self_select
+
+当前不包括：
+
+- mx_moni_trade
+- mx_moni_cancel
+
+业务含义：
+
+- 现有设计里，分析任务可以读账户、读行情、筛股、查新闻、管理自选
+- 但分析任务本身默认不允许直接下单或撤单
+
+#### 6.6.4 分析任务的模型决策阶段
+
+llm_service.run_agent_with_messages 会驱动一个多轮 tool loop：
+
+1. 给模型发送 messages + analysis 工具集
+2. 模型返回普通文本或 tool_calls
+3. 只读工具会立即执行并回填结果
+4. 变更类工具不会立刻执行真实动作，而是先转成 PlannedActionDraft
+5. 循环直到模型不再调用工具，输出 final_answer
+
+在 analysis 模式下，真正可能进入“先计划、后执行”的变更工具只有：
+
+- mx_manage_self_select
+
+业务含义：
+
+- 分析任务里，自选股变更属于受控执行，不是模型一说就直接改
+- 模型看到的是“计划结果”，真实执行发生在 LLM 阶段之后
+
+#### 6.6.5 分析任务的一致性修正阶段
+
+分析任务结束首次 LLM 决策后，会进入两层一致性检查：
+
+1. 自选股一致性检查
+2. 交易一致性检查
+
+但在现有工具边界下，两者作用不同：
+
+- 自选股一致性检查是 analysis 的核心修正逻辑
+- 交易一致性检查在 analysis 模式下通常为空操作，因为 analysis 模式默认看不到下单/撤单工具
+
+自选股一致性检查会做三件事：
+
+1. 检查 final_answer 是否声称做了自选股增删
+2. 对照 tool_calls 中是否真的存在可解析的自选股动作
+3. 如果声明了但没执行，则先提炼标准 JSON，再基于该 JSON 自动补齐工具计划；补不齐时再要求模型生成纠正文案
+
+当前实现里，这一步不会直接把文本改成工具调用，而是先生成一份标准化的一致性分析对象：
+
+- schema = consistency_operation_v1
+- check_name = self_select
+- claimed_changes: 从结论中提炼出的自选股增删声明
+- existing_actions: 当前已经存在的 planned / executed 动作
+- operations: 需要补齐的标准化操作列表
+- materialized_operations / materialized_tool_calls: 基于 operations 回填出来的计划工具结果
+- autofill_applied: 是否已成功生成补齐计划
+
+这份结构会挂到：
+
+- StrategyRun.decision_payload.consistency_analysis.self_select
+
+业务含义：
+
+- 分析任务里“口头说加入自选”并不算完成
+- 系统要求自然语言结论和工具执行记录对齐
+- 一致性修正的核心输入不再只是原始文本，而是“文本提取后的标准 JSON”
+
+#### 6.6.6 分析任务的执行与落库
+
+如果 analysis 任务形成了自选股计划动作：
+
+- execution_runner_service 会按顺序执行这些计划
+- 自选股这类非交易动作最多尝试 2 次
+- 结果写入 StrategyRunAction / StrategyRunActionResult
+
+最终 run 会落下这些结果：
+
+- StrategyRun.final_answer
+- StrategyRun.analysis_summary
+- StrategyRun.skill_payloads
+- StrategyRun.decision_payload.consistency_analysis
+- StrategyRun.executed_actions
+- 自动化会话 assistant 消息
+
+analysis 任务通常不会生成 TradeOrder，除非你后续放开 analysis 模式下的交易工具。
+
+#### 6.6.7 分析任务的行为结论
+
+可以把当前 analysis 任务理解成：
+
+- 一个带长期上下文和资讯预分析的多轮调研任务
+- 它可以形成观点
+- 它可以受控维护自选股
+- 但默认不直接产生交易委托
+
+### 6.7 交易任务的完整行为拆解
+
+这里说的“交易任务”也包括两类入口：
+
+- 定时任务中 run_type = trade 的任务
+- 手动运行时显式指定 run_type = trade 的任务
+
+#### 6.7.1 交易任务与分析任务共用哪些基础能力
+
+交易任务和分析任务共用这些基础流程：
+
+- settings_snapshot 冻结
+- Jin10 / CLS 资讯预分析
+- 自动化会话上下文拼装
+- 同一套 llm_service 多轮工具调用框架
+- 同一套运行记录、事件流和失败处理框架
+
+业务含义：
+
+- 交易任务不是完全独立的执行器
+- 它是在“分析任务框架”上加了交易工具和交易执行语义
+
+#### 6.7.2 交易任务实际能看到哪些工具
+
+trade 模式下，模型能看到：
+
+- analysis 模式全部公共工具
+- mx_moni_trade
+- mx_moni_cancel
+
+这意味着 trade 模式既能继续查行情/资讯/账户，也能生成真实模拟交易动作。
+
+业务含义：
+
+- 交易任务不是“直接下单页”
+- 它仍然是“先调研，再决定是否执行”的智能任务
+
+#### 6.7.3 交易任务的典型决策顺序
+
+当前源码没有把顺序写死，但典型路径是：
+
+1. 先读账户资金、持仓、委托
+2. 必要时看新闻、查行情、筛股票
+3. 形成 BUY / SELL / CANCEL 计划
+4. 由执行器顺序执行计划动作
+5. 再汇总出最终自然语言结论
+
+业务含义：
+
+- 交易任务的本质不是一句“买某只股票”
+- 而是“基于账户约束和外部信息，形成并执行一组交易动作”
+
+#### 6.7.4 交易任务的一致性修正阶段
+
+trade 路径和 analysis 路径最大的差异之一，是一致性修正逻辑的重点不同。
+
+当前规则：
+
+- self_select consistency 在 trade 模式下直接跳过修正，只保留动作抽取结果
+- trade consistency 才是 trade 模式的核心修正逻辑
+
+trade consistency 会检查：
+
+1. final_answer 是否声称已经买入、卖出或撤单
+2. tool_calls 中是否真的存在对应的交易动作
+3. 如果声明了但没执行，能否从结论中解析出明确 action / code / quantity
+
+修正策略按优先级分三层：
+
+1. 能明确解析时，系统先生成标准 JSON，再根据该 JSON 自动补一条受限交易工具计划
+2. 不能自动补时，要求模型再输出一轮纠正文案
+3. 最终仍会把结论修饰为与执行记录一致
+
+当前交易一致性阶段也会先生成一份标准化结构：
+
+- schema = consistency_operation_v1
+- check_name = trade
+- claimed_changes: 从结论里识别出的买卖撤声明
+- executable_claims: 可直接转成委托参数的交易声明
+- existing_actions: 当前已有的 planned / executed 动作
+- operations: 待补齐的交易操作列表
+- operation_key: action + symbol + quantity + price_type + price 的去重键
+- materialized_operations / materialized_tool_calls: 基于 operations 生成的计划工具结果
+- autofill_applied: 是否已成功生成补齐计划
+
+这份结构会挂到：
+
+- StrategyRun.decision_payload.consistency_analysis.trade
+
+业务含义：
+
+- trade 模式要求“说过的交易动作尽量真实落地”
+- 它不是只修文案，而是优先补执行计划
+- 同一条交易声明会先经过标准 JSON 去重，再决定是否补计划，避免一致性阶段重复补单
+
+#### 6.7.5 交易计划如何真正执行
+
+交易任务的变更工具不会在 LLM 阶段直接落单，而是分两层：
+
+第一层：execution_plan_service
+
+- 校验 action / symbol / quantity / price_type / price / order_id
+- 生成 PlannedActionDraft
+- 不做真实下单，只生成计划
+
+第二层：execution_runner_service
+
+- 按 sequence_no 顺序执行计划
+- BUY / SELL 计划动作强制单次提交
+- MANAGE_SELF_SELECT、CANCEL 等非买卖动作仍可按默认最多 2 次尝试
+- 每次尝试都写入 StrategyRunActionResult
+- 最终把成功动作归一化成 executed_actions
+
+业务含义：
+
+- 模型负责“决定做什么”
+- 执行器负责“按平台规则真正去做”
+- 当前系统已经显式避免 BUY / SELL 自动重试导致的重复买卖风险
+
+#### 6.7.6 哪些交易动作会真正写入 TradeOrder
+
+当前只有 executed_actions 里的以下动作会写入 TradeOrder：
+
+- BUY
+- SELL
+
+不会写入 TradeOrder 的包括：
+
+- CANCEL
+- MANAGE_SELF_SELECT
+
+它们仍然会留在：
+
+- StrategyRun.executed_actions
+- StrategyRun.skill_payloads
+- StrategyRunAction / StrategyRunActionResult
+
+业务含义：
+
+- TradeOrder 不是“所有执行动作总表”
+- 它只是买卖委托的结构化存档
+
+#### 6.7.7 为什么交易任务有时会有结论但仍然失败
+
+trade 任务的失败不只由大模型调用是否成功决定。
+
+只要出现下面任一情况，run 都可能被标成 failed：
+
+- 计划动作未完全执行
+- BUY / SELL 单次提交失败
+- 非交易动作重试后仍失败
+- execution_summary 里 unresolved_count 大于 0
+
+此时系统仍可能同时存在：
+
+- final_answer
+- 部分 executed_actions
+- 部分成功的工具调用
+- decision_payload.consistency_analysis
+
+业务含义：
+
+- “有结论”不等于“执行完全成功”
+- run.status 反映的是整轮业务闭环是否完整落地
+
+### 6.8 分析与交易的行为差异矩阵
+
+| 维度 | analysis | trade |
+|------|------|------|
+| 手动入口默认类型 | 默认 | 需显式指定 |
+| 定时入口常见任务名 | 盘前分析、午间复盘、收盘分析、夜间分析 | 上午运行X号、下午运行X号 |
+| 工具集 | 公共工具 + 自选股管理 | 公共工具 + 自选股管理 + 下单/撤单 |
+| 允许的核心变更动作 | 自选股增删 | 买入、卖出、撤单、自选股增删 |
+| 一致性修正重点 | 自选股声明是否真实执行 | 交易声明是否真实执行 |
+| self_select consistency | 启用 | 基本跳过修正 |
+| trade consistency | 通常为空操作 | 核心修正逻辑 |
+| 一致性中间产物 | consistency_operation_v1 self_select JSON | consistency_operation_v1 trade JSON |
+| 典型副作用 | 更新自动化记忆、可能更新自选股 | 更新自动化记忆、可能写入 TradeOrder |
+| 是否默认写 TradeOrder | 否 | 是，但仅 BUY / SELL |
+| 变更动作重试 | 自选股等非交易动作最多 2 次 | BUY / SELL 单次提交，非交易动作最多 2 次 |
+| 最终失败常见原因 | LLM 失败、自选股执行失败 | LLM 失败、交易计划未完全落地 |
+
+### 6.9 这套逻辑里最容易被误判的几个点
+
+#### 6.9.1 交易任务也会先做资讯预分析
+
+当前 _run_body 在 analysis 和 trade 两条路径上，都会先调用 _prefetch_analysis_context。
+
+业务含义：
+
+- trade 不是“只看账户然后下单”
+- 它同样会引入当天 Jin10 / CLS 的预分析结果作为上下文
+
+#### 6.9.2 分析和交易默认共享同一个自动化会话
+
+当前 automation 会话是共享的，而不是按 run_type 隔离。
+
+业务含义：
+
+- 昨天的分析结论会进入今天的交易上下文
+- 今天的交易失败信息也会进入下一轮分析上下文
+
+如果后续要做逻辑隔离，首先要改的是自动化会话路由，而不是 prompt。
+
+#### 6.9.3 模型调用变更工具，不等于动作已经执行
+
+在当前设计里：
+
+- mutation tool 在 LLM 阶段多数只是生成计划
+- 一致性修正阶段生成的 materialized_tool_calls 也只是计划结果，不是最终成交结果
+- 真正执行发生在 execution_runner_service
+
+业务含义：
+
+- 看见 tool_calls 里有 mx_moni_trade，不代表账户里一定已有对应委托
+- 看见 decision_payload.consistency_analysis 里有 operations，也不代表这些动作已经执行成功
+- 真正执行结果应以 executed_actions、StrategyRunActionResult 和 TradeOrder 为准
+
+#### 6.9.4 run.status = failed 并不代表整轮没有产出
+
+当前失败语义是“整轮闭环未完全落地”，不是“完全没有输出”。
+
+因此 failed run 仍可能同时拥有：
+
+- final_answer
+- tool_calls
+- partial executed_actions
+- 自动化会话里的失败 assistant 消息
+
+#### 6.9.5 取消委托不会进入 TradeOrder
+
+这不是遗漏，而是当前的数据建模选择。
+
+业务含义：
+
+- 如果你想做“全部动作流水”，应该优先看 StrategyRunAction / StrategyRunActionResult
+- 而不是扩展 TradeOrder 去承载所有动作类型
+
+#### 6.9.6 “每条动作最多尝试 2 次”不再适用于买卖委托
+
+当前这个说法只对非交易动作仍然成立。
+
+现在 execution_runner_service 会按 action_type 区分：
+
+- BUY / SELL: 单次提交
+- 其他动作: 仍按默认上限尝试
+
+业务含义：
+
+- 这是为了避免上游在第一次已提交但返回不确定失败时，自动重试再次发出同一笔买卖委托
+- 如果你要恢复 BUY / SELL 自动重试，必须同时设计幂等键或委托去重机制，否则风险很高
+
+### 6.10 后续调整逻辑时，优先改哪一层
+
+#### 想改“分析任务能不能直接下单”
+
+优先看：
+
+- backend/skills/mx_core/tool_specs.py 中的 TOOL_PROFILES.analysis
+- backend/app/services/aniu_service.py 中的 analysis 一致性与执行阶段
+
+#### 想改“交易任务是否必须先读账户再下单”
+
+优先看：
+
+- trade_execution_guidance prompt
+- llm_service 的 tool loop
+- 可能需要新增执行前校验，而不是只改提示词
+
+#### 想改“分析和交易是否共享上下文”
+
+优先看：
+
+- _get_or_create_persistent_session
+- _prepare_persistent_session_context
+- automation_session_id 的维护方式
+
+#### 想改“资讯预分析只用于分析、不用于交易”
+
+优先看：
+
+- _run_body 中 _prefetch_analysis_context 的调用位置
+- prefetched_context 写入 user 消息的逻辑
+
+#### 想改“交易失败的判定口径”
+
+优先看：
+
+- execution_reconcile_service
+- execution_runner_service._summarize_actions
+- build_run_error_message
+
+#### 想改“一致性修正提取出来的标准 JSON”
+
+优先看：
+
+- aniu_service._merge_consistency_analysis
+- aniu_service._materialize_consistency_operations
+- aniu_service._build_self_select_consistency_autofill_tool_calls
+- aniu_service._analyze_trade_consistency
+
+#### 想改“BUY / SELL 是否允许自动重试”
+
+优先看：
+
+- execution_runner_service.execute_plan
+- execution_runner_service._resolve_action_max_attempts
+- 如果要恢复重试，必须先补交易幂等或重复委托识别逻辑
+
+#### 想改“哪些动作要落到 TradeOrder”
+
+优先看：
+
+- _run_body 中 persisted_trade_orders 的构造逻辑
+- TradeOrder 表的语义是否仍只表示买卖委托
+
 ---
 
 ## 7. 自动化会话业务

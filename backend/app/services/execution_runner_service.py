@@ -72,8 +72,15 @@ class ExecutionRunnerService:
         execution_tool_calls: list[dict[str, Any]] = []
 
         for action_id in action_ids:
+            action_snapshot = self._get_action(action_id)
+            if action_snapshot is None:
+                continue
+            effective_max_attempts = self._resolve_action_max_attempts(
+                action_snapshot,
+                requested_max_attempts=max_attempts,
+            )
             attempt = 0
-            while attempt < max_attempts:
+            while attempt < effective_max_attempts:
                 attempt += 1
                 action = self._mark_action_executing(action_id)
                 if action is None:
@@ -123,7 +130,7 @@ class ExecutionRunnerService:
                     action_id=action.id,
                     attempt_no=attempt,
                     result=result,
-                    max_attempts=max_attempts,
+                    max_attempts=effective_max_attempts,
                 )
                 if success:
                     if normalized_action is not None:
@@ -148,6 +155,26 @@ class ExecutionRunnerService:
                     .order_by(StrategyRunAction.sequence_no.asc(), StrategyRunAction.id.asc())
                 ).all()
             )
+
+    def _get_action(self, action_id: int) -> StrategyRunAction | None:
+        with session_scope() as db:
+            action = db.get(StrategyRunAction, action_id)
+            if action is None:
+                return None
+            db.expunge(action)
+            return action
+
+    def _resolve_action_max_attempts(
+        self,
+        action: StrategyRunAction,
+        *,
+        requested_max_attempts: int,
+    ) -> int:
+        normalized_attempts = max(1, int(requested_max_attempts or 1))
+        action_type = str(action.action_type or "").upper()
+        if action_type in {"BUY", "SELL"}:
+            return 1
+        return normalized_attempts
 
     def _mark_action_executing(self, action_id: int) -> StrategyRunAction | None:
         with session_scope() as db:

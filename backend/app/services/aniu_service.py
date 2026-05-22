@@ -3256,6 +3256,128 @@ class AniuService:
             default_status="submitted",
         )
 
+    def _merge_consistency_analysis(
+        self,
+        decision: dict[str, Any],
+        *,
+        check_name: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        normalized_decision = dict(decision)
+        consistency_analysis = (
+            dict(normalized_decision.get("consistency_analysis"))
+            if isinstance(normalized_decision.get("consistency_analysis"), dict)
+            else {}
+        )
+        consistency_analysis[check_name] = payload
+        normalized_decision["consistency_analysis"] = consistency_analysis
+        return normalized_decision
+
+    def _build_trade_action_key(
+        self,
+        *,
+        action: Any,
+        symbol: Any,
+        quantity: Any,
+        price_type: Any,
+        price: Any,
+    ) -> tuple[str, str, int, str, str | None]:
+        try:
+            normalized_quantity = int(quantity or 0)
+        except (TypeError, ValueError):
+            normalized_quantity = 0
+        normalized_price_type = str(price_type or "MARKET").upper()
+        normalized_price: str | None = None
+        if price not in {None, ""}:
+            try:
+                normalized_price = f"{float(price):.6f}".rstrip("0").rstrip(".")
+            except (TypeError, ValueError):
+                normalized_price = str(price)
+        return (
+            str(action or "").upper(),
+            str(symbol or "").strip(),
+            normalized_quantity,
+            normalized_price_type,
+            normalized_price,
+        )
+
+    def _materialize_consistency_operations(
+        self,
+        *,
+        settings: Any,
+        client: MXClient,
+        analysis: dict[str, Any],
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        operations = analysis.get("operations")
+        if not isinstance(operations, list) or not operations:
+            normalized_analysis = dict(analysis)
+            normalized_analysis.setdefault("materialized_operations", [])
+            normalized_analysis.setdefault("materialized_tool_calls", [])
+            normalized_analysis["autofill_applied"] = False
+            return normalized_analysis, []
+
+        normalized_analysis = dict(analysis)
+        materialized_operations: list[dict[str, Any]] = []
+        materialized_tool_calls: list[dict[str, Any]] = []
+        run_type = str(getattr(settings, "run_type", "analysis") or "analysis")
+
+        for raw_operation in operations:
+            if not isinstance(raw_operation, dict):
+                continue
+            tool_name = str(raw_operation.get("tool_name") or "").strip()
+            if not tool_name:
+                continue
+
+            arguments = (
+                dict(raw_operation.get("arguments"))
+                if isinstance(raw_operation.get("arguments"), dict)
+                else {}
+            )
+            tool_call_id = str(raw_operation.get("tool_call_id") or "").strip() or None
+            sequence_no = int(raw_operation.get("sequence_no") or 0)
+
+            try:
+                tool_result, _draft = execution_plan_service.execute_tool(
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    tool_call_id=tool_call_id,
+                    context={
+                        "client": client,
+                        "app_settings": settings,
+                        "run_type": run_type,
+                    },
+                    sequence_no=sequence_no,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "consistency operation materialize failed: check=%s tool=%s error=%s",
+                    analysis.get("check_name"),
+                    tool_name,
+                    exc,
+                )
+                tool_result = {
+                    "ok": False,
+                    "tool_name": tool_name,
+                    "error": str(exc),
+                }
+
+            tool_call = {
+                "id": tool_call_id,
+                "name": tool_name,
+                "arguments": arguments,
+                "result": tool_result,
+            }
+            materialized_tool_calls.append(tool_call)
+
+            materialized_operation = dict(raw_operation)
+            materialized_operation["result"] = tool_result
+            materialized_operations.append(materialized_operation)
+
+        normalized_analysis["materialized_operations"] = materialized_operations
+        normalized_analysis["materialized_tool_calls"] = materialized_tool_calls
+        normalized_analysis["autofill_applied"] = bool(materialized_tool_calls)
+        return normalized_analysis, materialized_tool_calls
+
     def _clean_self_select_target(self, raw_target: Any) -> str:
         text = str(raw_target or "").strip()
         if not text:
@@ -3593,37 +3715,53 @@ class AniuService:
 
         return claims
 
-    def _build_trade_consistency_autofill_tool_calls(
+    def _analyze_trade_consistency(
         self,
         *,
-        settings: Any,
-        client: MXClient,
         final_answer: Any,
         tool_calls: Any,
-    ) -> list[dict[str, Any]]:
+        run_type: str,
+        gap_detected: bool | None = None,
+    ) -> dict[str, Any]:
         existing_tool_calls = tool_calls if isinstance(tool_calls, list) else []
         existing_actions = self._extract_planned_actions(existing_tool_calls)
         if not existing_actions:
             existing_actions = self._extract_executed_actions(existing_tool_calls)
 
-        existing_trade_keys: set[tuple[str, str]] = set()
+        existing_trade_keys: set[tuple[str, str, int, str, str | None]] = set()
         for item in existing_actions:
             if not isinstance(item, dict):
                 continue
             action = str(item.get("action") or "").upper()
             symbol = str(item.get("symbol") or "").strip()
-            if action in {"BUY", "SELL"} and symbol:
-                existing_trade_keys.add((action, symbol))
+            if action not in {"BUY", "SELL"} or not symbol:
+                continue
+            existing_trade_keys.add(
+                self._build_trade_action_key(
+                    action=action,
+                    symbol=symbol,
+                    quantity=item.get("quantity"),
+                    price_type=item.get("price_type"),
+                    price=item.get("price"),
+                )
+            )
 
         sequence_no = len(existing_actions)
-        autofill_tool_calls: list[dict[str, Any]] = []
+        operations: list[dict[str, Any]] = []
         for claim in self._extract_executable_trade_claims(final_answer):
             action = str(claim.get("action") or "").upper()
             symbol = str(claim.get("symbol") or "").strip()
             if action not in {"BUY", "SELL"} or not symbol:
                 continue
-            key = (action, symbol)
-            if key in existing_trade_keys:
+
+            operation_key = self._build_trade_action_key(
+                action=action,
+                symbol=symbol,
+                quantity=claim.get("quantity"),
+                price_type=claim.get("price_type"),
+                price=claim.get("price"),
+            )
+            if operation_key in existing_trade_keys:
                 continue
 
             arguments: dict[str, Any] = {
@@ -3639,40 +3777,57 @@ class AniuService:
                 arguments["price"] = claim.get("price")
 
             sequence_no += 1
-            try:
-                tool_result, _draft = execution_plan_service.execute_tool(
-                    tool_name="mx_moni_trade",
-                    arguments=arguments,
-                    tool_call_id=f"consistency-trade-{sequence_no}",
-                    context={
-                        "client": client,
-                        "app_settings": settings,
-                        "run_type": str(
-                            getattr(settings, "run_type", "trade") or "trade"
-                        ),
-                    },
-                    sequence_no=sequence_no,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "trade consistency autofill skipped: action=%s symbol=%s error=%s",
-                    action,
-                    symbol,
-                    exc,
-                )
-                continue
-
-            autofill_tool_calls.append(
+            operations.append(
                 {
-                    "id": f"consistency-trade-{sequence_no}",
-                    "name": "mx_moni_trade",
+                    "sequence_no": sequence_no,
+                    "tool_call_id": f"consistency-trade-{sequence_no}",
+                    "tool_name": "mx_moni_trade",
+                    "action_type": action,
+                    "operation_key": ":".join(
+                        str(part) for part in operation_key if part not in {None, ""}
+                    ),
+                    "claim": claim,
                     "arguments": arguments,
-                    "result": tool_result,
                 }
             )
-            existing_trade_keys.add(key)
+            existing_trade_keys.add(operation_key)
 
-        return autofill_tool_calls
+        return {
+            "schema": "consistency_operation_v1",
+            "check_name": "trade",
+            "run_type": str(run_type or "trade"),
+            "gap_detected": (
+                bool(gap_detected)
+                if gap_detected is not None
+                else self._has_trade_consistency_gap(final_answer, existing_actions)
+            ),
+            "claimed_changes": self._extract_claimed_trade_changes(final_answer),
+            "executable_claims": self._extract_executable_trade_claims(final_answer),
+            "existing_actions": existing_actions,
+            "operations": operations,
+            "autofill_ready": bool(operations),
+        }
+
+    def _build_trade_consistency_autofill_tool_calls(
+        self,
+        *,
+        settings: Any,
+        client: MXClient,
+        final_answer: Any,
+        tool_calls: Any,
+        gap_detected: bool | None = None,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        analysis = self._analyze_trade_consistency(
+            final_answer=final_answer,
+            tool_calls=tool_calls,
+            run_type=str(getattr(settings, "run_type", "trade") or "trade"),
+            gap_detected=gap_detected,
+        )
+        return self._materialize_consistency_operations(
+            settings=settings,
+            client=client,
+            analysis=analysis,
+        )
 
     def _extract_actual_trade_changes(
         self, executed_actions: list[dict[str, Any]] | Any
@@ -3844,16 +3999,14 @@ class AniuService:
         client: MXClient,
         final_answer: Any,
         tool_calls: Any,
-    ) -> list[dict[str, Any]]:
+        gap_detected: bool | None = None,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         existing_tool_calls = tool_calls if isinstance(tool_calls, list) else []
         existing_actions = self._extract_planned_actions(existing_tool_calls)
         if not existing_actions:
             existing_actions = self._extract_executed_actions(existing_tool_calls)
 
         claimed_changes = self._extract_claimed_self_select_changes(final_answer)
-        if not claimed_changes:
-            return []
-
         actual_targets_by_action: dict[str, set[str]] = {
             "add": set(),
             "remove": set(),
@@ -3868,7 +4021,7 @@ class AniuService:
                 )
 
         sequence_no = len(existing_actions)
-        autofill_tool_calls: list[dict[str, Any]] = []
+        operations: list[dict[str, Any]] = []
         for item in claimed_changes:
             action = str(item.get("action") or "").strip()
             target = self._clean_self_select_target(item.get("target"))
@@ -3885,43 +4038,39 @@ class AniuService:
                 if action == "add"
                 else f"将{target}从自选股删除"
             )
-            arguments = {"query": query}
             sequence_no += 1
-            try:
-                tool_result, _draft = execution_plan_service.execute_tool(
-                    tool_name="mx_manage_self_select",
-                    arguments=arguments,
-                    tool_call_id=f"consistency-self-select-{sequence_no}",
-                    context={
-                        "client": client,
-                        "app_settings": settings,
-                        "run_type": str(
-                            getattr(settings, "run_type", "analysis")
-                            or "analysis"
-                        ),
-                    },
-                    sequence_no=sequence_no,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "self-select consistency autofill skipped: action=%s target=%s error=%s",
-                    action,
-                    target,
-                    exc,
-                )
-                continue
-
-            autofill_tool_calls.append(
+            operations.append(
                 {
-                    "id": f"consistency-self-select-{sequence_no}",
-                    "name": "mx_manage_self_select",
-                    "arguments": arguments,
-                    "result": tool_result,
+                    "sequence_no": sequence_no,
+                    "tool_call_id": f"consistency-self-select-{sequence_no}",
+                    "tool_name": "mx_manage_self_select",
+                    "action_type": "MANAGE_SELF_SELECT",
+                    "operation_key": f"self-select:{action}:{target}",
+                    "claim": item,
+                    "arguments": {"query": query},
                 }
             )
             actual_targets_by_action[action].update(claimed_tokens)
 
-        return autofill_tool_calls
+        analysis = {
+            "schema": "consistency_operation_v1",
+            "check_name": "self_select",
+            "run_type": str(getattr(settings, "run_type", "analysis") or "analysis"),
+            "gap_detected": (
+                bool(gap_detected)
+                if gap_detected is not None
+                else self._has_self_select_consistency_gap(final_answer, existing_actions)
+            ),
+            "claimed_changes": claimed_changes,
+            "existing_actions": existing_actions,
+            "operations": operations,
+            "autofill_ready": bool(operations),
+        }
+        return self._materialize_consistency_operations(
+            settings=settings,
+            client=client,
+            analysis=analysis,
+        )
 
     def _has_self_select_consistency_gap(
         self, final_answer: Any, executed_actions: list[dict[str, Any]] | Any
@@ -4138,9 +4287,21 @@ class AniuService:
         if not planned_actions:
             planned_actions = self._extract_executed_actions(tool_calls)
         final_answer = decision.get("final_answer")
+        has_gap = self._has_self_select_consistency_gap(final_answer, planned_actions)
+        consistency_analysis, _ = self._build_self_select_consistency_autofill_tool_calls(
+            settings=settings,
+            client=client,
+            final_answer=final_answer,
+            tool_calls=tool_calls,
+            gap_detected=has_gap,
+        )
+        normalized_decision = self._merge_consistency_analysis(
+            dict(decision),
+            check_name="self_select",
+            payload=consistency_analysis,
+        )
 
-        if not self._has_self_select_consistency_gap(final_answer, planned_actions):
-            normalized_decision = dict(decision)
+        if not has_gap:
             normalized_decision["final_answer"] = self._finalize_self_select_consistency(
                 final_answer,
                 planned_actions,
@@ -4153,11 +4314,12 @@ class AniuService:
                 planned_actions,
             )
 
-        autofill_tool_calls = self._build_self_select_consistency_autofill_tool_calls(
+        consistency_analysis, autofill_tool_calls = self._build_self_select_consistency_autofill_tool_calls(
             settings=settings,
             client=client,
             final_answer=final_answer,
             tool_calls=tool_calls,
+            gap_detected=has_gap,
         )
         if autofill_tool_calls:
             _emit(
@@ -4167,7 +4329,11 @@ class AniuService:
             )
             combined_tool_calls = list(tool_calls) if isinstance(tool_calls, list) else []
             combined_tool_calls.extend(autofill_tool_calls)
-            merged_decision = dict(decision)
+            merged_decision = self._merge_consistency_analysis(
+                normalized_decision,
+                check_name="self_select",
+                payload=consistency_analysis,
+            )
             merged_decision["tool_calls"] = combined_tool_calls
             merged_decision["original_final_answer"] = (
                 str(final_answer or "").strip() or None
@@ -4195,7 +4361,6 @@ class AniuService:
 
         messages = runtime_trace.get("messages") if isinstance(runtime_trace, dict) else None
         if not isinstance(messages, list) or not messages:
-            normalized_decision = dict(decision)
             normalized_decision["final_answer"] = self._finalize_self_select_consistency(
                 final_answer,
                 planned_actions,
@@ -4297,9 +4462,20 @@ class AniuService:
         if not planned_actions:
             planned_actions = self._extract_executed_actions(tool_calls)
         final_answer = decision.get("final_answer")
+        has_gap = self._has_trade_consistency_gap(final_answer, planned_actions)
+        consistency_analysis = self._analyze_trade_consistency(
+            final_answer=final_answer,
+            tool_calls=tool_calls,
+            run_type=str(getattr(settings, "run_type", "trade") or "trade"),
+            gap_detected=has_gap,
+        )
+        normalized_decision = self._merge_consistency_analysis(
+            dict(decision),
+            check_name="trade",
+            payload=consistency_analysis,
+        )
 
-        if not self._has_trade_consistency_gap(final_answer, planned_actions):
-            normalized_decision = dict(decision)
+        if not has_gap:
             normalized_decision["final_answer"] = self._finalize_trade_consistency(
                 final_answer,
                 planned_actions,
@@ -4312,11 +4488,12 @@ class AniuService:
                 planned_actions,
             )
 
-        autofill_tool_calls = self._build_trade_consistency_autofill_tool_calls(
+        consistency_analysis, autofill_tool_calls = self._build_trade_consistency_autofill_tool_calls(
             settings=settings,
             client=client,
             final_answer=final_answer,
             tool_calls=tool_calls,
+            gap_detected=has_gap,
         )
         if autofill_tool_calls:
             _emit(
@@ -4326,7 +4503,11 @@ class AniuService:
             )
             combined_tool_calls = list(tool_calls) if isinstance(tool_calls, list) else []
             combined_tool_calls.extend(autofill_tool_calls)
-            merged_decision = dict(decision)
+            merged_decision = self._merge_consistency_analysis(
+                normalized_decision,
+                check_name="trade",
+                payload=consistency_analysis,
+            )
             merged_decision["tool_calls"] = combined_tool_calls
             merged_decision["original_final_answer"] = (
                 str(final_answer or "").strip() or None
@@ -4354,7 +4535,6 @@ class AniuService:
 
         messages = runtime_trace.get("messages") if isinstance(runtime_trace, dict) else None
         if not isinstance(messages, list) or not messages:
-            normalized_decision = dict(decision)
             normalized_decision["final_answer"] = self._finalize_trade_consistency(
                 final_answer,
                 planned_actions,
