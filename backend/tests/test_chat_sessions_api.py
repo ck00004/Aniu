@@ -83,6 +83,23 @@ def build_docx_bytes(*paragraphs: str) -> bytes:
     return buffer.getvalue()
 
 
+def wrap_chat_with_details(fake_chat):
+    def _fake_chat_with_details(**kwargs):
+        final_answer = fake_chat(**kwargs)
+        messages = kwargs.get("messages")
+        return {
+            "final_answer": final_answer,
+            "tool_calls": [],
+            "llm_request": {},
+            "llm_response": {},
+            "messages": list(messages) if isinstance(messages, list) else [],
+            "initial_message_count": len(messages) if isinstance(messages, list) else 0,
+            "replay_messages": [],
+        }
+
+    return _fake_chat_with_details
+
+
 def test_chat_session_stream_builds_multimodal_attachment_history_without_duplicate_user_message(
     monkeypatch, tmp_path
 ) -> None:
@@ -97,7 +114,7 @@ def test_chat_session_stream_builds_multimodal_attachment_history_without_duplic
             emit("completed", message="Answer")
         return "Answer"
 
-    monkeypatch.setattr(llm_service, "chat", fake_chat)
+    monkeypatch.setattr(llm_service, "chat_with_details", wrap_chat_with_details(fake_chat))
 
     with create_test_client(monkeypatch, tmp_path):
         with session_scope() as db:
@@ -185,7 +202,7 @@ def test_chat_session_stream_extracts_docx_attachment_text_for_attachment_only_m
             emit("completed", message="Document answer")
         return "Document answer"
 
-    monkeypatch.setattr(llm_service, "chat", fake_chat)
+    monkeypatch.setattr(llm_service, "chat_with_details", wrap_chat_with_details(fake_chat))
 
     with create_test_client(monkeypatch, tmp_path):
         with session_scope() as db:
@@ -255,7 +272,7 @@ def test_chat_stream_endpoint_accepts_attachment_only_message(
             emit("completed", message="OK")
         return "OK"
 
-    monkeypatch.setattr(llm_service, "chat", fake_chat)
+    monkeypatch.setattr(llm_service, "chat_with_details", wrap_chat_with_details(fake_chat))
 
     with create_test_client(monkeypatch, tmp_path) as client:
         headers = auth_headers(client)
@@ -306,7 +323,7 @@ def test_chat_session_stream_persists_failed_assistant_message(
             emit("final_delta", delta="Partial answer")
         raise RuntimeError("model unavailable")
 
-    monkeypatch.setattr(llm_service, "chat", fake_chat)
+    monkeypatch.setattr(llm_service, "chat_with_details", wrap_chat_with_details(fake_chat))
 
     with create_test_client(monkeypatch, tmp_path):
         with session_scope() as db:
@@ -358,7 +375,7 @@ def test_chat_session_stream_persists_partial_message_when_client_disconnects(
             pass
         return "Partial answer"
 
-    monkeypatch.setattr(llm_service, "chat", fake_chat)
+    monkeypatch.setattr(llm_service, "chat_with_details", wrap_chat_with_details(fake_chat))
 
     with create_test_client(monkeypatch, tmp_path):
         with session_scope() as db:
@@ -435,7 +452,7 @@ def test_chat_session_stream_matches_tool_calls_by_tool_call_id(
             emit("completed", message="Done")
         return "Done"
 
-    monkeypatch.setattr(llm_service, "chat", fake_chat)
+    monkeypatch.setattr(llm_service, "chat_with_details", wrap_chat_with_details(fake_chat))
 
     with create_test_client(monkeypatch, tmp_path):
         with session_scope() as db:

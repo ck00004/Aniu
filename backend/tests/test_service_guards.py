@@ -11,6 +11,7 @@ from app.db.database import init_db
 from app.db.models import StrategyRun, StrategySchedule
 from app.schemas.aniu import ScheduleUpdate
 from app.services.aniu_service import aniu_service
+from app.services.chat_session_service import chat_session_service
 from app.services.execution_plan_service import execution_plan_service
 from app.services.jin10_news_service import Jin10NewsService
 from app.services.mx_skill_service import mx_skill_service
@@ -1246,9 +1247,55 @@ def test_build_request_payload_from_messages_does_not_enable_thinking_for_other_
     assert "thinking" not in payload
 
 
+def test_build_request_payload_from_messages_enables_deepseek_v4_pro_reasoning() -> None:
+    app_settings = SimpleNamespace(
+        llm_model="deepseek-v4-pro",
+        system_prompt="system",
+        run_type="analysis",
+        prompt_templates=None,
+    )
+
+    payload = llm_service.build_request_payload_from_messages(
+        app_settings=app_settings,
+        messages=[{"role": "user", "content": "hi"}],
+    )
+
+    assert payload["thinking"] == {"type": "enabled"}
+    assert payload["reasoning_effort"] == "max"
+    assert "temperature" not in payload
+
+
+def test_generate_text_strips_temperature_for_deepseek_v4_pro(monkeypatch) -> None:
+    captured_payloads: list[dict[str, object]] = []
+
+    def fake_call_llm_stream(*, payload, **kwargs):
+        del kwargs
+        captured_payloads.append(payload)
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    monkeypatch.setattr(llm_service, "_call_llm_stream", fake_call_llm_stream)
+
+    text, request_payload, _response_payload = llm_service.generate_text(
+        model="deepseek-v4-pro",
+        base_url="https://example.com/v1",
+        api_key="token",
+        system_prompt="system",
+        messages=[{"role": "user", "content": "hello"}],
+    )
+
+    assert text == "ok"
+    assert request_payload["thinking"] == {"type": "enabled"}
+    assert request_payload["reasoning_effort"] == "high"
+    assert "temperature" not in request_payload
+    assert captured_payloads[0]["thinking"] == {"type": "enabled"}
+    assert captured_payloads[0]["reasoning_effort"] == "high"
+    assert "temperature" not in captured_payloads[0]
+
+
 def test_consume_llm_stream_uses_fresh_http_client_per_request(monkeypatch) -> None:
     service = LLMService()
     created_timeouts: list[int] = []
+    created_clients: list[object] = []
     client_ids: list[int] = []
 
     class FakeResponse:
@@ -1283,7 +1330,9 @@ def test_consume_llm_stream_uses_fresh_http_client_per_request(monkeypatch) -> N
 
     def fake_create_http_client(timeout_seconds: int):
         created_timeouts.append(timeout_seconds)
-        return FakeClient()
+        client = FakeClient()
+        created_clients.append(client)
+        return client
 
     monkeypatch.setattr(service, "_create_http_client", fake_create_http_client)
     monkeypatch.setattr(
@@ -1310,7 +1359,8 @@ def test_consume_llm_stream_uses_fresh_http_client_per_request(monkeypatch) -> N
 
     assert created_timeouts == [5, 7]
     assert len(client_ids) == 2
-    assert client_ids[0] != client_ids[1]
+    assert len(created_clients) == 2
+    assert created_clients[0] is not created_clients[1]
 
 
 def test_consume_llm_stream_reads_json_error_body_from_stream(monkeypatch) -> None:
@@ -1697,6 +1747,134 @@ def test_agent_loop_replays_reasoning_content_for_mimo_tool_turns() -> None:
         if message.get("role") == "assistant" and message.get("tool_calls")
     )
     assert assistant_message["reasoning_content"] == "我先查账户和持仓。"
+
+
+def test_extract_turn_replay_messages_keeps_assistant_reasoning_and_tool_messages() -> None:
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "请分析"},
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "先查账户。",
+            "tool_calls": [
+                {
+                    "id": "tool-1",
+                    "type": "function",
+                    "function": {"name": "demo_tool", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "tool-1",
+            "content": '{"ok": true}',
+        },
+        {
+            "role": "assistant",
+            "content": "最终结论。",
+            "reasoning_content": "工具结果已经足够。",
+        },
+    ]
+
+    replay_messages = LLMService.extract_turn_replay_messages(
+        messages,
+        initial_message_count=2,
+    )
+
+    assert [item["role"] for item in replay_messages] == ["assistant", "tool", "assistant"]
+    assert replay_messages[0]["reasoning_content"] == "先查账户。"
+    assert replay_messages[0]["tool_calls"][0]["id"] == "tool-1"
+    assert replay_messages[1]["tool_call_id"] == "tool-1"
+    assert replay_messages[2]["content"] == "最终结论。"
+
+
+def test_chat_history_messages_replay_meta_payload_messages() -> None:
+    records = [
+        SimpleNamespace(
+            role="user",
+            content="请分析市场",
+            attachments=None,
+            meta_payload=None,
+        ),
+        SimpleNamespace(
+            role="assistant",
+            content="展示给用户的摘要",
+            attachments=None,
+            meta_payload={
+                "replay_messages": [
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "先查账户。",
+                        "tool_calls": [
+                            {
+                                "id": "tool-1",
+                                "type": "function",
+                                "function": {"name": "demo_tool", "arguments": "{}"},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "tool-1",
+                        "content": '{"ok": true}',
+                    },
+                    {"role": "assistant", "content": "最终结论。"},
+                ]
+            },
+        ),
+    ]
+
+    messages = chat_session_service._build_history_messages(records)
+
+    assert [item["role"] for item in messages] == ["user", "assistant", "tool", "assistant"]
+    assert messages[1]["reasoning_content"] == "先查账户。"
+    assert messages[2]["tool_call_id"] == "tool-1"
+    assert messages[3]["content"] == "最终结论。"
+
+
+def test_persistent_session_history_messages_replay_meta_payload_messages() -> None:
+    records = [
+        SimpleNamespace(
+            role="user",
+            content="第1轮任务",
+            meta_payload=None,
+        ),
+        SimpleNamespace(
+            role="assistant",
+            content="自动化摘要",
+            meta_payload={
+                "replay_messages": [
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "先看持仓。",
+                        "tool_calls": [
+                            {
+                                "id": "tool-2",
+                                "type": "function",
+                                "function": {"name": "demo_tool", "arguments": "{}"},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "tool-2",
+                        "content": '{"ok": true}',
+                    },
+                    {"role": "assistant", "content": "第1轮结论。"},
+                ]
+            },
+        ),
+    ]
+
+    messages = aniu_service._build_persistent_session_history_messages(records)
+
+    assert [item["role"] for item in messages] == ["user", "assistant", "tool", "assistant"]
+    assert messages[1]["reasoning_content"] == "先看持仓。"
+    assert messages[2]["tool_call_id"] == "tool-2"
+    assert messages[3]["content"] == "第1轮结论。"
 
 
 def test_execute_tool_adds_guidance_for_api_key_error() -> None:

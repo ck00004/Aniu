@@ -625,6 +625,18 @@ class ChatSessionService:
                 )
                 continue
 
+            meta_payload = (
+                dict(record.meta_payload)
+                if isinstance(record.meta_payload, dict)
+                else {}
+            )
+            replay_messages = llm_service.normalize_replay_messages(
+                meta_payload.get("replay_messages")
+            )
+            if replay_messages:
+                history.extend(replay_messages)
+                continue
+
             text = str(record.content or "").strip()
             if record.attachments:
                 content_parts = [text] if text else []
@@ -720,6 +732,7 @@ class ChatSessionService:
 
         event_queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
         captured_tool_calls: list[dict[str, Any]] = []
+        captured_replay_messages: list[dict[str, Any]] = []
         cancel_event = Event()
 
         def _emit(event_type: str, **data: Any) -> None:
@@ -727,7 +740,7 @@ class ChatSessionService:
 
         def _worker() -> None:
             try:
-                content = llm_service.chat(
+                result = llm_service.chat_with_details(
                     model=settings_snapshot.llm_model,
                     base_url=settings_snapshot.llm_base_url,
                     api_key=settings_snapshot.llm_api_key,
@@ -739,7 +752,8 @@ class ChatSessionService:
                     emit=_emit,
                     cancel_event=cancel_event,
                 )
-                _emit("completed", message=content)
+                captured_replay_messages[:] = list(result.get("replay_messages") or [])
+                _emit("completed", message=result.get("final_answer") or "")
             except LLMStreamCancelled:
                 logger.info("chat_session stream worker cancelled: session_id=%s", session_id)
             except Exception as exc:  # noqa: BLE001
@@ -867,12 +881,18 @@ class ChatSessionService:
                     else:
                         assistant_content = str(final_content or "").strip()
 
-                    if assistant_content or captured_tool_calls:
+                    if assistant_content or captured_tool_calls or captured_replay_messages:
+                        meta_payload = None
+                        if captured_replay_messages:
+                            meta_payload = {
+                                "replay_messages": captured_replay_messages,
+                            }
                         assistant_record = ChatMessageRecord(
                             session_id=session_id,
                             role="assistant",
                             content=assistant_content,
                             tool_calls=captured_tool_calls or None,
+                            meta_payload=meta_payload,
                         )
                         db.add(assistant_record)
                         session.last_message_at = datetime.now(timezone.utc)

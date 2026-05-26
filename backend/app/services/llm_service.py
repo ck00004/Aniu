@@ -28,6 +28,15 @@ _MIMO_THINKING_MODEL_PREFIXES = (
     "mimo-v2-omni",
     "mimo-v2-flash",
 )
+_DEEPSEEK_THINKING_MODEL_PREFIXES = (
+    "deepseek-v4-pro",
+)
+_DEEPSEEK_IGNORED_SAMPLING_KEYS = (
+    "temperature",
+    "top_p",
+    "presence_penalty",
+    "frequency_penalty",
+)
 
 class LLMStreamCancelled(RuntimeError):
     """Raised when a streaming chat/run should stop because the client disconnected."""
@@ -66,11 +75,80 @@ def _should_enable_mimo_thinking(model: Any) -> bool:
     return normalized.startswith(_MIMO_THINKING_MODEL_PREFIXES)
 
 
+def _should_enable_deepseek_thinking(model: Any) -> bool:
+    normalized = str(model or "").strip().lower()
+    if not normalized:
+        return False
+    return normalized.startswith(_DEEPSEEK_THINKING_MODEL_PREFIXES)
+
+
+def _normalize_reasoning_effort(value: Any) -> str | None:
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return None
+    if normalized in {"low", "medium", "high"}:
+        return "high"
+    if normalized in {"xhigh", "max"}:
+        return "max"
+    return None
+
+
+def _default_deepseek_reasoning_effort(payload: dict[str, Any]) -> str:
+    tools = payload.get("tools")
+    if isinstance(tools, list) and tools:
+        return "max"
+    return "high"
+
+
 def _apply_reasoning_options(payload: dict[str, Any]) -> dict[str, Any]:
     adjusted = dict(payload)
+    if _should_enable_deepseek_thinking(adjusted.get("model")):
+        thinking_payload = adjusted.get("thinking")
+        thinking_type = "enabled"
+        if isinstance(thinking_payload, dict):
+            normalized_type = str(thinking_payload.get("type") or "").strip().lower()
+            if normalized_type in {"enabled", "disabled"}:
+                thinking_type = normalized_type
+        adjusted["thinking"] = {"type": thinking_type}
+
+        reasoning_effort = _normalize_reasoning_effort(adjusted.get("reasoning_effort"))
+        if thinking_type == "enabled":
+            adjusted["reasoning_effort"] = (
+                reasoning_effort or _default_deepseek_reasoning_effort(adjusted)
+            )
+            for key in _DEEPSEEK_IGNORED_SAMPLING_KEYS:
+                adjusted.pop(key, None)
+        else:
+            adjusted.pop("reasoning_effort", None)
+        return adjusted
+
     if _should_enable_mimo_thinking(adjusted.get("model")):
         adjusted["thinking"] = {"type": "enabled"}
     return adjusted
+
+
+def _normalize_tool_call_for_replay(tool_call: Any) -> dict[str, Any] | None:
+    if not isinstance(tool_call, dict):
+        return None
+
+    function_payload = tool_call.get("function")
+    if not isinstance(function_payload, dict):
+        function_payload = {}
+
+    tool_name = str(function_payload.get("name") or "").strip()
+    arguments = function_payload.get("arguments")
+    arguments_text = arguments if isinstance(arguments, str) else ""
+    if not tool_name and not arguments_text:
+        return None
+
+    return {
+        "id": str(tool_call.get("id") or "").strip() or None,
+        "type": str(tool_call.get("type") or "function").strip() or "function",
+        "function": {
+            "name": tool_name,
+            "arguments": arguments_text,
+        },
+    }
 
 
 def _sleep_before_retry(
@@ -290,7 +368,70 @@ class LLMService:
     def close(self) -> None:
         return None
 
-    def chat(
+    @staticmethod
+    def normalize_replay_messages(messages: Any) -> list[dict[str, Any]]:
+        if not isinstance(messages, list):
+            return []
+
+        normalized_messages: list[dict[str, Any]] = []
+        for item in messages:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "").strip()
+            if role not in {"assistant", "tool"}:
+                continue
+
+            content = item.get("content")
+            if role == "tool":
+                tool_call_id = str(item.get("tool_call_id") or "").strip()
+                if not tool_call_id:
+                    continue
+                normalized_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": str(content or ""),
+                    }
+                )
+                continue
+
+            entry: dict[str, Any] = {
+                "role": "assistant",
+                "content": content if isinstance(content, str) else _to_text_content(content),
+            }
+            reasoning_content = _to_reasoning_content(item.get("reasoning_content"))
+            if reasoning_content:
+                entry["reasoning_content"] = reasoning_content
+
+            raw_tool_calls = item.get("tool_calls")
+            if isinstance(raw_tool_calls, list):
+                normalized_tool_calls = [
+                    tool_call
+                    for tool_call in (
+                        _normalize_tool_call_for_replay(raw_tool_call)
+                        for raw_tool_call in raw_tool_calls
+                    )
+                    if tool_call is not None
+                ]
+                if normalized_tool_calls:
+                    entry["tool_calls"] = normalized_tool_calls
+
+            normalized_messages.append(entry)
+        return normalized_messages
+
+    @classmethod
+    def extract_turn_replay_messages(
+        cls,
+        messages: Any,
+        *,
+        initial_message_count: int = 0,
+    ) -> list[dict[str, Any]]:
+        if not isinstance(messages, list):
+            return []
+        start_index = max(0, int(initial_message_count or 0))
+        return cls.normalize_replay_messages(messages[start_index:])
+
+    def chat_with_details(
         self,
         *,
         model: str,
@@ -303,7 +444,7 @@ class LLMService:
         tool_context: dict[str, Any] | None = None,
         emit: Any = None,
         cancel_event: threading.Event | None = None,
-    ) -> str:
+    ) -> dict[str, Any]:
         payload_messages: list[dict[str, Any]] = []
         effective_system_prompt = self._augment_system_prompt(
             system_prompt,
@@ -337,6 +478,39 @@ class LLMService:
             run_type="chat",
             timeout_seconds=timeout_seconds,
             tool_executor=_chat_tool_executor,
+            emit=emit,
+            cancel_event=cancel_event,
+        )
+        result["initial_message_count"] = len(payload_messages)
+        result["replay_messages"] = self.extract_turn_replay_messages(
+            result.get("messages"),
+            initial_message_count=len(payload_messages),
+        )
+        return result
+
+    def chat(
+        self,
+        *,
+        model: str,
+        base_url: str,
+        api_key: str,
+        system_prompt: str | None,
+        prompt_templates: Any = None,
+        messages: list[dict[str, str]],
+        timeout_seconds: int = 60,
+        tool_context: dict[str, Any] | None = None,
+        emit: Any = None,
+        cancel_event: threading.Event | None = None,
+    ) -> str:
+        result = self.chat_with_details(
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            system_prompt=system_prompt,
+            prompt_templates=prompt_templates,
+            messages=messages,
+            timeout_seconds=timeout_seconds,
+            tool_context=tool_context,
             emit=emit,
             cancel_event=cancel_event,
         )
@@ -523,7 +697,14 @@ class LLMService:
                 "responses": result["responses"],
                 "final_message": result["final_message"],
             },
-            {"messages": result["messages"]},
+            {
+                "messages": result["messages"],
+                "initial_message_count": len(request_payload["messages"]),
+                "replay_messages": self.extract_turn_replay_messages(
+                    result["messages"],
+                    initial_message_count=len(request_payload["messages"]),
+                ),
+            },
         )
 
     def _agent_loop(

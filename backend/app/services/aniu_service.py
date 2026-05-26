@@ -2541,6 +2541,7 @@ class AniuService:
     ) -> StrategyRun | None:
         session_context: PersistentRunSessionContext | None = None
         automation_phase = "llm"
+        runtime_trace: dict[str, Any] | None = None
         _emit = emit if callable(emit) else (lambda *_a, **_kw: None)
 
         try:
@@ -2828,6 +2829,14 @@ class AniuService:
                                     getattr(settings, "run_type", "analysis") or "analysis"
                                 ),
                                 "executed_action_count": len(executed_actions),
+                                "replay_messages": llm_service.extract_turn_replay_messages(
+                                    runtime_trace.get("messages") if isinstance(runtime_trace, dict) else None,
+                                    initial_message_count=int(
+                                        (runtime_trace.get("initial_message_count") or 0)
+                                        if isinstance(runtime_trace, dict)
+                                        else 0
+                                    ),
+                                ),
                             },
                         )
                         session_context.response_message_id = response_message.id
@@ -2943,6 +2952,14 @@ class AniuService:
                                     "phase": automation_phase,
                                     "run_type": str(
                                         settings_snapshot.get("run_type") or "analysis"
+                                    ),
+                                    "replay_messages": llm_service.extract_turn_replay_messages(
+                                        runtime_trace.get("messages") if isinstance(runtime_trace, dict) else None,
+                                        initial_message_count=int(
+                                            (runtime_trace.get("initial_message_count") or 0)
+                                            if isinstance(runtime_trace, dict)
+                                            else 0
+                                        ),
                                     ),
                                 },
                             )
@@ -5282,6 +5299,17 @@ class AniuService:
         messages: list[dict[str, Any]] = []
         for record in records:
             if record.role not in {"user", "assistant", "system"}:
+                continue
+            meta_payload = (
+                dict(record.meta_payload)
+                if isinstance(record.meta_payload, dict)
+                else {}
+            )
+            replay_messages = llm_service.normalize_replay_messages(
+                meta_payload.get("replay_messages")
+            )
+            if replay_messages:
+                messages.extend(replay_messages)
                 continue
             content = str(record.content or "").strip()
             if not content:
