@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.services.mx_skill_service import mx_skill_service
+from app.services.skill_stack_service import skill_stack_service
 from skills.mx_core.tool_specs import TOOL_SPECS
 
 
@@ -35,13 +36,10 @@ class ExecutionPlanService:
         sequence_no: int,
     ) -> tuple[dict[str, Any], PlannedActionDraft | None]:
         if not self.is_mutation_tool(tool_name):
-            client = context.get("client")
-            app_settings = context.get("app_settings")
-            result = mx_skill_service.execute_tool(
-                client=client,
-                app_settings=app_settings,
+            result = skill_stack_service.runtime.execute_tool(
                 tool_name=tool_name,
                 arguments=arguments,
+                context=context,
             )
             return result, None
 

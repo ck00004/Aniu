@@ -16,6 +16,7 @@ from app.services.execution_plan_service import execution_plan_service
 from app.services.jin10_news_service import Jin10NewsService
 from app.services.mx_skill_service import mx_skill_service
 from app.services.llm_service import LLMService, LLMUpstreamError, llm_service
+from app.services.skill_stack_service import skill_stack_service
 
 
 def test_execute_run_rejects_unknown_schedule_id(monkeypatch, tmp_path) -> None:
@@ -112,6 +113,46 @@ def test_execution_plan_manage_self_select_returns_error_for_multiple_targets() 
     assert "请把每只股票拆成一次单独的 mx_manage_self_select 调用" in str(
         result.get("error") or ""
     )
+
+
+def test_execution_plan_delegates_non_mutation_tools_to_runtime(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_runtime_execute_tool(*, tool_name, arguments, context):
+        captured["tool_name"] = tool_name
+        captured["arguments"] = arguments
+        captured["context"] = context
+        return {
+            "ok": True,
+            "tool_name": tool_name,
+            "summary": "runtime ok",
+            "result": {"path": arguments.get("path")},
+        }
+
+    monkeypatch.setattr(
+        skill_stack_service.runtime,
+        "execute_tool",
+        fake_runtime_execute_tool,
+    )
+
+    context = {
+        "client": object(),
+        "app_settings": object(),
+        "run_type": "analysis",
+    }
+    result, draft = execution_plan_service.execute_tool(
+        tool_name="read_file",
+        arguments={"path": "/tmp/demo.txt"},
+        tool_call_id="call-rt",
+        context=context,
+        sequence_no=1,
+    )
+
+    assert draft is None
+    assert result["ok"] is True
+    assert captured["tool_name"] == "read_file"
+    assert captured["arguments"] == {"path": "/tmp/demo.txt"}
+    assert captured["context"] == context
 
 
 def test_moni_trade_rejects_multiple_symbols() -> None:

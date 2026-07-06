@@ -443,6 +443,98 @@ def test_execute_run_marks_failed_when_planned_action_execution_fails(
     reset_db_state()
 
 
+def test_execute_run_allows_runtime_tools_during_planning(
+    monkeypatch, tmp_path
+) -> None:
+    from app.services import aniu_service as aniu_service_module
+    from app.services import execution_plan_service as execution_plan_service_module
+
+    class StubClient:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+        def close(self) -> None:
+            return None
+
+    def fake_run_agent_with_messages(
+        *, app_settings, client, messages, emit=None, tool_executor=None
+    ):
+        del app_settings, client, messages, emit
+        read_result = tool_executor(
+            "read_file",
+            {"path": "/home/test/Aniu-main/data/skill_workspace/skills/tdx-stock-api/SKILL.md"},
+            "call-read",
+        )
+        glob_result = tool_executor(
+            "glob",
+            {"pattern": "**/tdx-stock-api/**"},
+            "call-glob",
+        )
+        return (
+            {
+                "final_answer": "runtime tools succeeded",
+                "tool_calls": [
+                    {
+                        "id": "call-read",
+                        "name": "read_file",
+                        "arguments": {"path": "/home/test/Aniu-main/data/skill_workspace/skills/tdx-stock-api/SKILL.md"},
+                        "result": read_result,
+                    },
+                    {
+                        "id": "call-glob",
+                        "name": "glob",
+                        "arguments": {"pattern": "**/tdx-stock-api/**"},
+                        "result": glob_result,
+                    },
+                ],
+            },
+            {"messages": []},
+            {"responses": [], "final_message": {"content": "runtime tools succeeded"}},
+            {"messages": []},
+        )
+
+    def fake_runtime_execute_tool(*, tool_name, arguments, context):
+        del context
+        return {
+            "ok": True,
+            "tool_name": tool_name,
+            "summary": f"{tool_name} ok",
+            "result": dict(arguments),
+        }
+
+    monkeypatch.setattr(aniu_service_module, "MXClient", StubClient)
+    monkeypatch.setattr(llm_service, "run_agent_with_messages", fake_run_agent_with_messages)
+    monkeypatch.setattr(
+        execution_plan_service_module.skill_stack_service.runtime,
+        "execute_tool",
+        fake_runtime_execute_tool,
+    )
+    monkeypatch.setattr(
+        aniu_service,
+        "_prefetch_analysis_context",
+        lambda **kwargs: (None, None),
+    )
+
+    with create_test_client(monkeypatch, tmp_path):
+        with session_scope() as db:
+            settings = aniu_service.get_or_create_settings(db)
+            settings.mx_api_key = "mx-key"
+            settings.llm_base_url = "https://example.com/v1"
+            settings.llm_api_key = "llm-key"
+            settings.llm_model = "demo-model"
+            settings.task_prompt = "请读取 skill 文档并继续分析。"
+
+        run = aniu_service.execute_run(trigger_source="manual")
+
+        assert run.status == "completed"
+        assert isinstance(run.decision_payload, dict)
+        tool_calls = run.decision_payload.get("tool_calls") or []
+        assert [item.get("name") for item in tool_calls] == ["read_file", "glob"]
+        assert all(bool(item.get("result", {}).get("ok")) for item in tool_calls)
+
+    reset_db_state()
+
+
 def test_execute_run_does_not_fail_on_invalid_multi_target_self_select_plan(
     monkeypatch, tmp_path
 ) -> None:
