@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from threading import Thread
 from zoneinfo import ZoneInfo
 import logging
+import time
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -32,30 +34,88 @@ _SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 _STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
 
+def _configure_app_logging() -> None:
+    """保证应用日志在 uvicorn 下可见。
+
+    uvicorn 默认只配置自己的 logger（uvicorn/uvicorn.error/uvicorn.access），
+    应用 logger 的 INFO 输出没有 handler 会完全不可见——启动分步日志
+    也就无法用于排查。仅在根 logger 无任何 handler 时挂载（pytest 的
+    caplog 已自带 handler，不干预以免重复输出）。
+    """
+    if logging.getLogger().handlers:
+        return
+
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        logging.Formatter("%(levelname)s:     %(name)s : %(message)s")
+    )
+    for logger_name in ("app", "skills"):
+        target = logging.getLogger(logger_name)
+        if not target.handlers:
+            target.addHandler(handler)
+        target.setLevel(logging.INFO)
+
+
 @asynccontextmanager
 async def app_lifespan(_app: FastAPI):
+    # 每个启动步骤都带计时 INFO 日志：生产环境 "Waiting for application
+    # startup." 卡住时可直接从日志看到卡在哪一步、耗时多少。
+    started_at = time.monotonic()
+
+    def _log_step(label: str, step_started: float) -> float:
+        now = time.monotonic()
+        logger.info("app startup: %s done in %.2fs", label, now - step_started)
+        return now
+
+    step = time.monotonic()
     init_db()
+    step = _log_step("init_db", step)
+
     skill_registry.reload()
+    step = _log_step("skill_registry.reload", step)
+
     with session_scope() as db:
         skill_admin_service.apply_persisted_state(db)
+        step = _log_step("apply_persisted_state", step)
         # 进程重启后遗留的 running 状态运行在此收敛为 failed，
         # 避免僵尸记录阻塞删除并让前端事件流永久挂起。
         try:
             aniu_service.fail_stale_running_runs(db)
         except Exception as exc:
             logger.warning("failed to mark stale running runs: %s", exc)
+        step = _log_step("fail_stale_running_runs", step)
         try:
             memory_dream_service.fail_stale_running_dreams(db)
         except Exception as exc:
             logger.warning("failed to mark stale running dreams: %s", exc)
-    # 预热失败不应阻止应用启动：日历月份缺失时运行期的懒加载与
-    # 失败负缓存会接管，调度循环对 is_trading_day 的异常同样有容忍。
+        step = _log_step("fail_stale_running_dreams", step)
+
+    # 日历预热放到后台线程：预热涉及远程日历接口（最坏 4 次重试 ×
+    # 30 秒超时），网络黑洞时会阻塞启动关键路径数分钟。运行期的懒加载
+    # 与失败负缓存会接管，调度循环对 is_trading_day 的异常同样有容忍。
     today = datetime.now(timezone.utc).astimezone(_SHANGHAI_TZ).date()
-    try:
-        trading_calendar_service.warm_up_months(today)
-    except Exception as exc:
-        logger.warning("交易日历预热失败，将在运行期重试: %s", exc)
+
+    def _warm_up_calendar() -> None:
+        try:
+            trading_calendar_service.warm_up_months(today)
+            logger.info("app startup: calendar warm-up finished (background)")
+        except Exception as exc:
+            logger.warning("交易日历预热失败，将在运行期重试: %s", exc)
+
+    Thread(
+        target=_warm_up_calendar,
+        name="aniu-calendar-warmup",
+        daemon=True,
+    ).start()
+    step = _log_step("calendar warm-up dispatched to background", step)
+
     scheduler_service.start()
+    step = _log_step("scheduler_service.start", step)
+
+    logger.info(
+        "app startup: all steps finished in %.2fs, serving requests",
+        time.monotonic() - started_at,
+    )
     try:
         yield
     finally:
@@ -63,6 +123,7 @@ async def app_lifespan(_app: FastAPI):
 
 
 def create_app() -> FastAPI:
+    _configure_app_logging()
     settings = get_settings()
     app = FastAPI(title=settings.app_name, lifespan=app_lifespan)
 

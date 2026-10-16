@@ -991,10 +991,10 @@ def test_trading_calendar_service_raises_after_retry_limit() -> None:
 
     service._fetch_month_once = fake_fetch_once  # type: ignore[method-assign]
 
-    with pytest.raises(RuntimeError, match="已重试 3 次仍失败"):
+    with pytest.raises(RuntimeError, match="已重试 2 次仍失败"):
         service._fetch_month("2027-01")
 
-    assert attempts == ["2027-01", "2027-01", "2027-01", "2027-01"]
+    assert attempts == ["2027-01", "2027-01", "2027-01"]
 
 
 def test_order_status_text_derives_from_fill_progress() -> None:

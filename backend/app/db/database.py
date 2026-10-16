@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import time
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
@@ -38,23 +40,68 @@ def get_session_local():
     return _session_local
 
 
+logger = logging.getLogger(__name__)
+
+
+def _schema_meta_get(engine, key: str) -> str | None:
+    """读取一次性迁移标记（schema_meta 键值表）。"""
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE IF NOT EXISTS schema_meta ("
+                "key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+        )
+        row = connection.execute(
+            text("SELECT value FROM schema_meta WHERE key = :key"),
+            {"key": key},
+        ).fetchone()
+    return str(row[0]) if row is not None else None
+
+
+def _schema_meta_set(engine, key: str, value: str) -> None:
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO schema_meta (key, value) VALUES (:key, :value) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+            ),
+            {"key": key, "value": value},
+        )
+
+
 def init_db() -> None:
+    started_at = time.monotonic()
+
+    def _log_step(label: str, step_started: float) -> float:
+        now = time.monotonic()
+        logger.info("init_db step: %s done in %.2fs", label, now - step_started)
+        return now
+
     engine = get_engine()
+    step = time.monotonic()
     Base.metadata.create_all(bind=engine)
+    step = _log_step("create_all", step)
     _ensure_app_settings_columns(engine)
+    step = _log_step("ensure_app_settings_columns", step)
     _ensure_chat_session_columns(engine)
     _ensure_chat_message_columns(engine)
     _ensure_strategy_schedule_columns(engine)
     _ensure_strategy_run_columns(engine)
     _ensure_strategy_run_action_columns(engine)
     _ensure_strategy_run_action_result_columns(engine)
+    step = _log_step("ensure_columns", step)
     _ensure_chat_session_indexes(engine)
     _ensure_chat_message_indexes(engine)
     _ensure_strategy_run_indexes(engine)
     _ensure_strategy_run_action_indexes(engine)
     _ensure_strategy_run_action_result_indexes(engine)
+    step = _log_step("ensure_indexes", step)
     _backfill_schedule_run_types(engine)
+    step = _log_step("backfill_schedule_run_types", step)
     _backfill_strategy_run_types(engine)
+    step = _log_step("backfill_strategy_run_types", step)
+    logger.info("init_db finished in %.2fs", time.monotonic() - started_at)
 
 
 def _ensure_app_settings_columns(engine) -> None:
@@ -356,10 +403,26 @@ def _backfill_schedule_run_types(engine) -> None:
         )
 
 
+_BACKFILL_RUN_TYPES_MARKER = "backfill_strategy_run_types_v1"
+
+
 def _backfill_strategy_run_types(engine) -> None:
+    """历史 run 的 run_type/market_day_type 一次性回填。
+
+    旧实现每次启动都全表加载所有 run 的完整 JSON 载荷并逐行 UPDATE
+    （即使值未变化），生产库增长后启动耗时线性上升、慢盘上表现为
+    "Waiting for application startup" 长时间无响应。现在：
+    1. schema_meta 一次性标记——迁移只在首次执行；
+    2. 仅 UPDATE 值实际变化的行；
+    3. 每 500 条输出进度日志。
+    """
     inspector = inspect(engine)
     table_names = set(inspector.get_table_names())
     if "strategy_runs" not in table_names:
+        return
+
+    if _schema_meta_get(engine, _BACKFILL_RUN_TYPES_MARKER) == "done":
+        logger.info("backfill_strategy_run_types skipped (marker set)")
         return
 
     db_path = Path(get_settings().sqlite_db_path)
@@ -369,6 +432,8 @@ def _backfill_strategy_run_types(engine) -> None:
     import json
     import sqlite3
 
+    logger.info("backfill_strategy_run_types: one-time migration starting")
+    migration_started = time.monotonic()
     connection = sqlite3.connect(db_path)
     connection.row_factory = sqlite3.Row
     try:
@@ -387,6 +452,10 @@ def _backfill_strategy_run_types(engine) -> None:
                 "SELECT run_id, COUNT(*) FROM trade_orders GROUP BY run_id"
             ).fetchall()
         }
+
+        total_runs = len(runs)
+        processed = 0
+        changed_count = 0
 
         for row in runs:
             schedule_name = str(row["schedule_name"] or "").strip()
@@ -445,14 +514,33 @@ def _backfill_strategy_run_types(engine) -> None:
             elif stored_market_day_type in {"trading_day", "non_trading_day"}:
                 inferred_market_day_type = stored_market_day_type
 
-            connection.execute(
-                "UPDATE strategy_runs SET run_type = ?, market_day_type = ? WHERE id = ?",
-                (inferred, inferred_market_day_type, int(row["id"])),
-            )
+            if inferred != stored_run_type or inferred_market_day_type != stored_market_day_type:
+                connection.execute(
+                    "UPDATE strategy_runs SET run_type = ?, market_day_type = ? WHERE id = ?",
+                    (inferred, inferred_market_day_type, int(row["id"])),
+                )
+                changed_count += 1
+
+            processed += 1
+            if processed % 500 == 0:
+                logger.info(
+                    "backfill_strategy_run_types: processed %d/%d rows (%d changed)",
+                    processed,
+                    total_runs,
+                    changed_count,
+                )
 
         connection.commit()
+        logger.info(
+            "backfill_strategy_run_types: finished %d rows, %d changed, %.2fs",
+            processed,
+            total_runs,
+            time.monotonic() - migration_started,
+        )
     finally:
         connection.close()
+
+    _schema_meta_set(engine, _BACKFILL_RUN_TYPES_MARKER, "done")
 
 
 def _ensure_strategy_run_columns(engine) -> None:

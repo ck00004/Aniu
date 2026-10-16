@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import calendar
 import json
+import logging
 import time
 from datetime import date, timedelta
 from pathlib import Path
@@ -9,8 +10,13 @@ from typing import Any
 
 import httpx
 
+logger = logging.getLogger(__name__)
+
 _MAX_PROBE_DAYS = 30
-_CALENDAR_FETCH_RETRIES = 3
+# 拉取超时与重试次数收紧：日历接口正常时秒级返回；网络黑洞时
+# 最坏 3 次尝试 × 10s + 2 × 2s 退避 ≈ 34s，避免长时间阻塞调用方
+# （调度循环 / 启动期的调度推进路径）。
+_CALENDAR_FETCH_RETRIES = 2
 _CALENDAR_FETCH_RETRY_DELAY_SECONDS = 2.0
 _CALENDAR_FETCH_FAILURE_TTL_SECONDS = 300.0
 _CALENDAR_SOURCE = "ciis_transaction_calendar"
@@ -97,6 +103,13 @@ class TradingCalendarService:
                 return self._fetch_month_once(month_key)
             except RuntimeError as exc:
                 last_error = exc
+                logger.warning(
+                    "trading calendar fetch attempt %d/%d failed for %s: %s",
+                    attempt + 1,
+                    _CALENDAR_FETCH_RETRIES + 1,
+                    month_key,
+                    exc,
+                )
                 if attempt == _CALENDAR_FETCH_RETRIES:
                     raise RuntimeError(
                         f"{exc}；已重试 {_CALENDAR_FETCH_RETRIES} 次仍失败"
@@ -117,7 +130,7 @@ class TradingCalendarService:
                 _CALENDAR_API_URL,
                 data=payload,
                 headers=_CALENDAR_REQUEST_HEADERS,
-                timeout=30.0,
+                timeout=10.0,
                 verify=False,
             )
             response.raise_for_status()
