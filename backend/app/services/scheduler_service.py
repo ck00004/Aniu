@@ -5,6 +5,7 @@ from threading import Event, Thread
 
 from app.core.config import get_settings
 from app.services.aniu_service import aniu_service
+from app.services.memory_dream_service import memory_dream_service
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,11 @@ class SchedulerService:
                 aniu_service.process_due_schedule()
             except Exception as exc:
                 logger.exception("scheduler loop error: %s", exc)
+            try:
+                # 记忆梦境：过了每日整理时间（默认 00:30 上海）触发一次
+                memory_dream_service.process_due_dream()
+            except Exception as exc:
+                logger.exception("dream schedule loop error: %s", exc)
             self._stop_event.wait(poll_seconds)
 
 

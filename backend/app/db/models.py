@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, func
+from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
 
@@ -72,6 +72,7 @@ class AppSettings(Base):
         Boolean, default=True
     )
     automation_idle_summary_hours: Mapped[int] = mapped_column(Integer, default=12)
+    automation_dream_time: Mapped[str] = mapped_column(String(8), default="00:30")
     automation_context_source: Mapped[str | None] = mapped_column(
         String(32), nullable=True, default="default"
     )
@@ -291,3 +292,88 @@ class ChatAttachment(Base):
     size: Mapped[int] = mapped_column(Integer, default=0)
     storage_path: Mapped[str] = mapped_column(String(512))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class ToolInvocationLog(Base):
+    """上游工具调用日志（移植自原版 Aniu stock_api_call_logs 的思路）。
+
+    记录每次妙想接口调用的端点、参数摘要、状态、耗时与响应规模，
+    让上游调用可观测、可排障。
+    """
+
+    __tablename__ = "tool_invocation_logs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    provider: Mapped[str] = mapped_column(String(32), default="mx")
+    operation: Mapped[str] = mapped_column(String(128))
+    request_summary: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="success")
+    status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    response_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), index=True
+    )
+
+
+class MemoryItem(Base):
+    """长期交易记忆（移植自原版 Aniu memory_items）。
+
+    乐观锁版本控制：update/delete 必须携带 expected_version；
+    软删除保留历史。
+    """
+
+    __tablename__ = "memory_items"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    content: Mapped[str] = mapped_column(Text)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), index=True
+    )
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True, index=True
+    )
+
+
+class MemoryActivity(Base):
+    """记忆读写活动审计（移植自原版 Aniu memory_activities）。"""
+
+    __tablename__ = "memory_activities"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    action: Mapped[str] = mapped_column(String(16))
+    keywords: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    result_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    memory_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), index=True
+    )
+
+
+class MemoryDream(Base):
+    """记忆梦境任务（移植自原版 Aniu memory_dreams）。
+
+    每个整理日期一条（幂等）；状态机 pending → running → completed/failed。
+    """
+
+    __tablename__ = "memory_dreams"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    target_date: Mapped[date] = mapped_column(Date, unique=True, index=True)
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    result: Mapped[str | None] = mapped_column(Text, nullable=True)
+    failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

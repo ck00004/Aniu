@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 import logging
 from pathlib import Path
 
@@ -16,12 +17,16 @@ from app.core.config import get_settings
 from app.core.rate_limit import rate_limit_middleware
 from app.db.database import init_db
 from app.db.database import session_scope
+from app.services.aniu_service import aniu_service
+from app.services.memory_dream_service import memory_dream_service
 from app.services.scheduler_service import scheduler_service
 from app.services.skill_admin_service import skill_admin_service
 from app.services.trading_calendar_service import trading_calendar_service
 from app.skills import skill_registry
 
 logger = logging.getLogger(__name__)
+
+_SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 # Directory where the Vite build output is placed (only exists in Docker image)
 _STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
@@ -33,8 +38,23 @@ async def app_lifespan(_app: FastAPI):
     skill_registry.reload()
     with session_scope() as db:
         skill_admin_service.apply_persisted_state(db)
-    today = date.today()
-    trading_calendar_service.warm_up_months(today)
+        # 进程重启后遗留的 running 状态运行在此收敛为 failed，
+        # 避免僵尸记录阻塞删除并让前端事件流永久挂起。
+        try:
+            aniu_service.fail_stale_running_runs(db)
+        except Exception as exc:
+            logger.warning("failed to mark stale running runs: %s", exc)
+        try:
+            memory_dream_service.fail_stale_running_dreams(db)
+        except Exception as exc:
+            logger.warning("failed to mark stale running dreams: %s", exc)
+    # 预热失败不应阻止应用启动：日历月份缺失时运行期的懒加载与
+    # 失败负缓存会接管，调度循环对 is_trading_day 的异常同样有容忍。
+    today = datetime.now(timezone.utc).astimezone(_SHANGHAI_TZ).date()
+    try:
+        trading_calendar_service.warm_up_months(today)
+    except Exception as exc:
+        logger.warning("交易日历预热失败，将在运行期重试: %s", exc)
     scheduler_service.start()
     try:
         yield

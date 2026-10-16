@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Path, Query, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.core.auth import get_current_user
-from app.db.database import get_db
+from app.db.database import get_db, session_scope
+from app.db.models import StrategyRun
 from app.schemas.aniu import (
     AccountOverviewDebugRead,
     AccountOverviewRead,
@@ -27,6 +28,14 @@ from app.schemas.aniu import (
     ChatStreamRequest,
     LoginRequest,
     LoginResponse,
+    MemoryActivityListRead,
+    MemoryCreateRequest,
+    MemoryDreamListRead,
+    MemoryDreamRead,
+    MemoryDreamRunResponse,
+    MemoryItemRead,
+    MemoryListRead,
+    MemoryUpdateRequest,
     RunDetailRead,
     RawToolPreviewDetailRead,
     RunSummaryRead,
@@ -46,10 +55,15 @@ from app.services.chat_session_service import (
     chat_session_service,
 )
 from app.services.event_bus import event_bus
+from app.services.daily_report_service import daily_report_service
+from app.services.memory_dream_service import memory_dream_service
+from app.services.memory_service import MemoryVersionConflict, memory_service
+from app.services.run_abort_service import run_abort_registry
 from app.services.skill_admin_service import (
     MAX_SKILL_ARCHIVE_BYTES,
     skill_admin_service,
 )
+from app.services.tool_invocation_log_service import tool_invocation_log_service
 
 router = APIRouter(prefix="/api/aniu", tags=["aniu"])
 
@@ -254,14 +268,51 @@ def run_stream(
     return {"run_id": run_id}
 
 
+@router.post("/runs/{run_id}/abort")
+def abort_run(
+    run_id: int,
+    _user: str = Depends(get_current_user),
+) -> dict:
+    """请求中止一个进行中的运行。
+
+    运行线程在 LLM 迭代、工具调用与交易执行等检查点感知中止并停止；
+    中止请求优先于后续真实交易。
+    """
+    with session_scope() as db:
+        run = db.get(StrategyRun, run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="运行记录不存在。")
+        if str(run.status or "") != "running":
+            raise HTTPException(status_code=409, detail="该运行已结束，无法中止。")
+
+    if not run_abort_registry.abort(run_id):
+        # run 已是 running 状态但注册表无活动事件（如进程刚重启），
+        # 直接把记录收敛为失败，避免僵尸运行。
+        with session_scope() as db:
+            run = db.get(StrategyRun, run_id)
+            if run is not None and str(run.status or "") == "running":
+                run.status = "failed"
+                run.error_message = "运行已被用户中止。"
+                run.finished_at = datetime.now(timezone.utc)
+                db.add(run)
+    return {"run_id": run_id, "aborted": True}
+
+
 @router.get("/runs/{run_id}/events")
 def run_events(
     run_id: int,
+    after_seq: int | None = Query(default=None, ge=0),
     _user: str = Depends(get_current_user),
 ) -> StreamingResponse:
+    # 订阅不存在的 run 会得到只有心跳的无限流；先校验存在性。
+    with session_scope() as db:
+        run = db.get(StrategyRun, run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="运行记录不存在。")
+
     def _generator():
         try:
-            for event in event_bus.stream(run_id):
+            for event in event_bus.stream(run_id, after_seq=after_seq):
                 event_type = str(event.get("type") or "message")
                 data = json.dumps(event, ensure_ascii=False)
                 yield f"event: {event_type}\ndata: {data}\n\n"
@@ -279,6 +330,173 @@ def run_events(
         media_type="text/event-stream",
         headers=headers,
     )
+
+
+@router.get("/memories", response_model=MemoryListRead)
+def list_memories(
+    query: str | None = Query(default=None, max_length=200),
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+    _user: str = Depends(get_current_user),
+) -> MemoryListRead:
+    payload = memory_service.list_memories(
+        db, query=query, limit=limit, offset=offset
+    )
+    return MemoryListRead(**payload)
+
+
+@router.post("/memories", response_model=MemoryItemRead)
+def create_memory(
+    payload: MemoryCreateRequest,
+    db: Session = Depends(get_db),
+    _user: str = Depends(get_current_user),
+) -> MemoryItemRead:
+    try:
+        item = memory_service.create_memory(
+            db, content=payload.content, reason=payload.reason
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return MemoryItemRead.model_validate(item, from_attributes=True)
+
+
+@router.put("/memories/{memory_id}", response_model=MemoryItemRead)
+def update_memory(
+    memory_id: int,
+    payload: MemoryUpdateRequest,
+    db: Session = Depends(get_db),
+    _user: str = Depends(get_current_user),
+) -> MemoryItemRead:
+    try:
+        item = memory_service.update_memory(
+            db,
+            memory_id=memory_id,
+            content=payload.content,
+            reason=payload.reason,
+            expected_version=payload.expected_version,
+        )
+    except MemoryVersionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return MemoryItemRead.model_validate(item, from_attributes=True)
+
+
+@router.delete("/memories/{memory_id}")
+def delete_memory(
+    memory_id: int,
+    expected_version: int = Query(ge=1),
+    db: Session = Depends(get_db),
+    _user: str = Depends(get_current_user),
+) -> dict:
+    try:
+        memory_service.delete_memory(
+            db, memory_id=memory_id, expected_version=expected_version
+        )
+    except MemoryVersionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"deleted": True, "memory_id": memory_id}
+
+
+@router.get("/memory-dreams", response_model=MemoryDreamListRead)
+def list_memory_dreams(
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+    _user: str = Depends(get_current_user),
+) -> MemoryDreamListRead:
+    payload = memory_dream_service.list_dreams(db, limit=limit, offset=offset)
+    return MemoryDreamListRead(**payload)
+
+
+@router.get("/memory-dreams/{dream_id}", response_model=MemoryDreamRead)
+def get_memory_dream(
+    dream_id: int,
+    db: Session = Depends(get_db),
+    _user: str = Depends(get_current_user),
+) -> MemoryDreamRead:
+    dream = memory_dream_service.get_dream(db, dream_id)
+    if dream is None:
+        raise HTTPException(status_code=404, detail="梦境任务不存在。")
+    return MemoryDreamRead.model_validate(dream, from_attributes=True)
+
+
+@router.post("/memory-dreams/run", response_model=MemoryDreamRunResponse)
+def run_memory_dream(
+    target_date: date | None = Query(default=None, alias="date"),
+    _user: str = Depends(get_current_user),
+) -> MemoryDreamRunResponse:
+    """手动触发记忆梦境（默认整理昨天）；已完成/失败的任务会重置重跑。"""
+    try:
+        dream, started = memory_dream_service.run_dream_async(target_date=target_date)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if dream is None:
+        raise HTTPException(status_code=500, detail="创建梦境任务失败。")
+    return MemoryDreamRunResponse(
+        dream=MemoryDreamRead.model_validate(dream, from_attributes=True),
+        started=started,
+    )
+
+
+@router.delete("/memory-dreams/{dream_id}")
+def delete_memory_dream(
+    dream_id: int,
+    db: Session = Depends(get_db),
+    _user: str = Depends(get_current_user),
+) -> dict:
+    try:
+        deleted = memory_dream_service.delete_dream(db, dream_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not deleted:
+        raise HTTPException(status_code=404, detail="梦境任务不存在。")
+    return {"deleted": True, "dream_id": dream_id}
+
+
+@router.get("/memory-activities", response_model=MemoryActivityListRead)
+def list_memory_activities(
+    limit: int = Query(default=30, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+    _user: str = Depends(get_current_user),
+) -> MemoryActivityListRead:
+    payload = memory_service.list_activities(db, limit=limit, offset=offset)
+    return MemoryActivityListRead(**payload)
+
+
+@router.get("/tool-invocation-logs")
+def list_tool_invocation_logs(
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    status: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    _user: str = Depends(get_current_user),
+) -> dict:
+    """上游工具调用日志（每次妙想接口调用的状态/耗时/响应规模）。"""
+    payload = tool_invocation_log_service.list_logs(
+        db,
+        limit=limit,
+        offset=offset,
+        status=status,
+    )
+    payload["summary"] = tool_invocation_log_service.summarize(db)
+    return payload
+
+
+@router.get("/runs/daily-report")
+def get_daily_run_report(
+    run_date: date | None = Query(default=None, alias="date"),
+    db: Session = Depends(get_db),
+    _user: str = Depends(get_current_user),
+) -> dict:
+    """每日运行报告（上海日历日聚合，含证据预算与当日交易汇总）。"""
+    return daily_report_service.build_daily_report(db, target_date=run_date)
 
 
 @router.get("/runs", response_model=list[RunSummaryRead])

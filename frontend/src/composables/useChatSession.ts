@@ -12,14 +12,6 @@ interface StreamEvent {
   [key: string]: unknown
 }
 
-function getStreamingAssistant(messages: ChatMessage[], fallback: ChatMessage): ChatMessage {
-  const assistant = messages[messages.length - 1]
-  if (!assistant || assistant.role !== 'assistant') {
-    return fallback
-  }
-  return assistant
-}
-
 function prependUniqueMessages(current: ChatMessage[], older: ChatMessage[]): ChatMessage[] {
   if (!older.length) return current
 
@@ -230,22 +222,38 @@ export function useChatSession() {
     let buffer = ''
     let failed: string | null = null
 
-    while (true) {
-      const { value, done } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
-      let idx = buffer.indexOf('\n\n')
-      while (idx >= 0) {
-        const chunk = buffer.slice(0, idx)
-        buffer = buffer.slice(idx + 2)
-        const event = parseSseChunk<StreamEvent>(chunk)
-        if (event) {
-          applyEventToAssistant(getStreamingAssistant(messages.value, assistant), event)
-          if (event.type === 'failed') {
-            failed = String(event.message || '聊天失败')
+    // 流式事件只写入发起请求时捕获的 assistant 对象，且仅当它仍在
+    // 当前消息列表中（用户未切换会话）时才应用；切换会话后由后端
+    // 持久化结果兜底，切回时 loadSession 会拉取落库内容。
+    const streamTargetActive = () =>
+      activeSessionId.value === sessionId && messages.value.includes(assistant)
+
+    try {
+      while (true) {
+        const { value, done } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        let idx = buffer.indexOf('\n\n')
+        while (idx >= 0) {
+          const chunk = buffer.slice(0, idx)
+          buffer = buffer.slice(idx + 2)
+          const event = parseSseChunk<StreamEvent>(chunk)
+          if (event) {
+            if (streamTargetActive()) {
+              applyEventToAssistant(assistant, event)
+            }
+            if (event.type === 'failed') {
+              failed = String(event.message || '聊天失败')
+            }
           }
+          idx = buffer.indexOf('\n\n')
         }
-        idx = buffer.indexOf('\n\n')
+      }
+    } catch (error) {
+      // 流建立后中断：后端已持久化用户消息与"执行中断"的助手消息，
+      // 本地回滚会与服务器状态分叉，保留本地部分内容并仅提示错误。
+      return {
+        failedMessage: (error as Error).message || '聊天流中断',
       }
     }
 
@@ -287,10 +295,19 @@ export function useChatSession() {
       if (failedMessage) {
         errorMessage.value = failedMessage
       }
+      // 流式期间用户切换走又切回：本地 assistant 对象已不在列表中，
+      // 重新加载会话以显示后端落库的完整结果。
+      if (activeSessionId.value === sessionId && !messages.value.includes(assistant)) {
+        await loadSession(sessionId)
+      }
       return { sessionId }
     } catch (error) {
+      // 连接阶段失败：消息尚未持久化，按引用回滚本地消息是安全的。
+      // （不能按位置 slice，否则会误删切换后新会话的消息。）
       errorMessage.value = (error as Error).message
-      messages.value = messages.value.slice(0, -2)
+      messages.value = messages.value.filter(
+        (item) => item !== userMessage && item !== assistant,
+      )
       input.value = content
       pendingAttachments.value = attachments
       return null

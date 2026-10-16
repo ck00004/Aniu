@@ -26,7 +26,7 @@ _MAX_REPLAY_EVENTS = 500
 
 
 class _RunChannel:
-    __slots__ = ("run_id", "subscribers", "history", "finished_at", "lock")
+    __slots__ = ("run_id", "subscribers", "history", "finished_at", "lock", "next_seq")
 
     def __init__(self, run_id: int) -> None:
         self.run_id = run_id
@@ -34,6 +34,7 @@ class _RunChannel:
         self.history: list[dict[str, Any]] = []
         self.finished_at: float | None = None
         self.lock = threading.Lock()
+        self.next_seq = 1
 
 
 class EventBus:
@@ -64,6 +65,10 @@ class EventBus:
 
         channel = self._get_or_create(run_id)
         with channel.lock:
+            # 单调递增事件序号：断线重连时客户端携带 after_seq 游标，
+            # 从重放缓冲中续传未消费的事件（移植自原版 Aniu stream_hub）。
+            payload["event_seq"] = channel.next_seq
+            channel.next_seq += 1
             channel.history.append(payload)
             if len(channel.history) > _MAX_REPLAY_EVENTS:
                 del channel.history[: len(channel.history) - _MAX_REPLAY_EVENTS]
@@ -71,7 +76,10 @@ class EventBus:
 
         for sub in subscribers:
             try:
-                if sub.qsize() >= _MAX_SUBSCRIBER_BACKLOG:
+                if (
+                    sub.qsize() >= _MAX_SUBSCRIBER_BACKLOG
+                    and event_type not in {"completed", "failed"}
+                ):
                     logger.warning(
                         "event_bus subscriber backlog exceeded for run_id=%s, dropping",
                         run_id,
@@ -86,12 +94,24 @@ class EventBus:
                 channel.finished_at = time.time()
             self._maybe_expire_finished()
 
-    def subscribe(self, run_id: int) -> tuple[queue.Queue[dict[str, Any] | None], list[dict[str, Any]]]:
+    def subscribe(
+        self,
+        run_id: int,
+        *,
+        after_seq: int | None = None,
+    ) -> tuple[queue.Queue[dict[str, Any] | None], list[dict[str, Any]]]:
         channel = self._get_or_create(run_id)
         sub: queue.Queue[dict[str, Any] | None] = queue.Queue()
         with channel.lock:
             snapshot = list(channel.history)
             channel.subscribers.append(sub)
+        if after_seq is not None:
+            # 断线续传：只重放游标之后的事件
+            snapshot = [
+                event
+                for event in snapshot
+                if int(event.get("event_seq") or 0) > int(after_seq)
+            ]
         return sub, snapshot
 
     def unsubscribe(self, run_id: int, sub: queue.Queue[dict[str, Any] | None]) -> None:
@@ -124,9 +144,18 @@ class EventBus:
             for rid in expired:
                 self._channels.pop(rid, None)
 
-    def stream(self, run_id: int, *, stop_event: threading.Event | None = None) -> Iterator[dict[str, Any]]:
-        """Blocking generator yielding events for `run_id` until the run ends."""
-        sub, snapshot = self.subscribe(run_id)
+    def stream(
+        self,
+        run_id: int,
+        *,
+        stop_event: threading.Event | None = None,
+        after_seq: int | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Blocking generator yielding events for `run_id` until the run ends.
+
+        `after_seq`：断线续传游标，只重放该序号之后的事件。
+        """
+        sub, snapshot = self.subscribe(run_id, after_seq=after_seq)
         try:
             for event in snapshot:
                 yield event

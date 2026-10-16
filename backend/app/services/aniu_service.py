@@ -50,6 +50,7 @@ from app.services.event_bus import make_emitter
 from app.services.cls_news_service import cls_news_service
 from app.services.jin10_news_service import jin10_news_service
 from app.services.llm_service import LLMStreamCancelled, llm_service
+from app.services.run_abort_service import run_abort_registry
 from app.services.mx_skill_service import mx_skill_service
 from app.services.mx_service import MXClient
 from app.services.token_estimator import (
@@ -464,7 +465,10 @@ class AniuService:
         instance = self.get_or_create_settings(db)
         sensitive_fields = {"mx_api_key", "llm_api_key"}
         changed_fields: list[str] = []
-        for field, value in payload.model_dump().items():
+        # exclude_unset：只更新请求中显式提供的字段。否则 Pydantic 会为
+        # 未提交的字段填入 schema 默认值并整体写回，把后端自行维护的
+        # automation_* 配置静默重置。
+        for field, value in payload.model_dump(exclude_unset=True).items():
             if field in sensitive_fields:
                 if isinstance(value, str) and "****" in value:
                     continue
@@ -549,7 +553,13 @@ class AniuService:
         stmt = select(StrategyRun)
 
         if run_date is not None:
-            start_of_day = datetime.combine(run_date, datetime.min.time())
+            # run_date 是用户选择的上海日历日；started_at 存储为 naive UTC，
+            # 因此先把上海日界换算成 UTC 再比较，避免凌晨 0-8 点的运行归错日期。
+            start_of_day = (
+                datetime.combine(run_date, datetime.min.time(), tzinfo=SHANGHAI_TZ)
+                .astimezone(timezone.utc)
+                .replace(tzinfo=None)
+            )
             end_of_day = start_of_day + timedelta(days=1)
             stmt = stmt.where(
                 StrategyRun.started_at >= start_of_day,
@@ -597,7 +607,21 @@ class AniuService:
         }
 
     def get_runtime_overview(self, db: Session) -> dict[str, Any]:
-        runs = self.list_runs(db, limit=100)
+        # 按时间窗口查询而非"最近 100 条"：默认调度密度（交易日每 30 分钟）
+        # 下 3 个交易日即可超过 100 条，内存子集过滤会让近 3/7 天统计
+        # 系统性偏低。
+        window_start = (
+            now_utc() - timedelta(days=7)
+        ).replace(tzinfo=None)
+        stmt = (
+            select(StrategyRun)
+            .where(StrategyRun.started_at >= window_start)
+            .order_by(StrategyRun.started_at.desc(), StrategyRun.id.desc())
+            .limit(1000)
+        )
+        runs = list(db.scalars(stmt).all())
+        for run in runs:
+            self._hydrate_run_datetimes(run, include_display_fields=False)
         latest_run = runs[0] if runs else None
         return {
             "last_run": self._build_runtime_last_run(latest_run),
@@ -611,6 +635,64 @@ class AniuService:
                 [run for run in runs if self._is_within_days(run.started_at, 7)]
             ),
         }
+
+    def fail_stale_running_runs(self, db: Session) -> int:
+        """启动时把遗留的 running 状态运行标记为失败。
+
+        进程在运行中被杀死/重启时，run 行会永远停留在 "running"（调度
+        线程是 daemon 线程，shutdown 的 join 超时后直接被硬杀）。这些
+        僵尸记录会阻塞删除并让前端事件流永久挂起，必须在启动时收敛。
+
+        同时把受影响调度的 next_run_at 推进到下一个 cron 槽位：被杀的
+        run 可能已执行部分真实交易但未持久化会话上下文，若调度仍指向
+        过去的时间，重启后会立即重跑同一槽位，模型不知道已执行的交易
+        而重新下单——这是重复委托/敞口放大的真实路径。
+        """
+        stale_runs = list(
+            db.scalars(
+                select(StrategyRun).where(StrategyRun.status == "running")
+            ).all()
+        )
+        affected_schedule_ids: set[int] = set()
+        for run in stale_runs:
+            run.status = "failed"
+            run.error_message = "运行中断：服务重启，任务未完成。"
+            run.finished_at = now_utc()
+            db.add(run)
+            if run.schedule_id:
+                affected_schedule_ids.add(int(run.schedule_id))
+        for schedule_id in affected_schedule_ids:
+            schedule = db.get(StrategySchedule, schedule_id)
+            if schedule is None or not schedule.enabled:
+                continue
+            try:
+                schedule.next_run_at = self._compute_next_run_at(
+                    schedule.cron_expression,
+                    from_time=now_shanghai(),
+                    market_day_type=schedule.market_day_type,
+                )
+            except Exception as exc:
+                # 日历等依赖失败时退到保守间隔：宁可推迟也不允许立即
+                # 重触发同一槽位。
+                schedule.next_run_at = now_utc() + timedelta(minutes=30)
+                logger.warning(
+                    "advance next_run_at after stale run failed for schedule_id=%s, "
+                    "fallback to +30min: %s",
+                    schedule_id,
+                    exc,
+                )
+            schedule.retry_count = 0
+            schedule.retry_after_at = None
+            db.add(schedule)
+        if stale_runs:
+            db.commit()
+            logger.warning(
+                "marked %s stale running run(s) as failed at startup "
+                "(advanced %s affected schedule(s))",
+                len(stale_runs),
+                len(affected_schedule_ids),
+            )
+        return len(stale_runs)
 
     def get_run(self, db: Session, run_id: int) -> StrategyRun | None:
         stmt = (
@@ -1227,6 +1309,11 @@ class AniuService:
         }
 
     def _extract_usage(self, payload: Any) -> dict[str, Any] | None:
+        """从 LLM 请求/响应 payload 提取 usage，多轮工具调用按轮累计。
+
+        旧实现只取最后一个含 usage 的响应——多轮 agent 每轮 prompt 都在
+        增长，真实消耗是各轮之和，只记最后一轮会系统性少记。
+        """
         if not isinstance(payload, dict):
             return None
 
@@ -1238,13 +1325,36 @@ class AniuService:
         if not isinstance(responses, list):
             return None
 
-        for item in reversed(responses):
+        def _usage_int(usage: dict[str, Any], key: str) -> int:
+            value = usage.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return 0
+            return max(0, int(value))
+
+        totals: dict[str, int] = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+        found_any = False
+        for item in responses:
             if not isinstance(item, dict):
                 continue
             usage = item.get("usage")
-            if isinstance(usage, dict):
-                return usage
-        return None
+            if not isinstance(usage, dict):
+                continue
+            found_any = True
+            totals["prompt_tokens"] += _usage_int(usage, "prompt_tokens")
+            totals["completion_tokens"] += _usage_int(usage, "completion_tokens")
+            totals["total_tokens"] += _usage_int(usage, "total_tokens")
+
+        if not found_any:
+            return None
+        if totals["total_tokens"] == 0:
+            totals["total_tokens"] = (
+                totals["prompt_tokens"] + totals["completion_tokens"]
+            )
+        return totals
 
     def _coerce_token_value(self, value: Any) -> int | None:
         numeric = _parse_float(value)
@@ -2513,6 +2623,7 @@ class AniuService:
         messages: list[dict[str, Any]],
         emit: Any = None,
         tool_executor: Any = None,
+        cancel_event: Any = None,
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
         kwargs = {
             "app_settings": app_settings,
@@ -2520,14 +2631,58 @@ class AniuService:
             "messages": messages,
             "emit": emit,
         }
-        if tool_executor is not None:
+        optional_fields: list[tuple[str, Any]] = [("tool_executor", tool_executor)]
+        if cancel_event is not None:
+            optional_fields.append(("cancel_event", cancel_event))
+        for field_name, value in optional_fields:
+            if value is None:
+                continue
             try:
                 signature = inspect.signature(llm_service.run_agent_with_messages)
             except (TypeError, ValueError):
                 signature = None
-            if signature is None or "tool_executor" in signature.parameters:
-                kwargs["tool_executor"] = tool_executor
+            if signature is None or field_name in signature.parameters:
+                kwargs[field_name] = value
         return llm_service.run_agent_with_messages(**kwargs)
+
+    def _build_planning_tool_executor(
+        self,
+        *,
+        settings: Any,
+        client: MXClient,
+    ) -> Any:
+        """构建"变更工具只生成计划、不直接执行"的工具执行器。
+
+        一致性 followup 等二次 LLM 调用必须使用该执行器：否则模型在
+        followup 中调用的交易/自选股工具会被默认执行器直接真实执行，
+        绕过计划落库与 execution_runner 的状态跟踪。
+        """
+        planning_sequence = {"value": 0}
+        run_type = str(getattr(settings, "run_type", "analysis") or "analysis")
+
+        def _planning_tool_executor(
+            tool_name: str,
+            arguments: dict[str, Any],
+            tool_call_id: str | None,
+        ) -> dict[str, Any]:
+            is_mutation = execution_plan_service.is_mutation_tool(tool_name)
+            next_sequence = planning_sequence["value"] + 1 if is_mutation else planning_sequence["value"]
+            tool_result, _draft = execution_plan_service.execute_tool(
+                tool_name=tool_name,
+                arguments=arguments,
+                tool_call_id=tool_call_id,
+                context={
+                    "client": client,
+                    "app_settings": settings,
+                    "run_type": run_type,
+                },
+                sequence_no=next_sequence,
+            )
+            if is_mutation and bool(tool_result.get("ok")):
+                planning_sequence["value"] = next_sequence
+            return tool_result
+
+        return _planning_tool_executor
 
     def _run_body(
         self,
@@ -2538,11 +2693,16 @@ class AniuService:
         schedule_id: int | None,
         emit: Any = None,
         return_full_run: bool = True,
+        cancel_event: Any = None,
     ) -> StrategyRun | None:
         session_context: PersistentRunSessionContext | None = None
         automation_phase = "llm"
         runtime_trace: dict[str, Any] | None = None
         _emit = emit if callable(emit) else (lambda *_a, **_kw: None)
+
+        def _check_aborted() -> None:
+            if cancel_event is not None and cancel_event.is_set():
+                raise LLMStreamCancelled("运行已被用户中止。")
 
         try:
             logger.info(
@@ -2563,6 +2723,7 @@ class AniuService:
             prefetched_context, prefetched_context_meta = (
                 self._prefetch_analysis_context(settings=settings, emit=_emit)
             )
+            _check_aborted()
             primary_prefetched_context_meta = self._select_primary_prefetched_context_meta(
                 prefetched_context_meta
             )
@@ -2579,29 +2740,10 @@ class AniuService:
                     prefetched_context=prefetched_context,
                     prefetched_context_meta=prefetched_context_meta,
                 )
-                planning_sequence = {"value": 0}
-
-                def _planning_tool_executor(
-                    tool_name: str,
-                    arguments: dict[str, Any],
-                    tool_call_id: str | None,
-                ) -> dict[str, Any]:
-                    is_mutation = execution_plan_service.is_mutation_tool(tool_name)
-                    next_sequence = planning_sequence["value"] + 1 if is_mutation else planning_sequence["value"]
-                    tool_result, _draft = execution_plan_service.execute_tool(
-                        tool_name=tool_name,
-                        arguments=arguments,
-                        tool_call_id=tool_call_id,
-                        context={
-                            "client": client,
-                            "app_settings": settings,
-                            "run_type": str(getattr(settings, "run_type", "analysis") or "analysis"),
-                        },
-                        sequence_no=next_sequence,
-                    )
-                    if is_mutation and bool(tool_result.get("ok")):
-                        planning_sequence["value"] = next_sequence
-                    return tool_result
+                _planning_tool_executor = self._build_planning_tool_executor(
+                    settings=settings,
+                    client=client,
+                )
 
                 decision, llm_request, llm_response, runtime_trace = (
                     self._run_agent_with_optional_tool_executor(
@@ -2610,8 +2752,10 @@ class AniuService:
                         messages=session_context.messages,
                         emit=_emit,
                         tool_executor=_planning_tool_executor,
+                        cancel_event=cancel_event,
                     )
                 )
+                _check_aborted()
                 (
                     decision,
                     llm_request,
@@ -2626,6 +2770,7 @@ class AniuService:
                     llm_response=llm_response,
                     runtime_trace=runtime_trace,
                     emit=_emit,
+                    tool_executor=_planning_tool_executor,
                 )
                 (
                     decision,
@@ -2641,6 +2786,7 @@ class AniuService:
                     llm_response=llm_response,
                     runtime_trace=runtime_trace,
                     emit=_emit,
+                    tool_executor=_planning_tool_executor,
                 )
 
                 tool_calls = decision.get("tool_calls")
@@ -2652,6 +2798,8 @@ class AniuService:
                 executed_actions: list[dict[str, Any]] = []
                 execution_tool_calls: list[dict[str, Any]] = []
                 if planned_action_drafts:
+                    # 执行真实交易前最后确认中止状态：中止请求优先于下单。
+                    _check_aborted()
                     execution_runner_service.replace_plan(
                         run_id=run_id,
                         planned_actions=planned_action_drafts,
@@ -2666,6 +2814,7 @@ class AniuService:
                         client=client,
                         app_settings=settings,
                         emit=_emit,
+                        cancel_event=cancel_event,
                     )
                     executed_actions = list(execution_result.executed_actions)
                     execution_tool_calls = list(execution_result.execution_tool_calls)
@@ -2798,10 +2947,9 @@ class AniuService:
                         schedule.last_run_at = completed_at
                         schedule.retry_count = 0
                         schedule.retry_after_at = None
-                        schedule.next_run_at = self._compute_next_run_at(
-                            schedule.cron_expression,
+                        schedule.next_run_at = self._safe_compute_next_run_at(
+                            schedule,
                             from_time=completed_at_shanghai,
-                            market_day_type=schedule.market_day_type,
                         )
                         db.add(schedule)
 
@@ -2897,6 +3045,29 @@ class AniuService:
                     actions=len(executed_actions),
                 )
                 return run
+        except LLMStreamCancelled as exc:
+            # 用户主动中止：与普通失败区分，给出明确的中止语义。
+            abort_message = "运行已被用户中止。" if "中止" in str(exc) else str(exc)
+            logger.info("execute_run aborted: run_id=%s", run_id)
+            with session_scope() as db:
+                run = db.get(StrategyRun, run_id)
+                if run is not None:
+                    run.status = "failed"
+                    run.error_message = abort_message
+                    run.final_answer = None
+                    run.finished_at = now_utc()
+                    db.add(run)
+                    if schedule_id:
+                        schedule = db.get(StrategySchedule, schedule_id)
+                        if schedule is not None:
+                            schedule.last_run_at = now_utc()
+                            schedule.next_run_at = self._safe_compute_next_run_at(
+                                schedule,
+                                from_time=now_shanghai(),
+                            )
+                            db.add(schedule)
+            _emit("failed", message=abort_message)
+            raise
         except Exception as exc:
             logger.error(
                 "execute_run failed: run_id=%s, error=%s",
@@ -2970,10 +3141,9 @@ class AniuService:
                     schedule = db.get(StrategySchedule, schedule_id)
                     if schedule is not None:
                         schedule.last_run_at = now_utc()
-                        schedule.next_run_at = self._compute_next_run_at(
-                            schedule.cron_expression,
+                        schedule.next_run_at = self._safe_compute_next_run_at(
+                            schedule,
                             from_time=now_shanghai(),
-                            market_day_type=schedule.market_day_type,
                         )
                         if trigger_source == "schedule":
                             retry_count = max(int(schedule.retry_count or 0), 0)
@@ -3003,12 +3173,17 @@ class AniuService:
                 schedule_id,
                 manual_run_type,
             )
-            return self._run_body(
-                run_id=run_id,
-                settings_snapshot=settings_snapshot,
-                trigger_source=trigger_source,
-                schedule_id=schedule_id,
-            )
+            cancel_event = run_abort_registry.register(run_id)
+            try:
+                return self._run_body(
+                    run_id=run_id,
+                    settings_snapshot=settings_snapshot,
+                    trigger_source=trigger_source,
+                    schedule_id=schedule_id,
+                    cancel_event=cancel_event,
+                )
+            finally:
+                run_abort_registry.unregister(run_id)
         finally:
             self._run_lock.release()
 
@@ -3037,6 +3212,7 @@ class AniuService:
             raise
 
         emit = make_emitter(run_id)
+        cancel_event = run_abort_registry.register(run_id)
 
         def _worker() -> None:
             try:
@@ -3047,10 +3223,12 @@ class AniuService:
                     schedule_id=schedule_id,
                     emit=emit,
                     return_full_run=False,
+                    cancel_event=cancel_event,
                 )
             except Exception:
                 logger.exception("async run worker failed: run_id=%s", run_id)
             finally:
+                run_abort_registry.unregister(run_id)
                 self._run_lock.release()
 
         Thread(
@@ -3228,18 +3406,69 @@ class AniuService:
             action_records.append(entry)
         return action_records
 
+    @staticmethod
+    def _planned_action_dedupe_key(action_payload: dict[str, Any]) -> tuple[str, ...]:
+        """计划动作的幂等键：同一 run 内完全相同的动作只应执行一次。
+
+        主循环草稿与一致性 followup 草稿（或模型多轮重复发起）可能对
+        同一标的生成完全相同的计划，不去重会导致重复真实委托、敞口
+        被动放大。合法的加仓/分批因数量或价格不同而键不同，不受影响。
+        """
+        action = str(action_payload.get("action") or "").upper()
+        symbol = str(
+            action_payload.get("symbol")
+            or action_payload.get("stock_code")
+            or ""
+        ).strip()
+        if action in {"BUY", "SELL"}:
+            try:
+                quantity = int(action_payload.get("quantity") or 0)
+            except (TypeError, ValueError):
+                quantity = 0
+            return (
+                action,
+                symbol,
+                quantity,
+                str(action_payload.get("price_type") or "MARKET").upper(),
+                str(action_payload.get("price") or ""),
+            )
+        if action == "CANCEL":
+            return (
+                action,
+                str(action_payload.get("order_id") or "").strip(),
+                symbol,
+            )
+        if action == "MANAGE_SELF_SELECT":
+            return (action, str(action_payload.get("query") or "").strip())
+        return (action, symbol)
+
     def _extract_planned_actions(self, tool_calls: Any) -> list[dict[str, Any]]:
-        return self._extract_action_records(
+        records = self._extract_action_records(
             tool_calls,
             payload_key="planned_action",
             default_status="planned",
         )
+        seen: set[tuple[str, ...]] = set()
+        deduped: list[dict[str, Any]] = []
+        for entry in records:
+            key = self._planned_action_dedupe_key(entry)
+            if key in seen:
+                logger.warning(
+                    "dropped duplicate planned action in same run: action=%s symbol=%s",
+                    entry.get("action"),
+                    entry.get("symbol"),
+                )
+                continue
+            seen.add(key)
+            deduped.append(entry)
+        return deduped
 
     def _extract_planned_action_drafts(self, tool_calls: Any) -> list[dict[str, Any]]:
         if not isinstance(tool_calls, list):
             return []
 
         drafts: list[dict[str, Any]] = []
+        seen_keys: set[tuple[str, ...]] = set()
         sequence_no = 0
         for item in tool_calls:
             if not isinstance(item, dict):
@@ -3250,6 +3479,15 @@ class AniuService:
             planned_action = result.get("planned_action")
             if not isinstance(planned_action, dict):
                 continue
+            key = self._planned_action_dedupe_key(planned_action)
+            if key in seen_keys:
+                logger.warning(
+                    "dropped duplicate planned draft in same run: action=%s symbol=%s",
+                    planned_action.get("action"),
+                    planned_action.get("symbol"),
+                )
+                continue
+            seen_keys.add(key)
             sequence_no += 1
             action_type = str(planned_action.get("action") or "").upper() or "UNKNOWN"
             drafts.append(
@@ -3458,10 +3696,8 @@ class AniuService:
             "raw_query": raw_query,
         }
 
-    def _extract_stock_mentions(self, text: Any) -> set[str]:
-        content = str(text or "")
-        mentions: set[str] = set()
-        stopwords = {
+    _SELF_SELECT_STOPWORDS = frozenset(
+        {
             "新增",
             "移除",
             "新增自选股",
@@ -3471,8 +3707,60 @@ class AniuService:
             "自选新增",
             "自选移除",
             "自选股",
+            "自选",
             "本轮",
+            "新增了",
+            "移除了",
+            "只自选股",
+            "股票",
+            "个股",
+            "标的",
+            "标的物",
+            "关注",
+            "跟踪",
+            "观察",
+            "理由",
+            "逻辑",
+            "风险",
+            "提示",
+            "备注",
+            "原因",
+            "结论",
+            "总结",
+            "建议",
+            "操作",
+            "信号",
+            "业绩",
+            "估值",
+            "仓位",
+            "板块",
+            "市场",
+            "大盘",
+            "指数",
+            "今日",
+            "昨日",
+            "明日",
+            "以下",
+            "如下",
+            "如下所示",
+            "暂无",
+            "无",
+            "估值偏低",
+            "估值偏高",
+            "估值合理",
+            "业绩增长",
+            "涨幅居前",
+            "跌幅居前",
+            "逢低布局",
+            "持续跟踪",
+            "重点关注",
         }
+    )
+
+    def _extract_stock_mentions(self, text: Any) -> set[str]:
+        content = str(text or "")
+        mentions: set[str] = set()
+        stopwords = self._SELF_SELECT_STOPWORDS
         for matched in re.findall(r"([A-Za-z\u4e00-\u9fa5\-*]{2,20})\s*[（(]\s*(\d{6})\s*[)）]", content):
             name, code = matched
             clean_name = self._clean_self_select_target(name)
@@ -3483,9 +3771,18 @@ class AniuService:
         for code in re.findall(r"\b\d{6}\b", content):
             mentions.add(code)
 
-        for name in re.findall(r"[\u4e00-\u9fa5A-Za-z]{2,20}", content):
+        # 裸名称模式只接受"像股票名"的 token：纯中文限 2-4 字（A 股名称
+        # 长度），含拉丁字母的混合名（如 TCL科技）放宽到 8 字。更长的
+        # 中文短语（"业绩超预期"等理由文本）不当作自选股目标。
+        for name in re.findall(r"[\u4e00-\u9fa5A-Za-z]{2,8}", content):
             clean_name = self._clean_self_select_target(name)
-            if clean_name and clean_name not in stopwords:
+            if not clean_name or clean_name in stopwords:
+                continue
+            has_latin = any(
+                character.isascii() and character.isalpha()
+                for character in clean_name
+            )
+            if has_latin or 2 <= len(clean_name) <= 4:
                 mentions.add(clean_name)
         return mentions
 
@@ -3522,6 +3819,13 @@ class AniuService:
             normalized_line = list_item_pattern.sub("", line).strip()
             return any(normalized_line.startswith(prefix) for prefix in prefixes)
 
+        def _name_segment(source: str) -> str:
+            # 条目/标题形如 "名称(600519)：理由" 时只取冒号前的名称部分，
+            # 避免把理由里的普通中文词（"业绩超预期"等）当成自选股目标。
+            parts = re.split(r"[:：]", source, maxsplit=1)
+            segment = parts[1].strip() if len(parts) > 1 else source
+            return segment or source
+
         current_action: str | None = None
         for raw_line in text.splitlines():
             line = str(raw_line or "").strip()
@@ -3532,13 +3836,13 @@ class AniuService:
             compact = re.sub(r"\s+", "", line)
             if _matches_section_marker(("新增自选股", "本轮新增", "自选新增")):
                 current_action = "add"
-                mentions = self._extract_stock_mentions(line)
+                mentions = self._extract_stock_mentions(_name_segment(line))
                 for target in mentions:
                     _push("add", target, line)
                 continue
             if _matches_section_marker(("移除自选股", "本轮移除", "自选移除")):
                 current_action = "remove"
-                mentions = self._extract_stock_mentions(line)
+                mentions = self._extract_stock_mentions(_name_segment(line))
                 for target in mentions:
                     _push("remove", target, line)
                 continue
@@ -3547,7 +3851,7 @@ class AniuService:
                 for token in ("新增候选", "新增关注", "新增重点跟踪", "重点跟踪的新增候选")
             ) and (line.endswith((":", "：")) or "只有" in line or "如下" in line):
                 current_action = "add"
-                mentions = self._extract_stock_mentions(line)
+                mentions = self._extract_stock_mentions(_name_segment(line))
                 for target in mentions:
                     _push("add", target, line)
                 continue
@@ -3557,7 +3861,7 @@ class AniuService:
                 prefix = re.split(r"[:：]", normalized_item, maxsplit=1)[0].strip()
                 if any(prefix.startswith(token) for token in ignored_item_prefixes):
                     continue
-                mentions = self._extract_stock_mentions(normalized_item)
+                mentions = self._extract_stock_mentions(prefix)
                 for target in mentions:
                     _push(current_action, target, normalized_item)
                 continue
@@ -3569,14 +3873,16 @@ class AniuService:
             (
                 "add",
                 re.compile(
-                    r"^\s*(?:[-*•]\s*)?(?:自选新增|新增自选股|本轮新增)\s*[:：]\s*([^。；;\n]+)",
+                    # 冒号后的空白不允许跨行（\s 会吞掉换行符，把下一行
+                    # 的列表项连同理由文本一起捕获成名称段）。
+                    r"^[ \t]*(?:[-*•][ \t]*)?(?:自选新增|新增自选股|本轮新增)[ \t]*[:：][ \t]*([^。；;\n]+)",
                     re.MULTILINE,
                 ),
             ),
             (
                 "remove",
                 re.compile(
-                    r"^\s*(?:[-*•]\s*)?(?:自选移除|移除自选股|本轮移除)\s*[:：]\s*([^。；;\n]+)",
+                    r"^[ \t]*(?:[-*•][ \t]*)?(?:自选移除|移除自选股|本轮移除)[ \t]*[:：][ \t]*([^。；;\n]+)",
                     re.MULTILINE,
                 ),
             ),
@@ -3594,6 +3900,30 @@ class AniuService:
 
         return changes
 
+    _TRADE_CONDITIONAL_MARKERS: tuple[str, ...] = (
+        "若",
+        "如果",
+        "如",
+        "观察",
+        "计划",
+        "预案",
+        "等待",
+        "可能",
+        "考虑",
+    )
+
+    @classmethod
+    def _line_has_conditional_marker(cls, line: str) -> bool:
+        # "如下"是列举引导词而非条件词（"执行情况如下：买入…"），
+        # 不能因单字"如"把整行当作条件表述跳过。
+        for marker in cls._TRADE_CONDITIONAL_MARKERS:
+            if marker == "如":
+                if "如" in line.replace("如下", ""):
+                    return True
+            elif marker in line:
+                return True
+        return False
+
     def _extract_claimed_trade_changes(self, final_answer: Any) -> list[dict[str, str]]:
         text = str(final_answer or "").strip()
         if not text:
@@ -3601,7 +3931,6 @@ class AniuService:
 
         changes: list[dict[str, str]] = []
         seen: set[tuple[str, str]] = set()
-        conditional_markers = ("若", "如果", "如", "观察", "计划", "预案", "等待", "可能", "考虑")
 
         def _push(action: str, target: str, raw: str) -> None:
             normalized_target = self._clean_self_select_target(target)
@@ -3623,7 +3952,7 @@ class AniuService:
             line = str(raw_line or "").strip()
             if not line:
                 continue
-            if any(marker in line for marker in conditional_markers):
+            if self._line_has_conditional_marker(line):
                 continue
             for action, pattern in patterns:
                 match = pattern.search(line)
@@ -3646,17 +3975,6 @@ class AniuService:
 
         claims: list[dict[str, Any]] = []
         seen: set[tuple[str, str, int, str, str | None]] = set()
-        conditional_markers = (
-            "若",
-            "如果",
-            "如",
-            "观察",
-            "计划",
-            "预案",
-            "等待",
-            "可能",
-            "考虑",
-        )
         patterns: list[tuple[str, re.Pattern[str]]] = [
             (
                 "BUY",
@@ -3682,7 +4000,7 @@ class AniuService:
             line = str(raw_line or "").strip()
             if not line:
                 continue
-            if any(marker in line for marker in conditional_markers):
+            if self._line_has_conditional_marker(line):
                 continue
 
             upper_line = line.upper()
@@ -3746,6 +4064,7 @@ class AniuService:
             existing_actions = self._extract_executed_actions(existing_tool_calls)
 
         existing_trade_keys: set[tuple[str, str, int, str, str | None]] = set()
+        existing_trade_targets: set[tuple[str, str]] = set()
         for item in existing_actions:
             if not isinstance(item, dict):
                 continue
@@ -3762,6 +4081,10 @@ class AniuService:
                     price=item.get("price"),
                 )
             )
+            existing_trade_targets.add((action, symbol))
+            item_name = str(item.get("name") or "").strip()
+            if item_name:
+                existing_trade_targets.add((action, item_name))
 
         sequence_no = len(existing_actions)
         operations: list[dict[str, Any]] = []
@@ -3769,6 +4092,15 @@ class AniuService:
             action = str(claim.get("action") or "").upper()
             symbol = str(claim.get("symbol") or "").strip()
             if action not in {"BUY", "SELL"} or not symbol:
+                continue
+
+            # 名称级查重（与 gap 判定同粒度）：模型已对该标的执行过同向
+            # 操作时，数量/价格不一致属于模型表述问题而非执行缺口，不再
+            # 自动补单，避免在另一缺口触发 autofill 时产生重复真实委托。
+            claim_name = str(claim.get("name") or "").strip()
+            if (action, symbol) in existing_trade_targets:
+                continue
+            if claim_name and (action, claim_name) in existing_trade_targets:
                 continue
 
             operation_key = self._build_trade_action_key(
@@ -3808,6 +4140,9 @@ class AniuService:
                 }
             )
             existing_trade_keys.add(operation_key)
+            existing_trade_targets.add((action, symbol))
+            if claim_name:
+                existing_trade_targets.add((action, claim_name))
 
         return {
             "schema": "consistency_operation_v1",
@@ -3858,12 +4193,20 @@ class AniuService:
             action = str(item.get("action") or "").upper()
             if action not in {"BUY", "SELL", "CANCEL"}:
                 continue
-            symbol = str(item.get("symbol") or "").strip()
+            symbol = str(item.get("symbol") or item.get("stock_code") or "").strip()
             name = str(item.get("name") or "").strip()
             if symbol:
                 changes.append({"action": action, "target": symbol, "raw_query": symbol})
             if name:
                 changes.append({"action": action, "target": name, "raw_query": name})
+            if action == "CANCEL" and not symbol and not name:
+                # 撤单记录可能只带 order_id；仍需产生条目，否则已执行的
+                # 撤单会被一致性校验误判为缺口。
+                order_id = str(item.get("order_id") or "").strip()
+                fallback = order_id or "委托"
+                changes.append(
+                    {"action": action, "target": fallback, "raw_query": fallback}
+                )
         return changes
 
     def _has_trade_consistency_gap(
@@ -3893,6 +4236,12 @@ class AniuService:
             action = item.get("action")
             target = self._clean_self_select_target(item.get("target"))
             if action not in actual_targets_by_action:
+                continue
+            if action == "CANCEL":
+                # 声称的撤单目标通常是"委托"等普通名词，与实际撤单记录的
+                # 股票名/单号天然无法对应；只要本轮存在实际撤单即视为一致。
+                if not actual_targets_by_action["CANCEL"]:
+                    return True
                 continue
             claimed_tokens = {target}
             claimed_tokens.update(self._extract_stock_mentions(target))
@@ -4284,6 +4633,7 @@ class AniuService:
         llm_response: dict[str, Any],
         runtime_trace: dict[str, Any],
         emit: Any = None,
+        tool_executor: Any = None,
     ) -> tuple[
         dict[str, Any],
         dict[str, Any],
@@ -4400,11 +4750,12 @@ class AniuService:
             }
         )
         followup_decision, followup_request, followup_response, followup_runtime_trace = (
-            llm_service.run_agent_with_messages(
+            self._run_agent_with_optional_tool_executor(
                 app_settings=settings,
                 client=client,
                 messages=followup_messages,
                 emit=emit,
+                tool_executor=tool_executor,
             )
         )
 
@@ -4466,6 +4817,7 @@ class AniuService:
         llm_response: dict[str, Any],
         runtime_trace: dict[str, Any],
         emit: Any = None,
+        tool_executor: Any = None,
     ) -> tuple[
         dict[str, Any],
         dict[str, Any],
@@ -4474,6 +4826,15 @@ class AniuService:
         list[dict[str, Any]],
     ]:
         _emit = emit if callable(emit) else (lambda *_a, **_kw: None)
+        # 交易一致性 autofill 只允许在交易任务中生效：分析任务的最终答案
+        # 常包含"建议买入"等表述，若不门控，autofill 会在用户未开启
+        # 交易的分析任务里自动下达真实模拟委托。
+        if str(getattr(settings, "run_type", "trade") or "trade").strip() != "trade":
+            tool_calls = decision.get("tool_calls")
+            action_records = self._extract_planned_actions(tool_calls)
+            if not action_records:
+                action_records = self._extract_executed_actions(tool_calls)
+            return dict(decision), llm_request, llm_response, runtime_trace, action_records
         tool_calls = decision.get("tool_calls")
         planned_actions = self._extract_planned_actions(tool_calls)
         if not planned_actions:
@@ -4574,11 +4935,12 @@ class AniuService:
             }
         )
         followup_decision, followup_request, followup_response, followup_runtime_trace = (
-            llm_service.run_agent_with_messages(
+            self._run_agent_with_optional_tool_executor(
                 app_settings=settings,
                 client=client,
                 messages=followup_messages,
                 emit=emit,
+                tool_executor=tool_executor,
             )
         )
 
@@ -5350,7 +5712,13 @@ class AniuService:
         memory_messages: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
-        del session
+        # 压缩归档的摘要必须注入提示词，否则被归档的历史对模型
+        # 完全不可见，压缩就退化为纯删除上下文。
+        summary_message = self._build_persistent_session_context_system_message(
+            session=session
+        )
+        if summary_message is not None:
+            messages.append(summary_message)
         messages.extend(memory_messages)
         messages.extend(history_messages)
         return messages
@@ -5524,6 +5892,37 @@ class AniuService:
                 content="[上下文压缩摘要]\n" + incremental_summary,
             )
         return session.archived_summary, session.summary_revision
+
+    def _safe_compute_next_run_at(
+        self,
+        schedule: StrategySchedule,
+        *,
+        from_time: datetime | None = None,
+    ) -> datetime:
+        """run 收尾路径专用的 next_run_at 计算：绝不允许抛异常。
+
+        成功路径里交易已执行、run 已标 completed；失败路径本身已在
+        except 块内。若此处因日历拉取失败等抛出异常，成功 run 会被
+        翻转成 failed（触发调度重试重跑），失败 run 则卡在 running 且
+        next_run_at 不推进（重启后反复重触发）——两者都会导致重复
+        委托。计算失败时退到保守间隔：宁可推迟也不允许立即重触发。
+        """
+        try:
+            next_run_at = self._compute_next_run_at(
+                schedule.cron_expression,
+                from_time=from_time,
+                market_day_type=schedule.market_day_type,
+            )
+        except Exception as exc:
+            logger.warning(
+                "compute next_run_at failed for schedule_id=%s, fallback +30min: %s",
+                schedule.id,
+                exc,
+            )
+            next_run_at = None
+        if next_run_at is None:
+            next_run_at = now_utc() + timedelta(minutes=30)
+        return next_run_at
 
     def _compute_next_run_at(
         self,

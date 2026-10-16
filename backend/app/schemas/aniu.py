@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -32,6 +32,7 @@ class AppSettingsBase(BaseModel):
     automation_recent_message_limit: int = Field(default=24, ge=4, le=200)
     automation_enable_auto_compaction: bool = True
     automation_idle_summary_hours: int = Field(default=12, ge=1, le=168)
+    automation_dream_time: str = Field(default="00:30", max_length=8)
 
 
 class AppSettingsRead(AppSettingsBase):
@@ -477,3 +478,64 @@ class LoginRequest(BaseModel):
 class LoginResponse(BaseModel):
     authenticated: bool
     token: str | None = None
+
+
+class MemoryItemRead(BaseModel):
+    id: int
+    content: str
+    reason: str | None = None
+    version: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class MemoryListRead(BaseModel):
+    total: int
+    items: list[MemoryItemRead] = Field(default_factory=list)
+
+
+class MemoryCreateRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=2000)
+    reason: str | None = Field(default=None, max_length=1000)
+
+
+class MemoryUpdateRequest(BaseModel):
+    content: str | None = Field(default=None, min_length=1, max_length=2000)
+    reason: str | None = Field(default=None, max_length=1000)
+    expected_version: int = Field(ge=1)
+
+
+class MemoryActivityRead(BaseModel):
+    id: int
+    action: str
+    keywords: list[str] | None = None
+    result_count: int | None = None
+    memory_id: int | None = None
+    created_at: datetime
+
+
+class MemoryActivityListRead(BaseModel):
+    total: int
+    items: list[MemoryActivityRead] = Field(default_factory=list)
+
+
+class MemoryDreamRead(BaseModel):
+    id: int
+    target_date: date
+    status: str
+    result: str | None = None
+    failure_reason: str | None = None
+    created_at: datetime
+    updated_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+
+class MemoryDreamListRead(BaseModel):
+    total: int
+    items: list[MemoryDreamRead] = Field(default_factory=list)
+
+
+class MemoryDreamRunResponse(BaseModel):
+    dream: MemoryDreamRead
+    started: bool

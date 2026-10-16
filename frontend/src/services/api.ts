@@ -1,4 +1,4 @@
-import type { AccountOverview, AppSettings, ChatAttachment, ChatRequest, ChatResponse, ChatSession, ChatSessionMessagesPayload, LoginRequest, LoginResponse, PersistentSession, PersistentSessionMessagesPayload, RawToolPreviewDetail, RunDetail, RunSummary, RunSummaryPage, RuntimeOverview, ScheduleConfig, SkillInfo, SkillListItem } from '../types.ts'
+import type { AccountOverview, AppSettings, ChatAttachment, ChatRequest, ChatResponse, ChatSession, ChatSessionMessagesPayload, LoginRequest, LoginResponse, MemoryActivityListPayload, MemoryDream, MemoryDreamListPayload, MemoryDreamRunPayload, MemoryItem, MemoryListPayload, PersistentSession, PersistentSessionMessagesPayload, RawToolPreviewDetail, RunDetail, RunSummary, RunSummaryPage, RuntimeOverview, ScheduleConfig, SkillInfo, SkillListItem } from '../types.ts'
 import {
   LOGIN_NOTICE_STORAGE_KEY,
   LOGIN_REDIRECT_STORAGE_KEY,
@@ -313,6 +313,73 @@ export const api = {
   },
   runEventsUrl(runId: number) {
     return `${API_PREFIX}/runs/${runId}/events`
+  },
+  abortRun(runId: number) {
+    return request<{ run_id: number, aborted: boolean }>(
+      `${API_PREFIX}/runs/${runId}/abort`,
+      { method: 'POST' },
+    )
+  },
+  listMemories(options: { query?: string, limit?: number, offset?: number } = {}) {
+    const params = new URLSearchParams()
+    if (options.query) {
+      params.set('query', options.query)
+    }
+    params.set('limit', String(options.limit ?? 20))
+    params.set('offset', String(options.offset ?? 0))
+    return request<MemoryListPayload>(
+      `${API_PREFIX}/memories?${params.toString()}`,
+    )
+  },
+  createMemory(content: string, reason: string | null) {
+    return request<MemoryItem>(`${API_PREFIX}/memories`, {
+      method: 'POST',
+      body: JSON.stringify({ content, reason }),
+    })
+  },
+  updateMemory(memoryId: number, payload: { content?: string, reason?: string | null, expected_version: number }) {
+    return request<MemoryItem>(`${API_PREFIX}/memories/${memoryId}`, {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    })
+  },
+  deleteMemory(memoryId: number, expectedVersion: number) {
+    return request<{ deleted: boolean }>(
+      `${API_PREFIX}/memories/${memoryId}?expected_version=${expectedVersion}`,
+      { method: 'DELETE' },
+    )
+  },
+  listMemoryActivities(options: { limit?: number, offset?: number } = {}) {
+    const params = new URLSearchParams()
+    params.set('limit', String(options.limit ?? 30))
+    params.set('offset', String(options.offset ?? 0))
+    return request<MemoryActivityListPayload>(
+      `${API_PREFIX}/memory-activities?${params.toString()}`,
+    )
+  },
+  listMemoryDreams(options: { limit?: number, offset?: number } = {}) {
+    const params = new URLSearchParams()
+    params.set('limit', String(options.limit ?? 20))
+    params.set('offset', String(options.offset ?? 0))
+    return request<MemoryDreamListPayload>(
+      `${API_PREFIX}/memory-dreams?${params.toString()}`,
+    )
+  },
+  getMemoryDream(dreamId: number) {
+    return request<MemoryDream>(`${API_PREFIX}/memory-dreams/${dreamId}`)
+  },
+  runMemoryDream(targetDate?: string) {
+    const suffix = targetDate ? `?date=${targetDate}` : ''
+    return request<MemoryDreamRunPayload>(
+      `${API_PREFIX}/memory-dreams/run${suffix}`,
+      { method: 'POST', timeoutMs: 30 * 1000 },
+    )
+  },
+  deleteMemoryDream(dreamId: number) {
+    return request<{ deleted: boolean }>(
+      `${API_PREFIX}/memory-dreams/${dreamId}`,
+      { method: 'DELETE' },
+    )
   },
   listRuns(options: number | ListRunsOptions = 20) {
     const config = typeof options === 'number' ? { limit: options } : options

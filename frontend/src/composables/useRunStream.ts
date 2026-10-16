@@ -1,8 +1,8 @@
 import { computed, effectScope, reactive, ref, watch } from 'vue'
 
-import { api, getStoredToken } from '@/services/api'
-import type { ApiDetail, TradeDetail } from '@/types'
-import { parseSseChunk } from '@/utils/sse'
+import { api, getStoredToken } from '../services/api.ts'
+import type { ApiDetail, TradeDetail } from '../types.ts'
+import { parseSseChunk } from '../utils/sse.ts'
 
 const PERSIST_KEY = 'aniu.runstream.v2'
 const MAX_EVENT_BUFFER = 300
@@ -491,6 +491,13 @@ function createRunStream() {
     })
   }
 
+  // SSE 断线续传（移植自原版 Aniu use-run-snapshot-stream 的重连设计）：
+  // 事件携带 event_seq 游标，流中断/静默结束时带 after_seq 指数退避重连，
+  // 从服务端重放缓冲续传未消费的事件。
+  const MAX_RECONNECT_ATTEMPTS = 6
+  const RECONNECT_BASE_DELAY_MS = 500
+  const RECONNECT_MAX_DELAY_MS = 8000
+
   async function start(id: number, options?: StartOptions): Promise<void> {
     stop()
     state.status = 'connecting'
@@ -512,24 +519,35 @@ function createRunStream() {
     liveNow.value = Date.now()
     ensureTimer()
 
-    controller = new AbortController()
-    const token = getStoredToken()
-    const headers: Record<string, string> = { Accept: 'text/event-stream' }
-    if (token) {
-      headers.Authorization = `Bearer ${token}`
-    }
+    let lastEventSeq: number | null = null
+    let attempts = 0
 
-    try {
-      const response = await fetch(api.runEventsUrl(id), {
+    const consumeOnce = async (afterSeq: number | null): Promise<void> => {
+      controller = new AbortController()
+      const token = getStoredToken()
+      const headers: Record<string, string> = { Accept: 'text/event-stream' }
+      if (token) {
+        headers.Authorization = `Bearer ${token}`
+      }
+      const url = api.runEventsUrl(id)
+        + (afterSeq !== null ? `?after_seq=${afterSeq}` : '')
+
+      const response = await fetch(url, {
         method: 'GET',
         headers,
-        signal: controller.signal,
+        signal: controller!.signal,
         cache: 'no-store',
       })
       if (!response.ok || !response.body) {
-        throw new Error(`SSE 连接失败 (${response.status})`)
+        const error = new Error(`SSE 连接失败 (${response.status})`) as Error & {
+          status?: number
+        }
+        error.status = response.status
+        throw error
       }
-      state.status = 'running'
+      if (state.status !== 'running') {
+        state.status = 'running'
+      }
 
       const reader = response.body.getReader()
       const decoder = new TextDecoder('utf-8')
@@ -547,19 +565,57 @@ function createRunStream() {
           const event = parseSseChunk<RunStreamEvent>(chunk, (err, payload) => {
             console.warn('[useRunStream] parse failed', err, payload)
           })
-          if (event) applyEvent(event)
+          if (event) {
+            applyEvent(event)
+            const seq = Number((event as { event_seq?: unknown }).event_seq)
+            if (Number.isFinite(seq) && seq > 0) {
+              lastEventSeq = seq
+            }
+          }
           idx = buffer.indexOf('\n\n')
         }
       }
-    } catch (err) {
-      if ((err as DOMException)?.name === 'AbortError') return
-      state.status = 'error'
-      state.stage = 'error'
-      state.stageMessage = '事件流已中断'
-      state.errorMessage = (err as Error).message || '事件流中断'
-      state.finalStreaming = false
-      manualRunning.value = false
-      console.error('[useRunStream] stream error', err)
+    }
+
+    const isTerminal = () =>
+      state.status === 'completed' || state.status === 'failed'
+
+    while (true) {
+      try {
+        await consumeOnce(attempts > 0 ? lastEventSeq : null)
+        // 流正常结束：若已到终态则完成；否则视为服务端静默断开，
+        // 同样走重连（否则 UI 会永远停留在 running）。
+        if (isTerminal()) return
+        throw new Error('事件流已结束但未收到终态事件')
+      } catch (err) {
+        if ((err as DOMException)?.name === 'AbortError') return
+        if (isTerminal()) return
+        // 认证/不存在等不可重试状态直接失败，不做无意义重连
+        const status = (err as { status?: number }).status
+        const nonRetryable = status === 401 || status === 403 || status === 404
+        if (nonRetryable || attempts >= MAX_RECONNECT_ATTEMPTS) {
+          state.status = 'error'
+          state.stage = 'error'
+          state.stageMessage = '事件流已中断'
+          state.errorMessage = (err as Error).message || '事件流中断'
+          state.finalStreaming = false
+          manualRunning.value = false
+          console.error('[useRunStream] stream error, giving up', err)
+          return
+        }
+        attempts += 1
+        const delay = Math.min(
+          RECONNECT_BASE_DELAY_MS * 2 ** (attempts - 1),
+          RECONNECT_MAX_DELAY_MS,
+        )
+        state.stageMessage = `事件流中断，正在重连 (${attempts}/${MAX_RECONNECT_ATTEMPTS})…`
+        console.warn(
+          '[useRunStream] stream interrupted, reconnecting',
+          { attempt: attempts, afterSeq: lastEventSeq, delay },
+          err,
+        )
+        await new Promise((resolve) => setTimeout(resolve, delay))
+      }
     }
   }
 
@@ -594,7 +650,9 @@ function createRunStream() {
     () => state.status === 'connecting' || state.status === 'running',
   )
 
-  const liveVisible = computed(() => liveFocused.value && state.status !== 'idle')
+  // 实时快照只在连接中/运行中可见；completed/failed/error 后必须让位
+  // 给完整详情，否则详情面板与删除入口会永久钉在流式快照上。
+  const liveVisible = computed(() => liveFocused.value && liveActive.value)
 
   const liveElapsed = computed(() => {
     if (liveStartedAt.value === 0) return '--'

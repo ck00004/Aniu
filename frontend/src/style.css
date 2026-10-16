@@ -92,11 +92,11 @@ textarea {
 }
 
 .app-brand-logo {
-  width: 60px;
-  height: 60px;
-  border-radius: 16px;
+  width: 44px;
+  height: 44px;
+  border-radius: 13px;
   flex: 0 0 auto;
-  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.18);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.22);
 }
 
 .app-brand-copy {
@@ -108,9 +108,9 @@ textarea {
 }
 
 .app-brand-copy strong {
-  font-size: 55px;
+  font-size: 30px;
   line-height: 1;
-  letter-spacing: -0.02em;
+  letter-spacing: -0.01em;
   color: #f7fbff;
 }
 
@@ -126,16 +126,23 @@ textarea {
   align-items: center;
   gap: 4px;
   min-width: 0;
-  padding: 6px;
-  border-radius: 12px;
-  border: 1px solid rgba(145, 170, 214, 0.12);
-  background: rgba(11, 18, 32, 0.82);
 }
 
 .tabs-container {
-  margin-top: 45px;
-  margin-bottom: 24px;
+  position: sticky;
+  top: 12px;
+  z-index: 40;
+  margin-top: 20px;
+  padding: 6px;
+  border-radius: 999px;
+  border: 1px solid rgba(145, 170, 214, 0.14);
+  background: rgba(9, 16, 29, 0.78);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.28);
 }
+
+
 
 .app-header-actions {
   display: flex;
@@ -184,30 +191,31 @@ textarea {
 .tab-button {
   flex: 1;
   min-width: 0;
-  padding: 12px 24px;
-  border: none;
+  padding: 10px 18px;
+  border: 1px solid transparent;
   background: transparent;
   color: #b7c8e3;
-  font-size: 18px;
+  font-size: 15px;
   font-weight: 600;
   line-height: 1.2;
-  border-radius: 8px;
+  border-radius: 999px;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition: color 0.18s ease, background 0.18s ease, border-color 0.18s ease;
   text-align: center;
   text-decoration: none;
+  white-space: nowrap;
 }
 
 .tab-button:hover {
-  background: rgba(255, 255, 255, 0.05);
+  background: rgba(255, 255, 255, 0.06);
   color: #eef4ff;
 }
 
 .tab-button.active {
-  background: linear-gradient(135deg, #58b9ff, #1cd6a6);
-  color: #06141f;
-  font-weight: 600;
-  box-shadow: 0 4px 12px rgba(23, 209, 163, 0.3);
+  background: linear-gradient(135deg, rgba(88, 185, 255, 0.2), rgba(28, 214, 166, 0.2));
+  border-color: rgba(88, 185, 255, 0.42);
+  color: #f7fbff;
+  font-weight: 700;
 }
 
 .tab-content {
@@ -784,7 +792,7 @@ textarea {
 
 .metric-label {
   font-size: 10px;
-  color: #5a7090;
+  color: #7f97b6;
   text-transform: uppercase;
   letter-spacing: 0.05em;
 }
@@ -1765,7 +1773,7 @@ textarea {
   top: 8px;
   left: 10px;
   font-size: 10px;
-  color: #5a7090;
+  color: #7f97b6;
   text-transform: uppercase;
   letter-spacing: 0.05em;
   text-align: left;
@@ -2134,7 +2142,7 @@ textarea {
 .run-grid-empty {
   padding: 12px;
   text-align: center;
-  color: #5a7090;
+  color: #7f97b6;
   font-size: 11px;
   grid-column: 1 / -1;
 }
@@ -2798,7 +2806,7 @@ textarea {
 }
 
 .task-card-body textarea::placeholder {
-  color: #5a7090;
+  color: #7f97b6;
 }
 
 /* 响应式：小屏幕时改为单列 */
@@ -3120,7 +3128,7 @@ textarea {
 }
 
 .task-detail textarea::placeholder {
-  color: #5a7090;
+  color: #7f97b6;
 }
 
 /* 运行列表 - 两列布局 */
@@ -3273,7 +3281,7 @@ textarea {
 }
 
 .run-prompt textarea::placeholder {
-  color: #5a7090;
+  color: #7f97b6;
 }
 
 /* 动画 */
@@ -4713,4 +4721,347 @@ textarea {
   background: rgba(227, 160, 174, 0.12);
   color: #e3a0ae;
   font-size: 12px;
+}
+
+/* ==========================================================================
+   记忆梦境页面（MemoriesView）
+   ========================================================================== */
+
+.memories-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.memories-overview-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 14px;
+}
+
+.memories-overview-grid .metric-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 18px 20px;
+  border-radius: 18px;
+}
+
+.memories-metric-value {
+  font-size: 26px;
+  line-height: 1.1;
+  color: #f7fbff;
+}
+
+.memories-metric-hint {
+  font-size: 12px;
+  color: #94aac8;
+}
+
+.memories-tabs {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.memories-tab-button {
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.05);
+  color: #c9d8ee;
+  border-radius: 999px;
+  padding: 9px 18px;
+  font-size: 14px;
+  transition: background 0.18s ease, color 0.18s ease, border-color 0.18s ease;
+}
+
+.memories-tab-button:hover {
+  background: rgba(255, 255, 255, 0.09);
+  color: #eef4ff;
+}
+
+.memories-tab-button.active {
+  background: linear-gradient(135deg, rgba(88, 185, 255, 0.22), rgba(28, 214, 166, 0.22));
+  border-color: rgba(88, 185, 255, 0.4);
+  color: #f7fbff;
+  font-weight: 700;
+}
+
+.memories-section {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.memories-toolbar {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.memories-search-input {
+  flex: 1 1 260px;
+  min-width: 220px;
+  padding: 11px 16px;
+  border-radius: 999px;
+  border: 1px solid rgba(145, 170, 214, 0.2);
+  background: rgba(9, 16, 29, 0.6);
+  color: #eef4ff;
+  outline: none;
+  transition: border-color 0.18s ease, box-shadow 0.18s ease;
+}
+
+.memories-search-input:focus {
+  border-color: rgba(88, 185, 255, 0.55);
+  box-shadow: 0 0 0 3px rgba(88, 185, 255, 0.12);
+}
+
+.memories-empty {
+  padding: 28px 18px;
+  text-align: center;
+  color: #94aac8;
+  border: 1px dashed rgba(145, 170, 214, 0.22);
+  border-radius: 18px;
+}
+
+.memories-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.memories-item {
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+  justify-content: space-between;
+  padding: 18px 20px;
+  border: 1px solid rgba(145, 170, 214, 0.14);
+  border-radius: 18px;
+  background: rgba(11, 18, 32, 0.6);
+  transition: border-color 0.18s ease, background 0.18s ease;
+}
+
+.memories-item:hover {
+  border-color: rgba(88, 185, 255, 0.32);
+  background: rgba(13, 22, 38, 0.75);
+}
+
+.memories-item-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.memories-item-content {
+  margin: 0;
+  font-size: 15px;
+  color: #e7effc;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.memories-item-reason {
+  margin: 0;
+  font-size: 13px;
+  color: #94aac8;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.memories-item-meta {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: #7f97b6;
+}
+
+.memories-item-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.memories-danger-button:hover:not(:disabled) {
+  border-color: rgba(255, 97, 132, 0.45);
+  color: #ffb0c1;
+}
+
+.memories-more {
+  display: flex;
+  justify-content: center;
+}
+
+/* 梦境条目 */
+
+.memories-dream-item {
+  flex-direction: column;
+  gap: 10px;
+  padding: 0;
+  overflow: hidden;
+}
+
+.memories-dream-head {
+  display: flex;
+  width: 100%;
+  gap: 12px;
+  align-items: center;
+  padding: 16px 20px;
+  background: transparent;
+  border: none;
+  color: #eef4ff;
+  text-align: left;
+  cursor: pointer;
+}
+
+.memories-dream-head:hover {
+  background: rgba(13, 22, 38, 0.6);
+}
+
+.memories-dream-date {
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.memories-dream-summary {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 13px;
+  color: #94aac8;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.memories-dream-chevron {
+  color: #7f97b6;
+  font-size: 11px;
+  flex-shrink: 0;
+}
+
+.memories-dream-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 4px 20px 18px;
+  border-top: 1px solid rgba(145, 170, 214, 0.12);
+}
+
+.memories-dream-result {
+  margin: 0;
+  padding: 14px 16px;
+  border-radius: 14px;
+  background: rgba(9, 16, 29, 0.7);
+  border: 1px solid rgba(145, 170, 214, 0.12);
+  color: #d6e1f5;
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 360px;
+  overflow-y: auto;
+}
+
+/* 活动列表 */
+
+.memories-activity-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.memories-activity-row {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  padding: 12px 16px;
+  border-radius: 14px;
+  border: 1px solid rgba(145, 170, 214, 0.1);
+  background: rgba(11, 18, 32, 0.5);
+  font-size: 13px;
+}
+
+.memories-activity-detail {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: #c9d8ee;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 编辑对话框 */
+
+.memories-editor-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(4, 9, 17, 0.72);
+  backdrop-filter: blur(6px);
+}
+
+.memories-editor {
+  width: min(640px, 100%);
+  max-height: 86vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.45);
+}
+
+.memories-field {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.memories-textarea {
+  padding: 12px 16px;
+  border-radius: 14px;
+  border: 1px solid rgba(145, 170, 214, 0.2);
+  background: rgba(9, 16, 29, 0.6);
+  color: #eef4ff;
+  outline: none;
+  line-height: 1.55;
+  transition: border-color 0.18s ease, box-shadow 0.18s ease;
+}
+
+.memories-textarea:focus {
+  border-color: rgba(88, 185, 255, 0.55);
+  box-shadow: 0 0 0 3px rgba(88, 185, 255, 0.12);
+}
+
+.memories-editor-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+}
+
+@media (max-width: 720px) {
+  .memories-item {
+    flex-direction: column;
+  }
+
+  .memories-item-actions {
+    justify-content: flex-end;
+  }
+
+  .memories-dream-summary {
+    display: none;
+  }
 }

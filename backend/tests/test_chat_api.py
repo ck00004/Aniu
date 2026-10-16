@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi.testclient import TestClient
 import pytest
+from sqlalchemy import select
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
@@ -251,7 +252,9 @@ def test_run_stream_endpoint_passes_manual_trade_run_type(monkeypatch, tmp_path)
     get_settings.cache_clear()
 
 
-def test_app_startup_requires_current_year_trading_calendar(monkeypatch, tmp_path) -> None:
+def test_app_startup_tolerates_trading_calendar_warmup_failure(
+    monkeypatch, tmp_path
+) -> None:
     monkeypatch.setenv("APP_LOGIN_PASSWORD", "release-pass")
     monkeypatch.setenv("SQLITE_DB_PATH", str(tmp_path / "test.db"))
     monkeypatch.setattr(
@@ -261,19 +264,15 @@ def test_app_startup_requires_current_year_trading_calendar(monkeypatch, tmp_pat
     )
     monkeypatch.setattr(scheduler_service, "start", lambda: None)
     monkeypatch.setattr(scheduler_service, "stop", lambda: None)
-    monkeypatch.setattr(
-        "app.main.date",
-        type("FakeDate", (), {"today": staticmethod(lambda: datetime(2026, 4, 22).date())}),
-    )
     get_settings.cache_clear()
     database_module._engine = None
     database_module._session_local = None
 
     app = create_app()
 
-    with pytest.raises(RuntimeError, match="calendar unavailable"):
-        with TestClient(app):
-            pass
+    # 日历预热失败不应阻止应用启动：运行期懒加载与失败负缓存会接管。
+    with TestClient(app):
+        assert True
 
     database_module._engine = None
     database_module._session_local = None
@@ -794,16 +793,25 @@ def test_run_events_endpoint_emits_failed_event_when_event_bus_stream_errors(
     monkeypatch.setattr(
         event_bus,
         "stream",
-        lambda run_id: (_ for _ in ()).throw(RuntimeError(f"stream boom: {run_id}")),
+        lambda run_id, **kwargs: (_ for _ in ()).throw(RuntimeError(f"stream boom: {run_id}")),
     )
 
     with create_test_client(monkeypatch, tmp_path) as client:
         headers = _auth_headers(client)
-        response = client.get("/api/aniu/runs/123/events", headers=headers)
+        # 先落一条真实 run 记录以通过存在性校验（不存在的 run 现在返回 404）。
+        with session_scope() as db:
+            db.add(StrategyRun(status="running", run_type="analysis"))
+            db.commit()
+            run_id = (
+                db.execute(select(StrategyRun.id).order_by(StrategyRun.id.desc()).limit(1))
+                .scalars()
+                .one()
+            )
+        response = client.get(f"/api/aniu/runs/{run_id}/events", headers=headers)
 
     assert response.status_code == 200
     assert "event: failed" in response.text
-    assert "stream boom: 123" in response.text
+    assert f"stream boom: {run_id}" in response.text
 
     database_module._engine = None
     database_module._session_local = None

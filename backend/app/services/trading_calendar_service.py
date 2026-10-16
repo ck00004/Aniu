@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import calendar
 import json
+import time
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,8 @@ import httpx
 
 _MAX_PROBE_DAYS = 30
 _CALENDAR_FETCH_RETRIES = 3
+_CALENDAR_FETCH_RETRY_DELAY_SECONDS = 2.0
+_CALENDAR_FETCH_FAILURE_TTL_SECONDS = 300.0
 _CALENDAR_SOURCE = "ciis_transaction_calendar"
 _CALENDAR_API_URL = (
     "https://www.ciis.com.hk/hongkong/transactionCalendar/"
@@ -33,6 +36,9 @@ class TradingCalendarService:
         )
         self._calendar: dict[str, object] | None = None
         self._month_days_cache: dict[str, set[str]] = {}
+        # 失败负缓存：月份拉取失败后短时间内快速失败，避免调度循环
+        # 每 15 秒都发起最长约 120 秒的阻塞重试。
+        self._month_fetch_failures: dict[str, float] = {}
 
     def _load_calendar(self) -> dict[str, object]:
         if self._calendar is None:
@@ -95,6 +101,7 @@ class TradingCalendarService:
                     raise RuntimeError(
                         f"{exc}；已重试 {_CALENDAR_FETCH_RETRIES} 次仍失败"
                     ) from exc
+                time.sleep(_CALENDAR_FETCH_RETRY_DELAY_SECONDS)
 
         raise RuntimeError(
             "missing trading calendar data for month "
@@ -209,13 +216,30 @@ class TradingCalendarService:
         for month_key in month_keys:
             normalized_key = self._month_key(*self._parse_month_key(month_key))
             if normalized_key in months_data:
+                self._month_fetch_failures.pop(normalized_key, None)
                 continue
-            queried_days = self._fetch_month(normalized_key)
+            failed_at = self._month_fetch_failures.get(normalized_key)
+            if (
+                failed_at is not None
+                and time.monotonic() - failed_at
+                < _CALENDAR_FETCH_FAILURE_TTL_SECONDS
+            ):
+                raise RuntimeError(
+                    f"交易日历 {normalized_key} 月数据获取近期已失败，"
+                    "等待负缓存过期后重试"
+                )
+            try:
+                queried_days = self._fetch_month(normalized_key)
+            except RuntimeError:
+                self._month_fetch_failures[normalized_key] = time.monotonic()
+                raise
             if not queried_days:
+                self._month_fetch_failures[normalized_key] = time.monotonic()
                 raise RuntimeError(
                     "missing trading calendar data for month "
                     f"{normalized_key}"
                 )
+            self._month_fetch_failures.pop(normalized_key, None)
             months_data[normalized_key] = {"trading_days": queried_days}
             changed = True
         if changed:

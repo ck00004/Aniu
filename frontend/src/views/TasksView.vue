@@ -27,6 +27,15 @@
                 >
                   {{ manualRunning && activeManualAction === 'trade' ? '执行中…' : '执行交易' }}
                 </button>
+                <button
+                  v-if="liveActive && liveRunId !== null"
+                  class="button ghost small soft-header-button abort-run-button"
+                  :disabled="abortRequesting"
+                  title="中止当前运行（中止请求优先于后续真实交易）"
+                  @click="handleAbortRun"
+                >
+                  {{ abortRequesting ? '正在中止…' : '停止运行' }}
+                </button>
               </div>
             </div>
 
@@ -653,6 +662,22 @@ async function handleManualTrade() {
   })
 }
 
+const abortRequesting = ref(false)
+
+async function handleAbortRun() {
+  const runId = liveRunId.value
+  if (runId === null || abortRequesting.value) return
+  abortRequesting.value = true
+  try {
+    await api.abortRun(runId)
+  } catch (error) {
+    console.error('[TasksView] abort run failed', error)
+    window.alert((error as Error).message || '中止运行失败')
+  } finally {
+    abortRequesting.value = false
+  }
+}
+
 async function handleDeleteRun(runId: number) {
   const confirmed = window.confirm(`确定删除任务 #${runId} 吗？`)
   if (!confirmed) return
@@ -707,7 +732,8 @@ function isTodayRunLive(runId: number) {
 }
 
 function handleTodayRunSelect(runId: number) {
-  if (liveRunId.value === runId && runStream.state.status !== 'idle') {
+  // 只有仍在运行中的实时卡片才聚焦快照；已结束的运行点击后查看完整详情。
+  if (liveRunId.value === runId && liveActive.value) {
     focusLiveCard()
     return
   }
@@ -727,6 +753,16 @@ async function reconcileFinishedRun() {
   const failed = results.find((result): result is PromiseRejectedResult => result.status === 'rejected')
   if (failed) {
     console.error('[TasksView] post-run refresh failed', failed.reason)
+  }
+  // 运行结束后从实时快照切换到完整详情：解除实时聚焦并选中该运行。
+  // 若用户在流式期间已手动选择其他运行（liveFocused 已为 false），
+  // 则不覆盖用户的选择。
+  if (liveFocused.value) {
+    liveFocused.value = false
+    const detail = results[1]
+    if (detail.status === 'fulfilled' && detail.value) {
+      void selectRun(detail.value)
+    }
   }
 }
 

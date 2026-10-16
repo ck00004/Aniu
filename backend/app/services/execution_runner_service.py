@@ -12,6 +12,9 @@ from app.services.mx_skill_service import mx_skill_service
 
 
 DEFAULT_ACTION_MAX_ATTEMPTS = 2
+# 只有这些状态的动作允许进入执行：已 completed/terminal 的动作再次执行
+# 会重放真实交易（重复委托），必须拒绝。
+_EXECUTABLE_ACTION_STATUSES = ("planned", "failed_retryable")
 
 
 def _now_utc() -> datetime:
@@ -65,6 +68,7 @@ class ExecutionRunnerService:
         app_settings: Any,
         emit: Any = None,
         max_attempts: int = DEFAULT_ACTION_MAX_ATTEMPTS,
+        cancel_event: Any = None,
     ) -> ExecutionRunSummary:
         _emit = emit if callable(emit) else (lambda *_a, **_kw: None)
         action_ids = self._list_action_ids(run_id)
@@ -72,6 +76,9 @@ class ExecutionRunnerService:
         execution_tool_calls: list[dict[str, Any]] = []
 
         for action_id in action_ids:
+            # 每个动作执行前检查中止：中止请求优先于后续真实交易。
+            if cancel_event is not None and cancel_event.is_set():
+                break
             action_snapshot = self._get_action(action_id)
             if action_snapshot is None:
                 continue
@@ -151,7 +158,10 @@ class ExecutionRunnerService:
             return list(
                 db.scalars(
                     select(StrategyRunAction.id)
-                    .where(StrategyRunAction.run_id == run_id)
+                    .where(
+                        StrategyRunAction.run_id == run_id,
+                        StrategyRunAction.status.in_(_EXECUTABLE_ACTION_STATUSES),
+                    )
                     .order_by(StrategyRunAction.sequence_no.asc(), StrategyRunAction.id.asc())
                 ).all()
             )
@@ -180,6 +190,11 @@ class ExecutionRunnerService:
         with session_scope() as db:
             action = db.get(StrategyRunAction, action_id)
             if action is None:
+                return None
+            # 重入防护：仅允许从可执行状态进入 executing。已 completed/
+            # executing/terminal 的动作直接拒绝，防止并发或重复调用
+            # execute_plan 时重放真实交易。
+            if str(action.status or "planned") not in _EXECUTABLE_ACTION_STATUSES:
                 return None
             action.status = "executing"
             db.add(action)

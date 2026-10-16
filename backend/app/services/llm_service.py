@@ -4,12 +4,15 @@ import json
 import logging
 import threading
 import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Iterable
 
 import httpx
 
 from app.core.prompt_templates import resolve_prompt_template
 from app.skills import skill_registry
+from app.services.context_compaction import compact_messages_for_overflow
 from app.services.mx_service import MXClient
 from app.services.skill_stack_service import skill_stack_service
 
@@ -42,10 +45,158 @@ class LLMStreamCancelled(RuntimeError):
     """Raised when a streaming chat/run should stop because the client disconnected."""
 
 
+class LLMErrorCode:
+    """LLM 上游错误分类（移植自原版 Aniu llm/errors.py）。"""
+
+    AUTHENTICATION = "authentication"
+    RATE_LIMIT = "rate_limit"
+    TIMEOUT = "timeout"
+    NETWORK = "network"
+    INVALID_RESPONSE = "invalid_response"
+    PROVIDER_4XX = "provider_4xx"
+    PROVIDER_5XX = "provider_5xx"
+    EMPTY_RESPONSE = "empty_response"
+    CONTEXT_OVERFLOW = "context_overflow"
+    UNKNOWN = "unknown"
+
+
+_CONTEXT_OVERFLOW_MARKERS = (
+    "context_length_exceeded",
+    "context length exceeded",
+    "maximum context length",
+    "model_context_window_exceeded",
+    "prompt too long; exceeded",
+    "too large for model with",
+    "exceed context limit",
+)
+
+
+def _classify_http_status(status_code: int | None) -> str:
+    if status_code is None:
+        return LLMErrorCode.UNKNOWN
+    if status_code in {401, 403}:
+        return LLMErrorCode.AUTHENTICATION
+    if status_code == 408:
+        return LLMErrorCode.TIMEOUT
+    if status_code == 429:
+        return LLMErrorCode.RATE_LIMIT
+    if 500 <= status_code <= 599:
+        return LLMErrorCode.PROVIDER_5XX
+    if 400 <= status_code <= 499:
+        return LLMErrorCode.PROVIDER_4XX
+    return LLMErrorCode.UNKNOWN
+
+
+def _classify_error_text(text: str) -> str | None:
+    lowered = str(text or "").lower()
+    if not lowered:
+        return None
+    if "rate_limit_error" in lowered or "rate limit exceeded" in lowered:
+        return LLMErrorCode.RATE_LIMIT
+    if "overloaded" in lowered:
+        return LLMErrorCode.PROVIDER_5XX
+    if any(marker in lowered for marker in _CONTEXT_OVERFLOW_MARKERS):
+        return LLMErrorCode.CONTEXT_OVERFLOW
+    return None
+
+
+def _retry_after_seconds_from_headers(headers: Any) -> float | None:
+    """解析 Retry-After：支持 retry-after-ms 头、秒数与 HTTP 日期三种格式
+    （移植自原版 Aniu llm/errors.py `_retry_after_seconds`）。"""
+    if headers is None:
+        return None
+    getter = getattr(headers, "get", None)
+    if not callable(getter):
+        return None
+
+    def _header(name: str) -> str | None:
+        value = getter(name)
+        return str(value).strip() if value is not None else None
+
+    milliseconds = _header("retry-after-ms")
+    if milliseconds:
+        try:
+            return max(0.0, float(milliseconds) / 1000.0)
+        except ValueError:
+            pass
+    value = _header("retry-after")
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        try:
+            moment = parsedate_to_datetime(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        return max(0.0, (moment - datetime.now(timezone.utc)).total_seconds())
+
+
+def _should_retry_header(headers: Any) -> bool | None:
+    if headers is None:
+        return None
+    getter = getattr(headers, "get", None)
+    if not callable(getter):
+        return None
+    value = getter("x-should-retry")
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    return None
+
+
 class LLMUpstreamError(RuntimeError):
-    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        error_code: str | None = None,
+        retry_after: float | None = None,
+        retryable_override: bool | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.error_code = error_code or _classify_http_status(status_code)
+        self.retry_after = retry_after
+        self.retryable_override = retryable_override
+
+
+def accumulate_usage(responses: Any) -> dict[str, int] | None:
+    """跨轮累计 usage（移植自原版 Aniu llm/usage.py 的归一化思路）。
+
+    多轮工具调用每轮 prompt 都在增长，真实消耗是各轮之和；只取最后
+    一轮会系统性少记。
+    """
+    if not isinstance(responses, list):
+        return None
+
+    def _usage_int(usage: dict[str, Any], key: str) -> int:
+        value = usage.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return 0
+        return max(0, int(value))
+
+    totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    found_any = False
+    for item in responses:
+        if not isinstance(item, dict):
+            continue
+        usage = item.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        found_any = True
+        totals["prompt_tokens"] += _usage_int(usage, "prompt_tokens")
+        totals["completion_tokens"] += _usage_int(usage, "completion_tokens")
+        totals["total_tokens"] += _usage_int(usage, "total_tokens")
+    if not found_any:
+        return None
+    if totals["total_tokens"] == 0:
+        totals["total_tokens"] = totals["prompt_tokens"] + totals["completion_tokens"]
+    return totals
 
 
 def _raise_if_cancelled(cancel_event: threading.Event | None) -> None:
@@ -61,7 +212,25 @@ def _format_error_message(prefix: str, detail: str) -> str:
 
 
 def _is_retryable_upstream_error(exc: LLMUpstreamError) -> bool:
-    return exc.status_code is None or exc.status_code >= 500
+    """错误分类驱动的可重试判定（移植自原版 Aniu llm/errors.py）。
+
+    旧实现只认 status>=500，429 限频与超时/网络错误都不重试——
+    恰恰是瞬态错误中最常见的两类。上下文溢出明确不重试（重试必然
+    再溢出，应尽快失败让上层裁剪上下文）。
+    """
+    if exc.error_code == LLMErrorCode.CONTEXT_OVERFLOW:
+        return False
+    if exc.retryable_override is not None:
+        return exc.retryable_override
+    if exc.error_code in {
+        LLMErrorCode.RATE_LIMIT,
+        LLMErrorCode.TIMEOUT,
+        LLMErrorCode.NETWORK,
+        LLMErrorCode.PROVIDER_5XX,
+        LLMErrorCode.EMPTY_RESPONSE,
+    }:
+        return True
+    return exc.status_code in {408, 409, 425, 429}
 
 
 def _should_fallback_to_non_stream(exc: LLMUpstreamError) -> bool:
@@ -226,24 +395,40 @@ def _extract_response_error_detail(response: httpx.Response, raw_body: bytes) ->
 def _raise_upstream_http_error(response: httpx.Response, raw_body: bytes) -> None:
     status = int(response.status_code)
     detail = _extract_response_error_detail(response, raw_body)
+    error_code = _classify_error_text(detail) or _classify_http_status(status)
+    headers = getattr(response, "headers", None)
+    retry_after = _retry_after_seconds_from_headers(headers)
+    retryable_override = _should_retry_header(headers)
     if status == 401:
         raise LLMUpstreamError(
             _format_error_message("大模型 API Key 无效或已过期 (401)", detail),
             status_code=status,
+            error_code=error_code,
+            retry_after=retry_after,
+            retryable_override=retryable_override,
         )
     if status == 400:
         raise LLMUpstreamError(
             _format_error_message("大模型请求参数错误 (400)", detail),
             status_code=status,
+            error_code=error_code,
+            retry_after=retry_after,
+            retryable_override=retryable_override,
         )
     if status == 429:
         raise LLMUpstreamError(
             _format_error_message("大模型接口请求频率超限 (429)", detail),
             status_code=status,
+            error_code=error_code,
+            retry_after=retry_after,
+            retryable_override=retryable_override,
         )
     raise LLMUpstreamError(
         _format_error_message(f"大模型接口返回错误 ({status})", detail),
         status_code=status,
+        error_code=error_code,
+        retry_after=retry_after,
+        retryable_override=retryable_override,
     )
 
 
@@ -362,6 +547,10 @@ def _merge_stream_tool_call(
 
 
 class LLMService:
+    # 模块级累计函数挂为静态方法，供 chat_session_service 等调用方
+    # 通过 llm_service 实例访问。
+    accumulate_usage = staticmethod(accumulate_usage)
+
     def _create_http_client(self, timeout_seconds: int) -> httpx.Client:
         return httpx.Client(timeout=float(timeout_seconds))
 
@@ -649,6 +838,7 @@ class LLMService:
         messages: list[dict[str, Any]],
         emit: Any = None,
         tool_executor: Callable[[str, dict[str, Any], str | None], dict[str, Any]] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
         request_payload = self.build_request_payload_from_messages(
             app_settings=app_settings,
@@ -685,6 +875,11 @@ class LLMService:
             tool_executor=tool_executor or _run_tool_executor,
             prompt_templates=getattr(app_settings, "prompt_templates", None),
             emit=emit,
+            cancel_event=cancel_event,
+            context_window_tokens=getattr(
+                app_settings, "automation_context_window_tokens", None
+            ),
+            tools_override=getattr(app_settings, "tools_override", None),
         )
 
         return (
@@ -720,12 +915,26 @@ class LLMService:
         prompt_templates: Any = None,
         emit: Any = None,
         cancel_event: threading.Event | None = None,
+        context_window_tokens: int | None = None,
+        tools_override: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         _emit = emit if callable(emit) else (lambda *_a, **_kw: None)
         messages: list[dict[str, Any]] = [dict(m) for m in initial_messages]
         response_history: list[dict[str, Any]] = []
         tool_history: list[dict[str, Any]] = []
         empty_final_answer_retries = 0
+        # 上下文溢出被动恢复（移植自原版 Aniu agent_loop 的
+        # _generate_turn_with_context_recovery）：provider 报溢出后压缩
+        # 历史并重试恰好一次。
+        context_overflow_recovered = False
+        effective_context_window = int(context_window_tokens or 0) or 32768
+        # 工具白名单覆盖（如梦境智能体只暴露 4 个只读/写记忆工具）；
+        # None 时使用技能栈按 run_type 构建的全量工具。
+        effective_tools = (
+            tools_override
+            if isinstance(tools_override, list)
+            else None
+        )
 
         for iteration in range(_MAX_TOOL_ITERATIONS):
             _raise_if_cancelled(cancel_event)
@@ -733,18 +942,49 @@ class LLMService:
                 "model": model,
                 "temperature": _LLM_TEMPERATURE,
                 "messages": messages,
-                "tools": skill_stack_service.runtime.build_tools(run_type=run_type),
+                "tools": effective_tools
+                if effective_tools is not None
+                else skill_stack_service.runtime.build_tools(run_type=run_type),
                 "tool_choice": "auto",
             })
             _emit("llm_request", iteration=iteration + 1, model=model)
-            response_payload = self._call_llm_stream(
-                base_url=base_url,
-                api_key=api_key,
-                payload=iteration_payload,
-                timeout_seconds=timeout_seconds,
-                emit=_emit,
-                cancel_event=cancel_event,
-            )
+            try:
+                response_payload = self._call_llm_stream(
+                    base_url=base_url,
+                    api_key=api_key,
+                    payload=iteration_payload,
+                    timeout_seconds=timeout_seconds,
+                    emit=_emit,
+                    cancel_event=cancel_event,
+                )
+            except LLMUpstreamError as exc:
+                if (
+                    exc.error_code == LLMErrorCode.CONTEXT_OVERFLOW
+                    and not context_overflow_recovered
+                    and len(messages) > 1
+                ):
+                    context_overflow_recovered = True
+                    compacted, stats = compact_messages_for_overflow(
+                        messages,
+                        target_tokens=int(effective_context_window * 0.6),
+                    )
+                    messages = compacted
+                    _emit(
+                        "stage",
+                        stage="llm",
+                        message=(
+                            "上下文超出模型窗口，已压缩历史"
+                            f"（丢弃 {stats['dropped']} 条、压缩 {stats['compacted']} 条）后重试"
+                        ),
+                    )
+                    logger.warning(
+                        "context overflow recovered by compaction: "
+                        "dropped=%s compacted=%s",
+                        stats["dropped"],
+                        stats["compacted"],
+                    )
+                    continue
+                raise
             response_history.append(response_payload)
 
             choices = response_payload.get("choices") or []
@@ -964,8 +1204,13 @@ class LLMService:
                 _LLM_UPSTREAM_MAX_RETRIES,
                 last_error,
             )
+            # 上游通过 Retry-After 指明等待时间时优先遵循（上限 30 秒，
+            # 防止异常大的值把运行卡死）。
+            retry_delay = _LLM_UPSTREAM_RETRY_DELAY_SECONDS
+            if last_error.retry_after is not None:
+                retry_delay = min(float(last_error.retry_after), 30.0)
             _sleep_before_retry(
-                _LLM_UPSTREAM_RETRY_DELAY_SECONDS,
+                retry_delay,
                 cancel_event=cancel_event,
             )
 
@@ -1013,10 +1258,14 @@ class LLMService:
             raise
         except httpx.TimeoutException as exc:
             raise LLMUpstreamError(
-                f"大模型接口请求超时 ({timeout_seconds}s)，请检查网络或增加超时时间。"
+                f"大模型接口请求超时 ({timeout_seconds}s)，请检查网络或增加超时时间。",
+                error_code=LLMErrorCode.TIMEOUT,
             ) from exc
         except httpx.RequestError as exc:
-            raise LLMUpstreamError(f"大模型接口请求失败: {exc}") from exc
+            raise LLMUpstreamError(
+                f"大模型接口请求失败: {exc}",
+                error_code=LLMErrorCode.NETWORK,
+            ) from exc
 
     def _parse_llm_stream_response(
         self,
@@ -1221,7 +1470,8 @@ class LLMService:
                 time.sleep(_LLM_UPSTREAM_RETRY_DELAY_SECONDS)
             except httpx.TimeoutException as exc:
                 last_error = LLMUpstreamError(
-                    f"大模型接口请求超时 ({timeout_seconds}s)，请检查网络或增加超时时间。"
+                    f"大模型接口请求超时 ({timeout_seconds}s)，请检查网络或增加超时时间。",
+                    error_code=LLMErrorCode.TIMEOUT,
                 )
                 if attempt >= _LLM_UPSTREAM_MAX_RETRIES - 1:
                     raise last_error from exc
@@ -1233,7 +1483,10 @@ class LLMService:
                 )
                 time.sleep(_LLM_UPSTREAM_RETRY_DELAY_SECONDS)
             except httpx.RequestError as exc:
-                last_error = LLMUpstreamError(f"大模型接口请求失败: {exc}")
+                last_error = LLMUpstreamError(
+                    f"大模型接口请求失败: {exc}",
+                    error_code=LLMErrorCode.NETWORK,
+                )
                 if attempt >= _LLM_UPSTREAM_MAX_RETRIES - 1:
                     raise last_error from exc
                 logger.warning(

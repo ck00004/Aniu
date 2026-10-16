@@ -3,11 +3,14 @@ from __future__ import annotations
 from datetime import date, datetime, time as dt_time
 import logging
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 
 
 logger = logging.getLogger(__name__)
+
+SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 _DEFAULT_TIMEOUT_SECONDS = 5.0
 _DEFAULT_LIMIT = 200
@@ -244,7 +247,7 @@ class ClsNewsService:
             ctime_int = int(ctime_value)
         except (TypeError, ValueError):
             return None
-        item_time = datetime.fromtimestamp(ctime_int, tz=datetime.now().astimezone().tzinfo)
+        item_time = datetime.fromtimestamp(ctime_int, tz=SHANGHAI_TZ)
         time_text = item_time.strftime("%H:%M:%S")
         title = " ".join(str(item.get("title") or "").split()).strip()
         content = " ".join(str(item.get("content") or "").split()).strip()

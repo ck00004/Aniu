@@ -1,10 +1,31 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import httpx
 
 from app.core.config import get_settings
+
+# 妙想接口可能以 HTTP 200 + 错误体返回业务错误（配额耗尽、未绑定模拟
+# 组合等）。这些标记来自真实错误体的已知特征；命中时抛出包含响应体
+# 文本的异常，让 ERROR_HINTS 的引导匹配真正可达。
+_BODY_ERROR_MARKERS: tuple[str, ...] = (
+    "API密钥不存在",
+    "今日调用次数已达上限",
+    "未绑定模拟组合账户",
+    "No dataTable found",
+    "筛选结果为空",
+)
+_MESSAGE_FIELDS: tuple[str, ...] = (
+    "message",
+    "msg",
+    "error",
+    "errorMsg",
+    "errorMessage",
+    "description",
+)
+_SUCCESS_CODES = (0, 200)
 
 
 class MXClient:
@@ -33,9 +54,93 @@ class MXClient:
 
     def _post(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
         url = f"{self.base_url}{endpoint}"
-        response = self._client.post(url, json=payload)
-        response.raise_for_status()
-        return response.json()
+        # 工具调用日志：记录每次妙想接口调用的状态/耗时/响应规模，
+        # 写入失败不影响调用主路径（移植自原版 Aniu stock_api_logs）。
+        from app.services.tool_invocation_log_service import instrument_invocation
+
+        with instrument_invocation(endpoint, payload) as invocation:
+            response = self._client.post(url, json=payload)
+            response.raise_for_status()
+            try:
+                data = response.json()
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"妙想接口返回了无法解析的响应: {response.text[:200]}"
+                ) from exc
+            invocation.observe(
+                status_code=response.status_code,
+                response_size=len(response.content),
+            )
+        self._raise_on_business_error(data)
+        return data
+
+    @staticmethod
+    def _raise_on_business_error(data: Any) -> None:
+        if isinstance(data, str):
+            text = data.strip()
+            if text and any(marker in text for marker in _BODY_ERROR_MARKERS):
+                raise RuntimeError(f"妙想接口业务错误: {text[:200]}")
+            return
+        if not isinstance(data, dict):
+            return
+
+        # 数据类接口（query/news-search/stock-screen）用顶层 status 字段
+        # 报错：status != 0 即失败，message 携带原因（官方 mx-data 规范）。
+        status = data.get("status")
+        if isinstance(status, bool):
+            status = None
+        if isinstance(status, int) and status != 0:
+            raise RuntimeError(
+                f"妙想接口业务错误 status={status}: "
+                f"{MXClient._extract_error_text(data)}"
+            )
+        if isinstance(status, str) and status.strip().lstrip("-").isdigit():
+            normalized_status = int(status.strip())
+            if normalized_status != 0:
+                raise RuntimeError(
+                    f"妙想接口业务错误 status={normalized_status}: "
+                    f"{MXClient._extract_error_text(data)}"
+                )
+
+        code = data.get("code")
+        if isinstance(code, bool):
+            code = None
+        if isinstance(code, int) and code not in _SUCCESS_CODES:
+            raise RuntimeError(
+                f"妙想接口业务错误 code={code}: "
+                f"{MXClient._extract_error_text(data)}"
+            )
+        if isinstance(code, str) and code.strip().lstrip("-").isdigit():
+            normalized = int(code.strip())
+            if normalized not in _SUCCESS_CODES:
+                raise RuntimeError(
+                    f"妙想接口业务错误 code={normalized}: "
+                    f"{MXClient._extract_error_text(data)}"
+                )
+
+        message_text = MXClient._extract_error_text(data)
+        if message_text and any(
+            marker in message_text for marker in _BODY_ERROR_MARKERS
+        ):
+            raise RuntimeError(f"妙想接口业务错误: {message_text[:200]}")
+
+    @staticmethod
+    def _extract_error_text(data: dict[str, Any]) -> str:
+        parts: list[str] = []
+        for field in _MESSAGE_FIELDS:
+            value = data.get(field)
+            if isinstance(value, str) and value.strip():
+                parts.append(value.strip())
+        if not parts:
+            # 无消息字段时带上除 data 外的少量上下文，便于排障与 hint 匹配。
+            context = {
+                key: value
+                for key, value in data.items()
+                if key not in {"data"} and isinstance(value, (str, int, float, bool))
+            }
+            if context:
+                parts.append(json.dumps(context, ensure_ascii=False))
+        return " | ".join(parts)[:200]
 
     def query_market(self, query: str) -> dict[str, Any]:
         return self._post("/api/claw/query", {"toolQuery": query})
@@ -79,7 +184,11 @@ class MXClient:
             "useMarketPrice": price_type.upper() == "MARKET",
         }
         if price_type.upper() == "LIMIT" and price is not None:
-            payload["price"] = price
+            # 官方规范（mx-moni 参考实现）：接口要求整数按放大后的价格
+            # 传入——沪市（6/9 开头）价格小数位不超过 2 位，深市（0/3
+            # 开头）不超过 3 位，price = 原价 * 10^小数位。
+            decimal_places = 2 if str(symbol)[:1] in ("6", "9") else 3
+            payload["price"] = int(round(float(price) * (10 ** decimal_places)))
         return self._post("/api/claw/mockTrading/trade", payload)
 
     def cancel_order(

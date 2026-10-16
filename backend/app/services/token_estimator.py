@@ -4,34 +4,51 @@ import json
 from typing import Any
 
 
-def _normalize_content_length(value: Any) -> int:
+def _normalize_content_text(value: Any) -> str:
     if value is None:
-        return 0
+        return ""
     if isinstance(value, str):
-        return len(value)
+        return value
     try:
-        return len(json.dumps(value, ensure_ascii=False))
+        return json.dumps(value, ensure_ascii=False)
     except Exception:
-        return len(str(value))
+        return str(value)
+
+
+def _count_tokens(text: str) -> int:
+    """按字符类别估算 token：ASCII 约 4 字符/token，非 ASCII（中文等）
+    主流 tokenizer 下约 1 字符/token 全额计入。
+
+    移植自原版 Aniu `llm/context.py:32-39`。旧的 (len+3)//4 对中文
+    系统性低估 2.5-4 倍，导致压缩触发时机偏晚。
+    """
+    ascii_chars = 0
+    non_ascii_chars = 0
+    for character in text:
+        if character.isascii():
+            ascii_chars += 1
+        else:
+            non_ascii_chars += 1
+    return (ascii_chars + 3) // 4 + non_ascii_chars
 
 
 def estimate_text_tokens(text: str | None) -> int:
     content = str(text or "")
     if not content:
         return 0
-    return max(1, (len(content) + 3) // 4)
+    return max(1, _count_tokens(content))
 
 
 def estimate_messages_tokens(messages: list[dict[str, Any]]) -> int:
-    total_chars = 0
+    combined_parts: list[str] = []
     structural_overhead = 0
 
     for message in messages:
         if not isinstance(message, dict):
             continue
-        total_chars += _normalize_content_length(message.get("content"))
-        total_chars += _normalize_content_length(message.get("tool_calls"))
-        total_chars += len(str(message.get("role") or ""))
+        combined_parts.append(_normalize_content_text(message.get("content")))
+        combined_parts.append(_normalize_content_text(message.get("tool_calls")))
+        combined_parts.append(str(message.get("role") or ""))
         structural_overhead += 16
 
-    return max(0, ((total_chars + structural_overhead) + 3) // 4)
+    return max(0, _count_tokens("".join(combined_parts)) + structural_overhead // 4)

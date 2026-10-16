@@ -87,6 +87,9 @@ function installBrowserMocks() {
     setFetchResponse(events: StreamEvent[]) {
       globalThis.fetch = async () => createSseResponse(events)
     },
+    setFetchHandler(handler: () => Promise<Response>) {
+      globalThis.fetch = handler
+    },
     restore() {
       Object.defineProperty(globalThis, 'window', {
         configurable: true,
@@ -99,6 +102,31 @@ function installBrowserMocks() {
       })
 
       globalThis.fetch = originalFetch
+    },
+  }
+}
+
+function createControllableSseResponse() {
+  const encoder = new TextEncoder()
+  let streamController!: ReadableStreamDefaultController<Uint8Array>
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      streamController = controller
+    },
+  })
+  const response = new Response(stream, {
+    status: 200,
+    headers: { 'Content-Type': 'text/event-stream' },
+  })
+  return {
+    response,
+    emit(event: StreamEvent): void {
+      streamController.enqueue(
+        encoder.encode(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`),
+      )
+    },
+    close(): void {
+      streamController.close()
     },
   }
 }
@@ -335,6 +363,110 @@ test('sendMessage 对同名工具调用按 tool_call_id 配对，不会串单', 
         { id: 'call-b', status: 'done', summary: 'B done' },
       ],
     )
+  } finally {
+    browser.restore()
+  }
+})
+
+test('流式期间切换会话：事件不写入新会话的消息', async () => {
+  const browser = installBrowserMocks()
+
+  try {
+    const controlled = createControllableSseResponse()
+    browser.setFetchHandler(async () => controlled.response)
+
+    const chat = useChatSession()
+    chat.activeSessionId.value = 1
+    chat.input.value = '你好'
+
+    const pending = chat.sendMessage()
+
+    // 模拟用户在等待回复时切换到会话 2（watch 清空消息 + loadSession 替换）
+    chat.activeSessionId.value = 2
+    await nextTick()
+    chat.messages.value = [
+      { role: 'user', content: '新会话的消息' },
+      { role: 'assistant', content: '新会话的最后回复' },
+    ]
+
+    // 旧会话的流继续推送
+    controlled.emit({ type: 'final_started' })
+    controlled.emit({ type: 'final_delta', delta: '旧会话的流式内容' })
+    controlled.emit({ type: 'completed', message: '旧会话的最终回复' })
+    controlled.close()
+
+    await pending
+    await nextTick()
+
+    // 新会话的消息既没有被清空，也没有被旧会话的流式内容污染
+    assert.deepEqual(
+      chat.messages.value.map((item) => item.content),
+      ['新会话的消息', '新会话的最后回复'],
+    )
+    assert.equal(chat.errorMessage.value, '')
+  } finally {
+    browser.restore()
+  }
+})
+
+test('连接失败回滚只移除本会话的待发消息，不误删切换后会话的消息', async () => {
+  const browser = installBrowserMocks()
+
+  try {
+    browser.setFetchHandler(async () => new Response('error', { status: 500 }))
+
+    const chat = useChatSession()
+    chat.activeSessionId.value = 1
+    chat.input.value = '你好'
+
+    const pending = chat.sendMessage()
+
+    // 连接失败发生前用户已切换到会话 2 并加载了消息
+    chat.activeSessionId.value = 2
+    await nextTick()
+    chat.messages.value = [{ role: 'user', content: '新会话的消息' }]
+
+    const result = await pending
+    await nextTick()
+
+    // 回滚按引用过滤，不会按位置误删新会话的消息
+    assert.equal(result, null)
+    assert.deepEqual(
+      chat.messages.value.map((item) => item.content),
+      ['新会话的消息'],
+    )
+    assert.equal(chat.input.value, '你好')
+  } finally {
+    browser.restore()
+  }
+})
+
+test('流建立后中断：保留本地部分内容，不回滚已持久化的消息', async () => {
+  const browser = installBrowserMocks()
+
+  try {
+    const controlled = createControllableSseResponse()
+    browser.setFetchHandler(async () => controlled.response)
+
+    const chat = useChatSession()
+    chat.activeSessionId.value = 1
+    chat.input.value = '你好'
+
+    const pending = chat.sendMessage()
+    controlled.emit({ type: 'final_started' })
+    controlled.emit({ type: 'final_delta', delta: '部分回答' })
+    // 模拟网络中断：流异常关闭
+    await nextTick()
+    controlled.close()
+
+    const result = await pending
+    await nextTick()
+
+    // 后端已持久化用户消息，本地不应回滚；助手消息保留部分内容
+    assert.deepEqual(result, { sessionId: 1 })
+    assert.equal(chat.messages.value.length, 2)
+    assert.equal(chat.messages.value[0]?.role, 'user')
+    assert.equal(chat.messages.value[1]?.content, '部分回答')
   } finally {
     browser.restore()
   }

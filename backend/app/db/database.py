@@ -113,6 +113,10 @@ def _ensure_app_settings_columns(engine) -> None:
         statements.append(
             "ALTER TABLE app_settings ADD COLUMN automation_context_detected_at DATETIME"
         )
+    if "automation_dream_time" not in columns:
+        statements.append(
+            "ALTER TABLE app_settings ADD COLUMN automation_dream_time VARCHAR(8) DEFAULT '00:30'"
+        )
 
     if not statements:
         return

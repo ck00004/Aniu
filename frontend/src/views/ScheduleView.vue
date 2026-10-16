@@ -476,7 +476,24 @@ function handleNonTradingTimeInput(section: 'nonTradingFirst' | 'nonTradingSecon
 }
 
 async function saveScheduleSettings() {
-  await store.saveSchedule(buildPayload(schedules.value))
+  // 保存是全量替换：任何不匹配固定模板的后端任务会被静默删除。
+  // 保存前检测并让用户确认（审计 P2-33）。
+  const payload = buildPayload(schedules.value)
+  const payloadNames = new Set(payload.map((item) => item.name))
+  const removed = schedules.value.filter(
+    (item) => item.id != null && !payloadNames.has(item.name),
+  )
+  if (removed.length > 0) {
+    const removedList = removed
+      .map((item) => `「${item.name}」${item.enabled ? '（启用中）' : ''}`)
+      .join('、')
+    const confirmed = window.confirm(
+      `保存将删除 ${removed.length} 个不属于标准模板的定时任务：${removedList}。\n\n`
+      + '此操作不可撤销。确定继续吗？',
+    )
+    if (!confirmed) return
+  }
+  await store.saveSchedule(payload)
 }
 
 watch(

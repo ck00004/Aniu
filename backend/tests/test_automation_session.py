@@ -1266,7 +1266,12 @@ def test_automation_context_estimate_does_not_double_count_archived_summary(
                 history_messages=[{"role": "user", "content": "本轮任务"}],
                 memory_messages=[],
             )
-            assert messages == [{"role": "user", "content": "本轮任务"}]
+            # 压缩摘要必须注入提示词（且只注入一次），否则被归档的历史
+            # 对模型完全不可见，压缩退化为纯删除上下文。
+            assert messages == [
+                {"role": "system", "content": "[上下文压缩摘要]\n已归档摘要"},
+                {"role": "user", "content": "本轮任务"},
+            ]
             estimate = aniu_service._estimate_persistent_session_context_tokens(
                 session=session,
                 settings=settings,

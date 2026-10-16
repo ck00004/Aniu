@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.db.database import session_scope
 from app.db.models import ChatAttachment, ChatMessageRecord, ChatSession
+from app.services.context_compaction import trim_messages_to_budget
 from app.schemas.aniu import (
     ChatAttachmentRead,
     ChatMessageRead,
@@ -34,6 +35,9 @@ logger = logging.getLogger(__name__)
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB
 MAX_ATTACHMENTS_PER_MESSAGE = 12
+MAX_HISTORY_RECORDS = 40
+# 聊天历史 token 预算（CJK 感知估算）：40 条上限之外的防线
+CHAT_CONTEXT_TOKEN_BUDGET = 60_000
 UPLOAD_URL_PREFIX = "/api/aniu/chat/uploads"
 DEFAULT_SESSION_TITLE = "新对话"
 ATTACHMENT_TEXT_LIMIT = 12_000
@@ -428,8 +432,22 @@ class ChatSessionService:
         *,
         content: str,
         attachments_payload: list[dict[str, Any]] | None,
+        include_attachments: bool = True,
     ) -> str | list[dict[str, Any]]:
         text = str(content or "").strip()
+        if not include_attachments and attachments_payload:
+            # 历史消息的附件降级为占位符，避免每轮重复读盘/解析/内嵌。
+            placeholders: list[str] = []
+            for item in attachments_payload:
+                if not isinstance(item, dict):
+                    continue
+                filename = (
+                    str(item.get("filename") or "attachment").strip() or "attachment"
+                )
+                placeholders.append(f"[历史附件 {filename} 内容已省略]")
+            merged_parts = [text] if text else []
+            merged_parts.extend(placeholders)
+            return "\n".join(part for part in merged_parts if part)
         attachment_parts = self._build_attachment_content_parts(attachments_payload)
         if not attachment_parts:
             return text
@@ -606,20 +624,39 @@ class ChatSessionService:
         return resolved
 
     def _build_history_messages(
-        self, records: list[ChatMessageRecord]
+        self,
+        records: list[ChatMessageRecord],
+        *,
+        full_attachments_record_id: int | None = None,
     ) -> list[dict[str, Any]]:
+        # 历史附件每轮重新读盘/解析/内嵌的成本随历史规模二次膨胀：
+        # 只保留最近一条带附件的用户消息的完整附件内容，更早的附件
+        # 降级为文件名占位符。
+        latest_attachment_record_id = full_attachments_record_id
+        if latest_attachment_record_id is None:
+            for record in reversed(records):
+                if record.role == "user" and record.attachments:
+                    latest_attachment_record_id = getattr(record, "id", None)
+                    break
+
         history: list[dict[str, Any]] = []
         for record in records:
             if record.role not in {"user", "assistant", "system"}:
                 continue
 
             if record.role == "user":
+                record_id = getattr(record, "id", None)
+                include_full_attachments = (
+                    record_id is not None
+                    and record_id == latest_attachment_record_id
+                )
                 history.append(
                     {
                         "role": record.role,
                         "content": self._build_user_message_content(
                             content=record.content,
                             attachments_payload=record.attachments,
+                            include_attachments=include_full_attachments,
                         ),
                     }
                 )
@@ -710,16 +747,36 @@ class ChatSessionService:
             if not session.title or session.title in {DEFAULT_SESSION_TITLE, "新会话"}:
                 session.title = self._derive_title(normalized_content)
 
+            # 历史裁剪：只取最近 MAX_HISTORY_RECORDS 条，避免长会话上下文
+            # 单调膨胀导致必然超出模型窗口且此后每轮都失败。
             history_records = (
                 db.execute(
                     select(ChatMessageRecord)
                     .where(ChatMessageRecord.session_id == session.id)
-                    .order_by(ChatMessageRecord.id.asc())
+                    .order_by(ChatMessageRecord.id.desc())
+                    .limit(MAX_HISTORY_RECORDS)
                 )
                 .scalars()
                 .all()
             )
-            history_messages = self._build_history_messages(history_records)
+            history_records.reverse()
+            history_messages = self._build_history_messages(
+                history_records,
+                full_attachments_record_id=user_record.id,
+            )
+            # token 预算防线（固定条数上限之外）：超预算时从最旧开始裁剪，
+            # 防止带巨型工具转录/附件的历史把上下文撑爆。
+            history_messages, dropped_count = trim_messages_to_budget(
+                history_messages,
+                budget_tokens=CHAT_CONTEXT_TOKEN_BUDGET,
+                keep_last=1,
+            )
+            if dropped_count:
+                logger.info(
+                    "chat history trimmed to token budget: session_id=%s dropped=%s",
+                    session.id,
+                    dropped_count,
+                )
             settings_snapshot = SimpleNamespace(
                 mx_api_key=settings.mx_api_key,
                 system_prompt=settings.system_prompt,
@@ -733,6 +790,7 @@ class ChatSessionService:
         event_queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
         captured_tool_calls: list[dict[str, Any]] = []
         captured_replay_messages: list[dict[str, Any]] = []
+        captured_tool_usage: dict[str, Any] = {}
         cancel_event = Event()
 
         def _emit(event_type: str, **data: Any) -> None:
@@ -753,6 +811,13 @@ class ChatSessionService:
                     cancel_event=cancel_event,
                 )
                 captured_replay_messages[:] = list(result.get("replay_messages") or [])
+                # 多轮工具调用的 usage 按轮累计后随消息落库，
+                # 供后续成本核算（此前聊天路径完全不记录 token 消耗）。
+                accumulated_usage = llm_service.accumulate_usage(
+                    result.get("responses")
+                )
+                if accumulated_usage is not None:
+                    captured_tool_usage["usage"] = accumulated_usage
                 _emit("completed", message=result.get("final_answer") or "")
             except LLMStreamCancelled:
                 logger.info("chat_session stream worker cancelled: session_id=%s", session_id)
@@ -771,10 +836,22 @@ class ChatSessionService:
         )
         worker.start()
 
-        final_content = ""
+        # 流式内容聚合：committed 是最近一段权威完整文本（final_finished/
+        # llm_message/completed），delta_buffer 是当前 final 段的增量累积。
+        # 两者分离后，"文本+工具调用同轮"的中间说明文本与最终回答不再
+        # 无分隔拼接；流式重试重播时 final_started 会重置增量缓冲。
+        committed_content = ""
+        delta_buffer = ""
         failed_message: str | None = None
         client_disconnected = False
         terminal_event_seen = False
+
+        def _merged_final_content() -> str:
+            committed = committed_content.strip()
+            pending = delta_buffer.strip()
+            if committed and pending:
+                return f"{committed}\n\n{pending}"
+            return committed or pending
 
         try:
             while True:
@@ -834,16 +911,21 @@ class ChatSessionService:
                                     "finished_at": event.get("ts"),
                                 }
                             )
+                elif event_type == "final_started":
+                    # 新的 final 段开始：丢弃上一段未完成的增量（流式重试
+                    # 会从头重发全部 delta，不重置会导致内容重复累积）。
+                    delta_buffer = ""
                 elif event_type == "final_delta":
                     delta = str(event.get("delta") or "")
                     if delta:
-                        final_content += delta
+                        delta_buffer += delta
                 elif event_type in {"final_finished", "completed", "llm_final", "llm_message"}:
                     payload_content = str(
                         event.get("content") or event.get("message") or ""
                     )
                     if payload_content:
-                        final_content = payload_content
+                        committed_content = payload_content
+                        delta_buffer = ""
                 elif event_type == "failed":
                     failed_message = str(event.get("message") or "聊天失败")
 
@@ -868,6 +950,7 @@ class ChatSessionService:
             with session_scope() as db:
                 session = db.get(ChatSession, session_id)
                 if session is not None:
+                    final_content = _merged_final_content()
                     assistant_content = ""
                     if failed_message is not None:
                         assistant_content = self._build_failed_assistant_content(
@@ -883,10 +966,12 @@ class ChatSessionService:
 
                     if assistant_content or captured_tool_calls or captured_replay_messages:
                         meta_payload = None
-                        if captured_replay_messages:
-                            meta_payload = {
-                                "replay_messages": captured_replay_messages,
-                            }
+                        if captured_replay_messages or captured_tool_usage:
+                            meta_payload = {}
+                            if captured_replay_messages:
+                                meta_payload["replay_messages"] = captured_replay_messages
+                            if captured_tool_usage:
+                                meta_payload["usage"] = captured_tool_usage.get("usage")
                         assistant_record = ChatMessageRecord(
                             session_id=session_id,
                             role="assistant",

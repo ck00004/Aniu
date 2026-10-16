@@ -401,3 +401,53 @@ export interface SkillInfo {
   clawhub_url: string | null
   published_at: string | null
 }
+
+export interface MemoryItem {
+  id: number
+  content: string
+  reason: string | null
+  version: number
+  created_at: string
+  updated_at: string
+}
+
+export interface MemoryListPayload {
+  total: number
+  items: MemoryItem[]
+}
+
+export interface MemoryActivity {
+  id: number
+  action: string
+  keywords: string[] | null
+  result_count: number | null
+  memory_id: number | null
+  created_at: string
+}
+
+export interface MemoryActivityListPayload {
+  total: number
+  items: MemoryActivity[]
+}
+
+export interface MemoryDream {
+  id: number
+  target_date: string
+  status: 'pending' | 'running' | 'completed' | 'failed'
+  result: string | null
+  failure_reason: string | null
+  created_at: string
+  updated_at: string
+  started_at: string | null
+  finished_at: string | null
+}
+
+export interface MemoryDreamListPayload {
+  total: number
+  items: MemoryDream[]
+}
+
+export interface MemoryDreamRunPayload {
+  dream: MemoryDream
+  started: boolean
+}

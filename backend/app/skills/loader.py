@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import logging
 import re
 import sys
 from dataclasses import dataclass
@@ -11,6 +12,7 @@ from typing import Any
 
 from app.skills.base import BaseSkill
 
+logger = logging.getLogger(__name__)
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\r?\n(.*?)\r?\n---\s*\r?\n?", re.DOTALL)
 
@@ -229,26 +231,38 @@ def _scan_dir(base: Path, source: str) -> list[SkillPackage]:
         skill_file = child / "SKILL.md"
         if not skill_file.exists():
             continue
+        # 单个损坏的技能（编码错误、frontmatter 非法、handler 抛异常）只跳过
+        # 该技能本身，绝不能让整个注册表重载失败导致应用无法启动。
         try:
-            content = skill_file.read_text(encoding="utf-8")
-        except OSError:
-            continue
-        metadata, body = _parse_frontmatter(content)
-        skill_id = child.name
-        aniu_meta = (metadata.get("metadata") or {}).get("aniu") or {}
-        handler_module = aniu_meta.get("handler_module")
-        skill = _load_handler_class(child, skill_id, handler_module)
-        packages.append(
-            SkillPackage(
-                id=skill_id,
-                source=source,
-                path=child,
-                metadata=metadata,
-                sop_text=body,
-                skill=skill,
+            packages.append(_load_skill_package(child, skill_file, source))
+        except Exception as exc:
+            logger.warning(
+                "skip broken skill package dir=%s source=%s error=%s",
+                child,
+                source,
+                exc,
             )
-        )
     return packages
+
+
+def _load_skill_package(child: Path, skill_file: Path, source: str) -> SkillPackage:
+    content = skill_file.read_text(encoding="utf-8")
+    metadata, body = _parse_frontmatter(content)
+    skill_id = child.name
+    raw_metadata = metadata.get("metadata")
+    aniu_meta = raw_metadata.get("aniu") if isinstance(raw_metadata, dict) else None
+    if not isinstance(aniu_meta, dict):
+        aniu_meta = {}
+    handler_module = aniu_meta.get("handler_module")
+    skill = _load_handler_class(child, skill_id, handler_module)
+    return SkillPackage(
+        id=skill_id,
+        source=source,
+        path=child,
+        metadata=metadata,
+        sop_text=body,
+        skill=skill,
+    )
 
 
 def discover_skill_packages(
