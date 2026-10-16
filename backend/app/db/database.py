@@ -6,7 +6,7 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
 
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
@@ -16,6 +16,9 @@ _engine = None
 _session_local = None
 
 
+_SQLITE_BUSY_TIMEOUT_SECONDS = 30
+
+
 def get_engine():
     global _engine
     if _engine is None:
@@ -23,8 +26,23 @@ def get_engine():
         settings.sqlite_db_path.parent.mkdir(parents=True, exist_ok=True)
         _engine = create_engine(
             f"sqlite:///{settings.sqlite_db_path.as_posix()}",
-            connect_args={"check_same_thread": False},
+            connect_args={
+                "check_same_thread": False,
+                # 写锁冲突时等待 30 秒而不是默认 5 秒后抛
+                # "database is locked"（启动/调度/运行多线程并发场景）。
+                "timeout": _SQLITE_BUSY_TIMEOUT_SECONDS,
+            },
         )
+
+        # WAL 模式：读写不互斥（调度线程读、运行线程写可并行），
+        # 写写冲突由上面的 busy timeout 兜底等待。
+        @event.listens_for(_engine, "connect")
+        def _set_sqlite_pragma(dbapi_connection, _connection_record):
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.close()
+
     return _engine
 
 
@@ -434,7 +452,7 @@ def _backfill_strategy_run_types(engine) -> None:
 
     logger.info("backfill_strategy_run_types: one-time migration starting")
     migration_started = time.monotonic()
-    connection = sqlite3.connect(db_path)
+    connection = sqlite3.connect(db_path, timeout=_SQLITE_BUSY_TIMEOUT_SECONDS)
     connection.row_factory = sqlite3.Row
     try:
         runs = connection.execute(

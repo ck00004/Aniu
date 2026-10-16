@@ -82,3 +82,27 @@ INFO:     Application startup complete.
 修改（3）：`app/main.py`（分步日志 + 日志配置 + 预热后台化）、`app/db/database.py`（init_db 分步日志 + schema_meta + 回填一次性化）、`app/services/trading_calendar_service.py`（拉取参数收紧 + 失败日志 + logger 定义）
 
 新增（1）：`tests/test_startup_blocking.py`（4 个用例）；适配 `tests/test_schedule_timezone.py`（2 处重试次数断言）
+
+
+---
+
+## 追加（同日第二阶段）：database is locked 的根因修复
+
+生产复跑后出现确切错误：`sqlite3.OperationalError: database is locked`（启动期 commit 失败 → Application startup failed）。这是审计 P2 发现"SQLite 并发写入未做 WAL / busy_timeout 配置"的生产显现：
+
+**根因**：SQLite 默认 journal 模式（DELETE）下读写互斥、写锁等待仅 5 秒。启动时若有另一连接持有写锁（`--reload` 重载窗口的旧进程、残留的旧实例、或调度/梦境线程的写入），新进程的启动 commit 等 5 秒后直接报错退出。
+
+**修复（三层防护）**：
+
+1. **WAL 模式**：引擎连接事件监听器执行 `PRAGMA journal_mode=WAL` + `PRAGMA synchronous=NORMAL`——读写不再互斥（调度线程读、运行线程写可并行），写写冲突才需要等待。真实启动验证：`journal_mode: wal`，`-wal`/`-shm` 文件生成。
+2. **busy timeout 5s → 30s**：引擎 `connect_args={"timeout": 30}` + 回填的裸 `sqlite3.connect(db_path, timeout=30)`——写写冲突时等待 30 秒而不是 5 秒后报错。
+3. **启动步骤显式锁重试**：`_run_with_lock_retry` 包裹 init_db 与运行状态恢复（3 次尝试 + 2 秒退避，仅对含 "locked" 的 OperationalError 重试）——覆盖重载窗口的极端锁竞争。
+
+**新增测试（4 个）**：WAL 与 busy_timeout 生效（PRAGMA 断言）、并发写等待锁释放而非报错（真实双连接阻塞实验）、锁重试成功、持续锁死达到上限后抛出。
+
+完整套件 **326 通过 / 0 备份失败**。
+
+**生产注意事项**：
+1. WAL 会生成 `<db>-wal` 与 `<db>-shm` 文件——**备份数据库时需一并备份**（或先 checkpoint：`sqlite3 aniu.db "PRAGMA wal_checkpoint(TRUNCATE)"`）。
+2. WAL 不适用于 NFS 等网络文件系统（数据库需在本地盘）。
+3. 强烈建议生产去掉 `--reload`（开发模式双进程 + 文件监控，是锁竞争的主要来源）；用 systemd/supervisor 管理单进程。

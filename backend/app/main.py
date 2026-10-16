@@ -12,6 +12,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy.exc import OperationalError
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.api.router import router as aniu_router
@@ -56,6 +57,30 @@ def _configure_app_logging() -> None:
         target.setLevel(logging.INFO)
 
 
+def _run_with_lock_retry(label: str, action, attempts: int = 3) -> None:
+    """启动步骤的数据库锁重试。
+
+    典型场景：--reload 重载或旧实例退出时，旧进程的写入尚未释放，
+    新进程启动即撞上写锁。busy timeout（30s）已兜底大部分情况，
+    这里再叠加一层显式重试，避免极端窗口下启动直接失败。
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            action()
+            return
+        except OperationalError as exc:
+            if "locked" not in str(exc).lower() or attempt >= attempts:
+                raise
+            logger.warning(
+                "app startup: %s hit database lock (attempt %d/%d), retrying in 2s: %s",
+                label,
+                attempt,
+                attempts,
+                exc,
+            )
+            time.sleep(2)
+
+
 @asynccontextmanager
 async def app_lifespan(_app: FastAPI):
     # 每个启动步骤都带计时 INFO 日志：生产环境 "Waiting for application
@@ -68,27 +93,28 @@ async def app_lifespan(_app: FastAPI):
         return now
 
     step = time.monotonic()
-    init_db()
+    _run_with_lock_retry("init_db", init_db)
     step = _log_step("init_db", step)
 
     skill_registry.reload()
     step = _log_step("skill_registry.reload", step)
 
-    with session_scope() as db:
-        skill_admin_service.apply_persisted_state(db)
-        step = _log_step("apply_persisted_state", step)
-        # 进程重启后遗留的 running 状态运行在此收敛为 failed，
-        # 避免僵尸记录阻塞删除并让前端事件流永久挂起。
-        try:
-            aniu_service.fail_stale_running_runs(db)
-        except Exception as exc:
-            logger.warning("failed to mark stale running runs: %s", exc)
-        step = _log_step("fail_stale_running_runs", step)
-        try:
-            memory_dream_service.fail_stale_running_dreams(db)
-        except Exception as exc:
-            logger.warning("failed to mark stale running dreams: %s", exc)
-        step = _log_step("fail_stale_running_dreams", step)
+    def _restore_runtime_state() -> None:
+        with session_scope() as db:
+            skill_admin_service.apply_persisted_state(db)
+            # 进程重启后遗留的 running 状态运行在此收敛为 failed，
+            # 避免僵尸记录阻塞删除并让前端事件流永久挂起。
+            try:
+                aniu_service.fail_stale_running_runs(db)
+            except Exception as exc:
+                logger.warning("failed to mark stale running runs: %s", exc)
+            try:
+                memory_dream_service.fail_stale_running_dreams(db)
+            except Exception as exc:
+                logger.warning("failed to mark stale running dreams: %s", exc)
+
+    _run_with_lock_retry("restore_runtime_state", _restore_runtime_state)
+    step = _log_step("restore_runtime_state", step)
 
     # 日历预热放到后台线程：预热涉及远程日历接口（最坏 4 次重试 ×
     # 30 秒超时），网络黑洞时会阻塞启动关键路径数分钟。运行期的懒加载

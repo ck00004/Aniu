@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import sys
 
+import pytest
 from fastapi.testclient import TestClient
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
@@ -20,7 +21,7 @@ from app.core.rate_limit import _limiter
 from app.db import database as database_module
 from app.db.database import init_db, session_scope
 from app.db.models import StrategyRun
-from app.main import create_app
+from app.main import _run_with_lock_retry, create_app
 from app.services.aniu_service import aniu_service, now_utc
 from app.services.scheduler_service import scheduler_service
 from app.services.trading_calendar_service import trading_calendar_service
@@ -92,7 +93,7 @@ def test_startup_step_logs_emitted(monkeypatch, tmp_path, caplog) -> None:
     for step in (
         "init_db done",
         "skill_registry.reload done",
-        "fail_stale_running_runs done",
+        "restore_runtime_state done",
         "scheduler_service.start done",
         "all steps finished",
     ):
@@ -225,3 +226,123 @@ def test_backfill_only_writes_changed_rows(monkeypatch, tmp_path) -> None:
     del before_changes, after_changes
 
     reset_db_state()
+
+
+# ---------------------------------------------------------------------------
+# SQLite 并发加固：WAL + busy timeout + 启动锁重试
+# ---------------------------------------------------------------------------
+
+
+def test_engine_enables_wal_and_busy_timeout(monkeypatch, tmp_path) -> None:
+    """引擎连接必须启用 WAL（读写不互斥）与 30 秒锁等待。"""
+    monkeypatch.setenv("SQLITE_DB_PATH", str(tmp_path / "wal.db"))
+    get_settings.cache_clear()
+    database_module._engine = None
+    database_module._session_local = None
+
+    engine = database_module.get_engine()
+    with engine.connect() as connection:
+        mode = connection.exec_driver_sql("PRAGMA journal_mode").scalar()
+        timeout = connection.exec_driver_sql("PRAGMA busy_timeout").scalar()
+    assert str(mode).lower() == "wal"
+    assert int(timeout) >= 30000
+
+    reset_db_state()
+
+
+def test_concurrent_writer_waits_instead_of_erroring(monkeypatch, tmp_path) -> None:
+    """另一连接持有写锁时，引擎写入应等待锁释放而不是立即报错。"""
+    import threading
+
+    monkeypatch.setenv("SQLITE_DB_PATH", str(tmp_path / "lock.db"))
+    get_settings.cache_clear()
+    database_module._engine = None
+    database_module._session_local = None
+    init_db()
+
+    db_path = tmp_path / "lock.db"
+    blocker = sqlite3.connect(db_path, timeout=2)
+    blocker.execute("BEGIN IMMEDIATE")
+    blocker.execute(
+        "INSERT INTO schema_meta (key, value) VALUES ('blocker', '1') "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+    )
+
+    errors: list[str] = []
+
+    def _write_from_engine() -> None:
+        try:
+            with session_scope() as db:
+                db.execute(
+                    __import__("sqlalchemy").text(
+                        "INSERT INTO schema_meta (key, value) VALUES ('lock_test', '1') "
+                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+                    )
+                )
+                db.commit()
+        except Exception as exc:  # noqa: BLE001
+            errors.append(str(exc))
+
+    writer = threading.Thread(target=_write_from_engine)
+    writer.start()
+    # 引擎写入在等锁（busy timeout 30s）；短暂阻塞后释放锁
+    time.sleep(1.0)
+    blocker.commit()
+    blocker.close()
+    writer.join(timeout=10)
+
+    assert not writer.is_alive(), "engine writer still blocked after lock release"
+    assert errors == [], f"engine write failed: {errors}"
+
+    reset_db_state()
+
+
+def test_run_with_lock_retry_retries_then_succeeds(monkeypatch) -> None:
+    """启动步骤撞锁：重试后成功。"""
+    import app.main as main_module
+
+    class FakeOperationalError(Exception):
+        def __init__(self) -> None:
+            super().__init__("database is locked")
+
+    original = main_module.OperationalError
+    main_module.OperationalError = FakeOperationalError
+    try:
+        calls = {"count": 0}
+
+        def flaky() -> None:
+            calls["count"] += 1
+            if calls["count"] < 3:
+                raise FakeOperationalError()
+
+        monkeypatch.setattr(time, "sleep", lambda seconds: None)
+        _run_with_lock_retry("test_step", flaky)
+        assert calls["count"] == 3
+    finally:
+        main_module.OperationalError = original
+
+
+def test_run_with_lock_retry_gives_up_after_attempts(monkeypatch) -> None:
+    """持续锁死：达到重试上限后抛出原异常。"""
+    import app.main as main_module
+
+    class FakeOperationalError(Exception):
+        def __init__(self) -> None:
+            super().__init__("database is locked")
+
+    original = main_module.OperationalError
+    main_module.OperationalError = FakeOperationalError
+    try:
+        calls = {"count": 0}
+
+        def always_locked() -> None:
+            calls["count"] += 1
+            raise FakeOperationalError()
+
+        monkeypatch.setattr(time, "sleep", lambda seconds: None)
+
+        with pytest.raises(FakeOperationalError):
+            _run_with_lock_retry("test_step", always_locked, attempts=3)
+        assert calls["count"] == 3
+    finally:
+        main_module.OperationalError = original
