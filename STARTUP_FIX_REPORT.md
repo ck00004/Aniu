@@ -106,3 +106,24 @@ INFO:     Application startup complete.
 1. WAL 会生成 `<db>-wal` 与 `<db>-shm` 文件——**备份数据库时需一并备份**（或先 checkpoint：`sqlite3 aniu.db "PRAGMA wal_checkpoint(TRUNCATE)"`）。
 2. WAL 不适用于 NFS 等网络文件系统（数据库需在本地盘）。
 3. 强烈建议生产去掉 `--reload`（开发模式双进程 + 文件监控，是锁竞争的主要来源）；用 systemd/supervisor 管理单进程。
+
+
+---
+
+## 生产验证结果（2026-10-16）
+
+生产（3.75GB 库 / 1747 条 run）实际启动日志确认全链路修复生效：
+
+```
+backfill_strategy_run_types: finished 1747 rows (1 changed), 150.02s   ← 一次性迁移完成
+app startup: all steps finished in 150.40s, serving requests           ← 启动成功
+marked 3 stale running run(s) as failed at startup                     ← 僵尸 run 收敛生效
+memory dream triggered by schedule: target_date=2026-10-15             ← 记忆梦境自动触发
+POST /api/aniu/login 200 OK / GET /api/aniu/account 200 OK             ← 服务正常
+```
+
+要点：
+1. **150 秒是一次性成本**：schema_meta 标记已落库，下次重启日志会显示 `backfill_strategy_run_types skipped (marker set)`，init_db 回到秒级。
+2. 修复了收尾日志的参数错误（误把总行数打印为变更行数——实际仅 1 行变更）。
+3. 3.75GB / 1747 条 run ≈ 平均每条约 2.1MB 的 JSON 载荷（工具调用转录累积）。建议后续考虑运行记录的保留策略或载荷压缩，否则库会持续增长（可另行安排）。
+4. 生产仍建议去掉 `--reload`，改用 systemd 管理单进程。

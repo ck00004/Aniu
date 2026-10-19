@@ -36,6 +36,10 @@ def _payload_rows(payload: Any) -> list[dict[str, Any]]:
             or source.get("data")
             or source.get("orderList")
             or source.get("orders")
+            # 持仓接口的真实列表键是 posList（生产 2026-10-19 排查确认：
+            # 漏掉该键导致卖出预检全部误判"未找到持仓"，当日零成交）
+            or source.get("posList")
+            or source.get("positionList")
             or []
         )
     elif isinstance(source, list):
@@ -222,7 +226,11 @@ def preflight_cancel(*, client: MXClient, order_id: str, stock_code: str | None)
     filled_qty = _row_int(
         order_row, "dealCount", "tradeCount", "filledCount", "filledQty"
     )
-    if status not in _PENDING_ORDER_STATUSES and filled_qty >= order_qty:
+    # 非待撤状态（已成交/已撤单/已完成/未知）一律不可撤——
+    # 旧条件额外要求"已全部成交"，已撤单（零成交）会被漏判为可撤
+    # （生产结构回归测试发现）。
+    if status not in _PENDING_ORDER_STATUSES:
+        del order_qty, filled_qty
         raise RuntimeError(
             f"委托编号 {order_id} 当前状态为 {status}，不可撤销"
         )

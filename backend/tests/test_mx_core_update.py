@@ -16,6 +16,8 @@ from skills.mx_core.client import MXClient
 from skills.mx_core.execution import (
     MXExecutionService,
     _format_query_market_result,
+    preflight_cancel,
+    preflight_trade,
 )
 
 
@@ -247,3 +249,164 @@ def test_handle_query_market_empty_result_returns_error() -> None:
     )
     assert result["ok"] is False
     assert "无 dataTableDTOList" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# 生产结构回归（2026-10-19 生产排查确认的真实载荷结构）
+# ---------------------------------------------------------------------------
+
+
+def _production_positions_payload() -> dict:
+    """生产 mx_get_positions 真实结构（data.posList，2026-10-19 确认）。"""
+    return {
+        "code": "200",
+        "message": "成功",
+        "data": {
+            "totalAssets": 904030.323,
+            "availBalance": 757903.323,
+            "posCount": 4,
+            "posList": [
+                {
+                    "secCode": "300059", "secMkt": 0, "count": 800, "availCount": 800,
+                    "costPriceDec": 3, "costPrice": 18298, "priceDec": 2, "price": 1807,
+                    "secName": "东方财富",
+                },
+                {
+                    "secCode": "603986", "secMkt": 1, "count": 200, "availCount": 200,
+                    "costPriceDec": 3, "costPrice": 286589, "priceDec": 2, "price": 27500,
+                    "secName": "兆易创新",
+                },
+                {
+                    "secCode": "600938", "secMkt": 1, "count": 1000, "availCount": 1000,
+                    "costPriceDec": 3, "costPrice": 34993, "priceDec": 2, "price": 3528,
+                    "secName": "中国海油",
+                },
+            ],
+            "currencyUnit": 1,
+        },
+        "traceId": None,
+    }
+
+
+def _production_orders_payload() -> dict:
+    """生产 mx_get_orders 真实结构（data.orders，2026-10-19 确认）。"""
+    return {
+        "code": "200",
+        "message": "成功",
+        "data": {
+            "totalNum": 3,
+            "orders": [
+                {
+                    "id": "262884800000052612", "type": 5, "status": 9, "dbStatus": 206,
+                    "time": 1792132612, "secCode": "603986", "secMkt": 1, "drt": 2,
+                    "priceDec": 0, "price": 279, "count": 200, "tradeCount": 0,
+                    "tradePrice": 0, "secName": "兆易创新",
+                },
+                {
+                    "id": "262884700000047253", "type": 5, "status": 8, "dbStatus": 100,
+                    "time": 1792127253, "secCode": "688825", "secMkt": 1, "drt": 1,
+                    "priceDec": 1, "price": 445, "count": 400, "tradeCount": 0,
+                    "tradePrice": 0, "secName": "长鑫科技",
+                },
+                {
+                    "id": "262884800000049805", "type": 5, "status": 4, "dbStatus": 200,
+                    "time": 1792129805, "secCode": "600276", "secMkt": 1, "drt": 2,
+                    "priceDec": 2, "price": 4635, "count": 300, "tradeCount": 300,
+                    "tradePrice": 4636, "secName": "恒瑞医药",
+                },
+            ],
+        },
+        "traceId": None,
+    }
+
+
+def test_sell_preflight_with_production_positions_payload() -> None:
+    """生产结构（posList）下卖出预检必须找到持仓并放行。
+
+    2026-10-19 生产事故：_payload_rows 漏了 posList 键，导致全部卖出
+    委托被误判"未找到该标的持仓"，当日零成交。
+    """
+    client = SimpleNamespace(
+        get_positions=lambda: _production_positions_payload(),
+        get_orders=lambda: _production_orders_payload(),
+    )
+    # 兆易创新 200 股可卖，卖 100 → 放行
+    preflight_trade(
+        client=client,
+        action="SELL",
+        symbol="603986",
+        quantity=100,
+        price_type="LIMIT",
+        price=274.5,
+    )
+    # 中国海油 1000 股可卖，卖 500 → 放行
+    preflight_trade(
+        client=client,
+        action="SELL",
+        symbol="600938",
+        quantity=500,
+        price_type="LIMIT",
+        price=36.13,
+    )
+    # 超可卖 → 拒绝
+    with pytest.raises(RuntimeError, match="可卖数量 200"):
+        preflight_trade(
+            client=client,
+            action="SELL",
+            symbol="603986",
+            quantity=300,
+            price_type="MARKET",
+            price=None,
+        )
+
+
+def test_sell_preflight_uses_avail_count_from_production_payload() -> None:
+    """availCount 存在时直接用 availCount 判可卖（生产字段）。"""
+    client = SimpleNamespace(
+        get_positions=lambda: {
+            "code": "200",
+            "data": {
+                "posList": [
+                    {"secCode": "600276", "count": 900, "availCount": 400},
+                ]
+            },
+        },
+        get_orders=lambda: _production_orders_payload(),
+    )
+    with pytest.raises(RuntimeError, match="可卖数量 400"):
+        preflight_trade(
+            client=client,
+            action="SELL",
+            symbol="600276",
+            quantity=500,
+            price_type="MARKET",
+            price=None,
+        )
+
+
+def test_cancel_preflight_with_production_orders_payload() -> None:
+    """生产结构（data.orders + drt/status 字段）下撤单预检。"""
+    client = SimpleNamespace(
+        get_positions=lambda: _production_positions_payload(),
+        get_orders=lambda: _production_orders_payload(),
+    )
+    # 未成交委托（status=8）→ 可撤
+    preflight_cancel(
+        client=client,
+        order_id="262884700000047253",
+        stock_code="688825",
+    )
+    # 已撤单（status=9/dbStatus=206）→ 不可撤
+    with pytest.raises(RuntimeError, match="不可撤销"):
+        preflight_cancel(
+            client=client,
+            order_id="262884800000052612",
+            stock_code="603986",
+        )
+    # 已成交（status=4，tradeCount=count）→ 不可撤
+    with pytest.raises(RuntimeError, match="不可撤销"):
+        preflight_cancel(
+            client=client,
+            order_id="262884800000049805",
+            stock_code="600276",
+        )

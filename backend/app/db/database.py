@@ -552,7 +552,7 @@ def _backfill_strategy_run_types(engine) -> None:
         logger.info(
             "backfill_strategy_run_types: finished %d rows, %d changed, %.2fs",
             processed,
-            total_runs,
+            changed_count,
             time.monotonic() - migration_started,
         )
     finally:
