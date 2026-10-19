@@ -347,7 +347,25 @@
                         <p class="run-time">09:30 - 11:30</p>
                       </div>
                       <div class="run-control">
-                        <div class="choice-chip-group run-count-group">
+                        <div class="choice-chip-group run-mode-group">
+                          <button
+                            type="button"
+                            class="choice-chip"
+                            :class="{ 'is-active': scheduleSettings.morning.timeMode === 'auto' }"
+                            @click="setSessionTimeMode('morning', 'auto')"
+                          >
+                            自动时间
+                          </button>
+                          <button
+                            type="button"
+                            class="choice-chip"
+                            :class="{ 'is-active': scheduleSettings.morning.timeMode === 'manual' }"
+                            @click="setSessionTimeMode('morning', 'manual')"
+                          >
+                            手动调整
+                          </button>
+                        </div>
+                        <div v-if="scheduleSettings.morning.timeMode === 'auto'" class="choice-chip-group run-count-group">
                           <button
                             v-for="count in runCountOptions"
                             :key="`morning-${count}`"
@@ -361,7 +379,7 @@
                         </div>
                       </div>
                     </div>
-                    <div class="run-schedule">
+                    <div v-if="scheduleSettings.morning.timeMode === 'auto'" class="run-schedule">
                       <span class="schedule-label">计划运行时间</span>
                       <div class="schedule-badges">
                         <span 
@@ -370,6 +388,40 @@
                           class="badge"
                         >{{ time }}</span>
                       </div>
+                    </div>
+                    <div v-else class="run-schedule run-schedule-manual">
+                      <span class="schedule-label">运行时间（{{ getSessionManualTimes('morning').length }}个，可增删改）</span>
+                      <div class="manual-time-list">
+                        <div
+                          v-for="(time, index) in getSessionManualTimes('morning')"
+                          :key="'mt-m'+index"
+                          class="manual-time-row"
+                        >
+                          <input
+                            type="time"
+                            class="manual-time-input"
+                            :value="time"
+                            @input="handleSessionManualTimeInput('morning', index, $event)"
+                          />
+                          <button
+                            type="button"
+                            class="button ghost small manual-time-remove"
+                            :disabled="getSessionManualTimes('morning').length <= 1"
+                            @click="removeSessionManualTime('morning', index)"
+                          >
+                            删除
+                          </button>
+                        </div>
+                        <button
+                          type="button"
+                          class="button ghost small manual-time-add"
+                          :disabled="getSessionManualTimes('morning').length >= maxManualTimes"
+                          @click="addSessionManualTime('morning')"
+                        >
+                          + 添加时间
+                        </button>
+                      </div>
+                      <p v-if="morningTimeError" class="manual-time-error">{{ morningTimeError }}</p>
                     </div>
                     <div class="run-prompt">
                       <span class="prompt-label">提示词 <small>{{ scheduleSettings.morning.prompt.length }}字</small></span>
@@ -388,7 +440,25 @@
                         <p class="run-time">13:00 - 15:00</p>
                       </div>
                       <div class="run-control">
-                        <div class="choice-chip-group run-count-group">
+                        <div class="choice-chip-group run-mode-group">
+                          <button
+                            type="button"
+                            class="choice-chip"
+                            :class="{ 'is-active': scheduleSettings.afternoon.timeMode === 'auto' }"
+                            @click="setSessionTimeMode('afternoon', 'auto')"
+                          >
+                            自动时间
+                          </button>
+                          <button
+                            type="button"
+                            class="choice-chip"
+                            :class="{ 'is-active': scheduleSettings.afternoon.timeMode === 'manual' }"
+                            @click="setSessionTimeMode('afternoon', 'manual')"
+                          >
+                            手动调整
+                          </button>
+                        </div>
+                        <div v-if="scheduleSettings.afternoon.timeMode === 'auto'" class="choice-chip-group run-count-group">
                           <button
                             v-for="count in runCountOptions"
                             :key="`afternoon-${count}`"
@@ -402,7 +472,7 @@
                         </div>
                       </div>
                     </div>
-                    <div class="run-schedule">
+                    <div v-if="scheduleSettings.afternoon.timeMode === 'auto'" class="run-schedule">
                       <span class="schedule-label">计划运行时间</span>
                       <div class="schedule-badges">
                         <span 
@@ -411,6 +481,40 @@
                           class="badge"
                         >{{ time }}</span>
                       </div>
+                    </div>
+                    <div v-else class="run-schedule run-schedule-manual">
+                      <span class="schedule-label">运行时间（{{ getSessionManualTimes('afternoon').length }}个，可增删改）</span>
+                      <div class="manual-time-list">
+                        <div
+                          v-for="(time, index) in getSessionManualTimes('afternoon')"
+                          :key="'mt-a'+index"
+                          class="manual-time-row"
+                        >
+                          <input
+                            type="time"
+                            class="manual-time-input"
+                            :value="time"
+                            @input="handleSessionManualTimeInput('afternoon', index, $event)"
+                          />
+                          <button
+                            type="button"
+                            class="button ghost small manual-time-remove"
+                            :disabled="getSessionManualTimes('afternoon').length <= 1"
+                            @click="removeSessionManualTime('afternoon', index)"
+                          >
+                            删除
+                          </button>
+                        </div>
+                        <button
+                          type="button"
+                          class="button ghost small manual-time-add"
+                          :disabled="getSessionManualTimes('afternoon').length >= maxManualTimes"
+                          @click="addSessionManualTime('afternoon')"
+                        >
+                          + 添加时间
+                        </button>
+                      </div>
+                      <p v-if="afternoonTimeError" class="manual-time-error">{{ afternoonTimeError }}</p>
                     </div>
                     <div class="run-prompt">
                       <span class="prompt-label">提示词 <small>{{ scheduleSettings.afternoon.prompt.length }}字</small></span>
@@ -434,7 +538,7 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, watch } from 'vue'
+import { computed, onMounted, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 
 import { useAppStore } from '@/stores/legacy'
@@ -447,6 +551,7 @@ const {
   scheduleSettings,
   fixedTaskTimeOptions,
   runCountOptions,
+  maxManualTimes,
   syncFromSchedules,
   buildPayload,
   setFixedTaskTime,
@@ -457,7 +562,24 @@ const {
   autoResizeTextarea,
   getMorningRunTimes,
   getAfternoonRunTimes,
+  setSessionTimeMode,
+  getSessionManualTimes,
+  setSessionManualTime,
+  addSessionManualTime,
+  removeSessionManualTime,
+  validateSessionTimes,
 } = useScheduleForm()
+
+const morningTimeError = computed(() => validateSessionTimes('morning'))
+const afternoonTimeError = computed(() => validateSessionTimes('afternoon'))
+
+function handleSessionManualTimeInput(section: 'morning' | 'afternoon', index: number, event: Event) {
+  const target = event.target as HTMLInputElement | null
+  if (!target) {
+    return
+  }
+  setSessionManualTime(section, index, target.value)
+}
 
 function handleTimeInput(section: 'preMarket' | 'midday' | 'postMarket' | 'night', event: Event) {
   const target = event.target as HTMLInputElement | null
@@ -476,6 +598,15 @@ function handleNonTradingTimeInput(section: 'nonTradingFirst' | 'nonTradingSecon
 }
 
 async function saveScheduleSettings() {
+  // 手动时间校验不通过时阻止保存
+  if (morningTimeError.value) {
+    window.alert(`上午运行时间无效：${morningTimeError.value}`)
+    return
+  }
+  if (afternoonTimeError.value) {
+    window.alert(`下午运行时间无效：${afternoonTimeError.value}`)
+    return
+  }
   // 保存是全量替换：任何不匹配固定模板的后端任务会被静默删除。
   // 保存前检测并让用户确认（审计 P2-33）。
   const payload = buildPayload(schedules.value)

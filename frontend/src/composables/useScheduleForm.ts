@@ -51,6 +51,17 @@ export const FIXED_TASK_TIME_OPTIONS = {
 
 export const RUN_COUNT_OPTIONS = [1, 2, 3, 4] as const
 
+export type SessionTimeMode = 'auto' | 'manual'
+
+// 手动模式的次数上限（自动模式为 1-4；手动通过增删时间条目调整次数）
+export const MAX_MANUAL_TIMES = 8
+
+// 交易时段窗口（手动时间必须落在窗口内，否则交易运行会被交易时段门禁拦截）
+export const SESSION_WINDOWS: Record<SessionKey, { start: { hour: number; minute: number }; end: { hour: number; minute: number }; label: string }> = {
+  morning: { start: { hour: 9, minute: 30 }, end: { hour: 11, minute: 30 }, label: '09:30 - 11:30' },
+  afternoon: { start: { hour: 13, minute: 0 }, end: { hour: 15, minute: 0 }, label: '13:00 - 15:00' },
+}
+
 export interface ScheduleFormState {
   preMarket: { enabled: boolean; hour: number; minute: number; prompt: string }
   postMarket: { enabled: boolean; hour: number; minute: number; prompt: string }
@@ -58,8 +69,8 @@ export interface ScheduleFormState {
   night: { enabled: boolean; hour: number; minute: number; prompt: string }
   nonTradingFirst: { enabled: boolean; hour: number; minute: number; prompt: string }
   nonTradingSecond: { enabled: boolean; hour: number; minute: number; prompt: string }
-  morning: { enabled: boolean; runCount: number; prompt: string }
-  afternoon: { enabled: boolean; runCount: number; prompt: string }
+  morning: { enabled: boolean; runCount: number; prompt: string; timeMode: SessionTimeMode; manualTimes: string[] }
+  afternoon: { enabled: boolean; runCount: number; prompt: string; timeMode: SessionTimeMode; manualTimes: string[] }
 }
 
 const FIXED_TASK_NAMES = {
@@ -88,8 +99,8 @@ const defaultState = (): ScheduleFormState => ({
   night: { enabled: false, hour: 21, minute: 0, prompt: '你正在执行夜间分析任务，请结合收盘结果、盘后资讯、政策消息与题材演化，梳理次日重点方向、风险点和跟踪计划。' },
   nonTradingFirst: { enabled: false, hour: 9, minute: 30, prompt: '你正在执行非交易日分析任务，请复盘最新市场环境、消息面与持仓状态，为下一个交易日的首次分析准备重点结论。' },
   nonTradingSecond: { enabled: false, hour: 20, minute: 0, prompt: '你正在执行非交易日补充分析任务，请补充梳理非交易日新增信息、情绪变化和次日需要重点跟踪的交易线索。' },
-  morning: { enabled: true, runCount: 2, prompt: '你正在执行盘中交易操作，你的唯一目标是追求收益最大化。' },
-  afternoon: { enabled: true, runCount: 2, prompt: '你正在执行盘中交易操作，你的唯一目标是追求收益最大化。' },
+  morning: { enabled: true, runCount: 2, prompt: '你正在执行盘中交易操作，你的唯一目标是追求收益最大化。', timeMode: 'auto', manualTimes: [] },
+  afternoon: { enabled: true, runCount: 2, prompt: '你正在执行盘中交易操作，你的唯一目标是追求收益最大化。', timeMode: 'auto', manualTimes: [] },
 })
 
 function parseCron(cronExpression: string) {
@@ -198,17 +209,33 @@ export function useScheduleForm() {
     })
 
     ;(Object.keys(SESSION_TASK_NAMES) as SessionKey[]).forEach((key) => {
+      // 按解析后的时间排序（旧实现按 cron 字符串排序，分钟在前会导致
+      // 10:00 排在 9:45 之前，时间错序）
       const matched = schedules
         .filter((item) => item.name.startsWith(SESSION_TASK_NAMES[key]) && item.market_day_type !== 'non_trading_day')
-        .sort((a, b) => a.cron_expression.localeCompare(b.cron_expression))
+        .map((item) => {
+          const { hour, minute } = parseCron(item.cron_expression)
+          return { item, hour, minute }
+        })
+        .filter(({ hour, minute }) => isValidHourMinute(hour, minute))
+        .sort((a, b) => (a.hour - b.hour) || (a.minute - b.minute))
 
       if (matched.length === 0) {
         return
       }
 
-      scheduleSettings[key].enabled = matched.some((item) => item.enabled)
+      scheduleSettings[key].enabled = matched.some(({ item }) => item.enabled)
       scheduleSettings[key].runCount = Number(matched.length)
-      scheduleSettings[key].prompt = matched[0].task_prompt || scheduleSettings[key].prompt
+      scheduleSettings[key].prompt = matched[0].item.task_prompt || scheduleSettings[key].prompt
+
+      // 实际时间与自动模板一致 → auto 模式；否则 → manual 模式并保留实际时间
+      const actualTimes = matched.map(({ hour, minute }) => formatTimeValue(hour, minute))
+      const autoTimes = getSessionTimes(key, matched.length)
+        .map(({ hour, minute }) => formatTimeValue(hour, minute))
+      const isAuto = actualTimes.length === autoTimes.length
+        && actualTimes.every((time, index) => time === autoTimes[index])
+      scheduleSettings[key].timeMode = isAuto ? 'auto' : 'manual'
+      scheduleSettings[key].manualTimes = isAuto ? [] : actualTimes
     })
   }
 
@@ -245,15 +272,35 @@ export function useScheduleForm() {
 
     const sessionPayload = (Object.keys(SESSION_TASK_NAMES) as SessionKey[]).flatMap((key) => {
       const current = scheduleSettings[key]
-      const existing = existingSchedules.filter((item) => item.name.startsWith(SESSION_TASK_NAMES[key]) && item.market_day_type !== 'non_trading_day')
-      return getSessionTimes(key, current.runCount).map((time, index) => ({
-        id: existing[index]?.id,
+      const existing = existingSchedules
+        .filter((item) => item.name.startsWith(SESSION_TASK_NAMES[key]) && item.market_day_type !== 'non_trading_day')
+        .map((item) => {
+          const { hour, minute } = parseCron(item.cron_expression)
+          return { item, hour, minute }
+        })
+        .filter(({ hour, minute }) => isValidHourMinute(hour, minute))
+        .sort((a, b) => (a.hour - b.hour) || (a.minute - b.minute))
+
+      // manual 模式用手动时间（排序去重）；空/无效时回退自动模板，
+      // 避免误清空该时段全部任务
+      const manualParsed = (current.timeMode === 'manual' ? current.manualTimes : [])
+        .map((value) => parseTimeValue(value))
+        .filter((parsed): parsed is { hour: number; minute: number } => parsed !== null)
+      const uniqueManual = new Map(
+        manualParsed.map(({ hour, minute }) => [`${hour}:${minute}`, { hour, minute }] as const),
+      )
+      const times = uniqueManual.size > 0
+        ? [...uniqueManual.values()].sort((a, b) => (a.hour - b.hour) || (a.minute - b.minute))
+        : getSessionTimes(key, current.runCount)
+
+      return times.map((time, index) => ({
+        id: existing[index]?.item.id,
         name: `${SESSION_TASK_NAMES[key]}${index + 1}号`,
         run_type: 'trade' as const,
         market_day_type: 'trading_day' as const,
         cron_expression: buildCron(time.hour, time.minute, 'trading_day'),
         task_prompt: current.prompt,
-        timeout_seconds: existing[index]?.timeout_seconds ?? DEFAULT_TIMEOUT,
+        timeout_seconds: existing[index]?.item.timeout_seconds ?? DEFAULT_TIMEOUT,
         enabled: current.enabled,
       }))
     })
@@ -299,17 +346,118 @@ export function useScheduleForm() {
   }
 
   function getMorningRunTimes() {
-    return getSessionTimeLabels('morning', scheduleSettings.morning.runCount)
+    return getSessionRunTimes('morning')
   }
 
   function getAfternoonRunTimes() {
-    return getSessionTimeLabels('afternoon', scheduleSettings.afternoon.runCount)
+    return getSessionRunTimes('afternoon')
+  }
+
+  // ---- 交易时段手动时间机制 ----
+
+  /** 当前时段生效的时间标签（auto 用模板，manual 用手动列表）。 */
+  function getSessionRunTimes(section: SessionKey) {
+    const current = scheduleSettings[section]
+    if (current.timeMode === 'manual') {
+      return current.manualTimes.filter((time) => parseTimeValue(time) !== null).join(', ')
+    }
+    return getSessionTimeLabels(section, current.runCount)
+  }
+
+  /** 切换时间模式；切到手动时以当前生效时间初始化列表，避免从空白开始。 */
+  function setSessionTimeMode(section: SessionKey, mode: SessionTimeMode) {
+    const current = scheduleSettings[section]
+    if (current.timeMode === mode) {
+      return
+    }
+    current.timeMode = mode
+    if (mode === 'manual' && current.manualTimes.length === 0) {
+      current.manualTimes = getSessionTimes(section, current.runCount)
+        .map(({ hour, minute }) => formatTimeValue(hour, minute))
+    }
+  }
+
+  function getSessionManualTimes(section: SessionKey) {
+    return scheduleSettings[section].manualTimes
+  }
+
+  /** 更新手动时间条目；无效输入原样保留，由 validate 在保存时拦截。 */
+  function setSessionManualTime(section: SessionKey, index: number, value: string) {
+    const times = scheduleSettings[section].manualTimes
+    if (index < 0 || index >= times.length) {
+      return
+    }
+    times[index] = value.trim()
+  }
+
+  function addSessionManualTime(section: SessionKey) {
+    const times = scheduleSettings[section].manualTimes
+    if (times.length >= MAX_MANUAL_TIMES) {
+      return
+    }
+    // 新条目默认取窗口中点（或最后一条 +30 分钟，超窗回落到窗口中点）
+    const window = SESSION_WINDOWS[section]
+    const last = times
+      .map((value) => parseTimeValue(value))
+      .filter((parsed): parsed is { hour: number; minute: number } => parsed !== null)
+      .sort((a, b) => (a.hour - b.hour) || (a.minute - b.minute))
+    const lastTime = last.length > 0 ? last[last.length - 1] : undefined
+    let candidate = { hour: Math.floor((window.start.hour + window.end.hour) / 2), minute: window.start.minute }
+    if (lastTime) {
+      const total = lastTime.hour * 60 + lastTime.minute + 30
+      const clamped = Math.min(Math.max(total, window.start.hour * 60 + window.start.minute), window.end.hour * 60 + window.end.minute)
+      candidate = { hour: Math.floor(clamped / 60), minute: clamped % 60 }
+    }
+    times.push(formatTimeValue(candidate.hour, candidate.minute))
+  }
+
+  function removeSessionManualTime(section: SessionKey, index: number) {
+    const times = scheduleSettings[section].manualTimes
+    if (index < 0 || index >= times.length) {
+      return
+    }
+    times.splice(index, 1)
+  }
+
+  /** 校验手动时间列表；返回错误文案，null 表示通过。 */
+  function validateSessionTimes(section: SessionKey): string | null {
+    const current = scheduleSettings[section]
+    if (current.timeMode !== 'manual') {
+      return null
+    }
+    if (current.manualTimes.length === 0) {
+      return '请至少添加一个运行时间。'
+    }
+    if (current.manualTimes.length > MAX_MANUAL_TIMES) {
+      return `运行时间最多 ${MAX_MANUAL_TIMES} 个。`
+    }
+    const window = SESSION_WINDOWS[section]
+    const seen = new Set<string>()
+    for (const raw of current.manualTimes) {
+      const parsed = parseTimeValue(raw)
+      if (parsed === null) {
+        return `时间格式无效：${raw || '（空）'}，请使用 HH:MM。`
+      }
+      const total = parsed.hour * 60 + parsed.minute
+      const start = window.start.hour * 60 + window.start.minute
+      const end = window.end.hour * 60 + window.end.minute
+      if (total < start || total > end) {
+        return `${raw} 超出${section === 'morning' ? '上午' : '下午'}交易时段（${window.label}）。`
+      }
+      if (seen.has(raw)) {
+        return `存在重复时间：${raw}。`
+      }
+      seen.add(raw)
+    }
+    return null
   }
 
   return {
     scheduleSettings,
     fixedTaskTimeOptions: FIXED_TASK_TIME_OPTIONS,
     runCountOptions: RUN_COUNT_OPTIONS,
+    sessionWindows: SESSION_WINDOWS,
+    maxManualTimes: MAX_MANUAL_TIMES,
     syncFromSchedules,
     buildPayload,
     setFixedTaskTime,
@@ -320,5 +468,12 @@ export function useScheduleForm() {
     autoResizeTextarea,
     getMorningRunTimes,
     getAfternoonRunTimes,
+    getSessionRunTimes,
+    setSessionTimeMode,
+    getSessionManualTimes,
+    setSessionManualTime,
+    addSessionManualTime,
+    removeSessionManualTime,
+    validateSessionTimes,
   }
 }

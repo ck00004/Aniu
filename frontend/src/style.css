@@ -5065,3 +5065,69 @@ textarea {
     display: none;
   }
 }
+
+/* ==========================================================================
+   交易任务手动时间编辑器（ScheduleView）
+   ========================================================================== */
+
+.run-mode-group {
+  margin-right: 10px;
+}
+
+.run-schedule-manual {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.manual-time-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
+.manual-time-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-radius: 12px;
+  border: 1px solid rgba(145, 170, 214, 0.18);
+  background: rgba(9, 16, 29, 0.55);
+}
+
+.manual-time-input {
+  width: 96px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(145, 170, 214, 0.22);
+  background: rgba(11, 18, 32, 0.85);
+  color: #eef4ff;
+  font-variant-numeric: tabular-nums;
+  outline: none;
+  transition: border-color 0.18s ease, box-shadow 0.18s ease;
+}
+
+.manual-time-input:focus {
+  border-color: rgba(88, 185, 255, 0.55);
+  box-shadow: 0 0 0 3px rgba(88, 185, 255, 0.12);
+}
+
+.manual-time-remove {
+  min-height: 30px;
+  padding: 2px 10px;
+  font-size: 12px;
+}
+
+.manual-time-add {
+  min-height: 34px;
+  padding: 4px 12px;
+  font-size: 13px;
+}
+
+.manual-time-error {
+  margin: 0;
+  color: #ffb0c1;
+  font-size: 13px;
+}
