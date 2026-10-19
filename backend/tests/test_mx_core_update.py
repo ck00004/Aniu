@@ -51,39 +51,32 @@ def _trade_payload(symbol: str, price: float, price_type: str = "LIMIT") -> dict
     return stub.calls[0][1]
 
 
-def test_limit_price_scaled_for_shanghai_stocks() -> None:
-    """沪市（6 开头）2 位小数：1780.5 → 178050。"""
+def test_limit_price_sent_as_raw_decimal() -> None:
+    """接口接收原始小数价格（生产 2026-10-19 验证：放大为整数被拒
+    status=100 "输入价格不合理，超过限价"；上周五原始价格全部成交）。"""
     payload = _trade_payload("600519", 1780.5)
-    assert payload["price"] == 178050
+    assert payload["price"] == 1780.5
     assert payload["useMarketPrice"] is False
 
 
-def test_limit_price_scaled_for_shanghai_9_prefix() -> None:
-    """9 开头（沪市科创板/CDR）同样 2 位小数。"""
-    payload = _trade_payload("920001", 12.34)
-    assert payload["price"] == 1234
-
-
-def test_limit_price_scaled_for_shenzhen_stocks() -> None:
-    """深市（0/3 开头）3 位小数：10.123 → 10123。"""
-    payload = _trade_payload("000001", 10.123)
-    assert payload["price"] == 10123
-
-    payload_3 = _trade_payload("300059", 15.678)
-    assert payload_3["price"] == 15678
+def test_limit_price_decimal_places_normalized() -> None:
+    """按市场规则规范化小数位：沪市（6/9 开头）2 位、深市（0/3 开头）3 位。"""
+    # 沪市 6 开头：3 位小数 → 规范化为 2 位
+    assert _trade_payload("600519", 1780.555)["price"] == 1780.56
+    # 沪市 9 开头：同样 2 位
+    assert _trade_payload("920001", 12.346)["price"] == 12.35
+    # 深市 0 开头：4 位小数 → 规范化为 3 位
+    assert _trade_payload("000001", 10.1234)["price"] == 10.123
+    # 深市 3 开头：同样 3 位
+    assert _trade_payload("300059", 15.6789)["price"] == 15.679
+    # 合规小数位原样透传
+    assert _trade_payload("600519", 277.0)["price"] == 277.0
 
 
 def test_market_order_omits_price() -> None:
     payload = _trade_payload("600519", 1780.5, price_type="MARKET")
     assert "price" not in payload
     assert payload["useMarketPrice"] is True
-
-
-def test_limit_price_rounding() -> None:
-    """超出小数位的输入四舍五入到放大整数。"""
-    payload = _trade_payload("600519", 1780.555)
-    # 2 位小数放大：1780.555 * 100 = 178055.5 → round → 178056
-    assert payload["price"] == 178056
 
 
 # ---------------------------------------------------------------------------

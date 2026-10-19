@@ -184,11 +184,13 @@ class MXClient:
             "useMarketPrice": price_type.upper() == "MARKET",
         }
         if price_type.upper() == "LIMIT" and price is not None:
-            # 官方规范（mx-moni 参考实现）：接口要求整数按放大后的价格
-            # 传入——沪市（6/9 开头）价格小数位不超过 2 位，深市（0/3
-            # 开头）不超过 3 位，price = 原价 * 10^小数位。
+            # 接口接收原始小数价格（官方 SKILL.md 文档示例 "price": 1780.00；
+            # 生产 2026-10-19 验证：放大为整数会被拒 status=100
+            # "输入价格不合理，超过限价"；上周五原始小数价格全部成交）。
+            # 仅按市场规则规范化小数位：沪市（6/9 开头）不超过 2 位、
+            # 深市（0/3 开头）不超过 3 位。
             decimal_places = 2 if str(symbol)[:1] in ("6", "9") else 3
-            payload["price"] = int(round(float(price) * (10 ** decimal_places)))
+            payload["price"] = round(float(price), decimal_places)
         return self._post("/api/claw/mockTrading/trade", payload)
 
     def cancel_order(
