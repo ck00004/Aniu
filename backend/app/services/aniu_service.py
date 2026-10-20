@@ -3380,6 +3380,12 @@ class AniuService:
             if not isinstance(action_payload, dict):
                 continue
             action_name = str(action_payload.get("action") or "").upper()
+            try:
+                quantity = int(action_payload.get("quantity") or 0)
+            except (TypeError, ValueError):
+                # 防御性归零：planned/executed 两个生产者目前都归一化为 int，
+                # 但未来新增生产者传入非数值时不应让整次运行崩溃。
+                quantity = 0
             entry = {
                 "symbol": str(
                     action_payload.get("symbol")
@@ -3388,7 +3394,7 @@ class AniuService:
                 ).strip(),
                 "name": str(action_payload.get("name") or "").strip() or None,
                 "action": action_name,
-                "quantity": int(action_payload.get("quantity") or 0),
+                "quantity": quantity,
                 "price_type": str(action_payload.get("price_type") or "MARKET"),
                 "price": action_payload.get("price"),
                 "reason": str(action_payload.get("reason") or "").strip(),

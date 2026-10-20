@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.core.constants import normalize_schedule_task_prompt
 
@@ -50,7 +51,15 @@ class AppSettingsRead(AppSettingsBase):
 
 
 class AppSettingsUpdate(AppSettingsBase):
-    pass
+    # 只校验写入路径：读取（AppSettingsRead）不校验，避免历史库中的
+    # 脏值导致 GET /settings 序列化失败。
+    @field_validator("automation_dream_time")
+    @classmethod
+    def validate_dream_time_format(cls, value: str) -> str:
+        text = str(value or "").strip()
+        if not re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", text):
+            raise ValueError("梦境整理时间必须是 HH:MM 格式（00:00-23:59）。")
+        return text
 
 
 class SkillListItemRead(BaseModel):

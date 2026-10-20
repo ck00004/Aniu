@@ -68,6 +68,14 @@
               />
               <p class="field-help">默认 128K。后端会按该值的 85% 自动作为上下文压缩触发预算。</p>
             </label>
+            <label class="field">
+              <span>梦境整理时间</span>
+              <input
+                v-model="settings.automation_dream_time"
+                type="time"
+              />
+              <p class="field-help">每天到达该时间后自动整理前一交易日的运行报告并沉淀长期记忆，默认 00:30。</p>
+            </label>
           </div>
         </div>
 

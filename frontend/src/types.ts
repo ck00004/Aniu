@@ -10,6 +10,7 @@ export interface AppSettings {
   system_prompt: string
   prompt_templates: Record<string, string>
   automation_context_window_tokens?: number | null
+  automation_dream_time?: string
   created_at: string
   updated_at: string
 }

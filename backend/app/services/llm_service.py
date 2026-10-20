@@ -1071,7 +1071,45 @@ class LLMService:
                 try:
                     arguments = json.loads(arguments_text)
                 except json.JSONDecodeError as exc:
-                    raise RuntimeError(f"工具参数不是合法 JSON: {exc}") from exc
+                    # 非法 JSON 参数不终止整次运行：把错误作为工具结果回传，
+                    # 让模型修正参数后重新调用（原行为是直接失败整个运行）。
+                    error_result = {
+                        "ok": False,
+                        "tool_name": tool_name,
+                        "error": (
+                            "工具参数不是合法 JSON，本次调用未执行。"
+                            f"请检查参数格式后重新调用该工具：{exc}"
+                        ),
+                    }
+                    raw_arguments_preview = str(arguments_text)[:500]
+                    _emit(
+                        "tool_call",
+                        phase="llm",
+                        tool_name=tool_name,
+                        tool_call_id=tool_call.get("id"),
+                        arguments={"_invalid_json": raw_arguments_preview},
+                        status="done",
+                        ok=False,
+                        summary=error_result["error"],
+                    )
+                    tool_history.append(
+                        {
+                            "id": tool_call.get("id"),
+                            "name": tool_name,
+                            "arguments": {"_invalid_json": raw_arguments_preview},
+                            "result": error_result,
+                        }
+                    )
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call.get("id"),
+                            "content": _safe_json_dumps(
+                                _slim_tool_result(error_result)
+                            ),
+                        }
+                    )
+                    continue
 
                 _emit(
                     "tool_call",

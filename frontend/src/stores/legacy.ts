@@ -41,6 +41,7 @@ const defaultSettings = (): SettingsPayload => ({
   system_prompt: '你是跨越完整牛熊周期的顶尖私募投资机构老将与极度理性的专业交易员，你深谙A股政策驱动、外资流动与资金博弈机制。你必须持续运行以下自我驱动循环，监控经济、政策、盘面数据及资金流向，研判周期位置与市场情绪，寻找共识与预期差，定性博弈逻辑，自主决策执行交易操作。你的唯一目标是追求收益最大化。',
   prompt_templates: {},
   automation_context_window_tokens: 131072,
+  automation_dream_time: '00:30',
 })
 
 const defaultAccount = (): AccountOverview => ({
@@ -224,6 +225,7 @@ export const useAppStore = defineStore('app', () => {
     settings.system_prompt = payload.system_prompt
     settings.prompt_templates = { ...(payload.prompt_templates ?? {}) }
     settings.automation_context_window_tokens = payload.automation_context_window_tokens ?? 131072
+    settings.automation_dream_time = payload.automation_dream_time ?? '00:30'
   }
 
   function applySchedules(payload: ScheduleConfig[]) {

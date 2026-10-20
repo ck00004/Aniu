@@ -23,3 +23,21 @@ test('chat view exposes persistent session reset entry', () => {
   assert.ok(sidebarSource.includes('清空上下文'))
   assert.ok(sidebarSource.includes('resetPersistent'))
 })
+test('settings view exposes dream time configuration field', () => {
+  const source = readFileSync(new URL('../src/views/SettingsView.vue', import.meta.url), 'utf-8')
+
+  assert.ok(source.includes('梦境整理时间'))
+  assert.ok(source.includes('automation_dream_time'))
+  assert.ok(source.includes('type="time"'))
+  assert.ok(source.includes('默认 00:30'))
+})
+
+test('settings store 同步并回传梦境整理时间', () => {
+  const storeSource = readFileSync(new URL('../src/stores/legacy.ts', import.meta.url), 'utf-8')
+  const typesSource = readFileSync(new URL('../src/types.ts', import.meta.url), 'utf-8')
+
+  // 默认值、applySettings 同步、类型声明三处齐备（保存走 {...settings} 展开，自动回传）
+  assert.ok(storeSource.includes("automation_dream_time: '00:30'"))
+  assert.ok(storeSource.includes("settings.automation_dream_time = payload.automation_dream_time ?? '00:30'"))
+  assert.ok(typesSource.includes('automation_dream_time?: string'))
+})
