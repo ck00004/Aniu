@@ -3945,7 +3945,7 @@ class AniuService:
         patterns: list[tuple[str, re.Pattern[str]]] = [
             ("BUY", re.compile(r"(?:^|[：:\-\s]|执行[：:]?)((?:直接)?买入|加仓)\s*([A-Za-z\u4e00-\u9fa5]{2,20})(?:\s*[（(]\s*(\d{6})\s*[)）])?")),
             ("SELL", re.compile(r"(?:^|[：:\-\s]|执行[：:]?)((?:直接)?卖出|先卖|优先卖|减仓)\s*([A-Za-z\u4e00-\u9fa5]{2,20})(?:\s*[（(]\s*(\d{6})\s*[)）])?")),
-            ("CANCEL", re.compile(r"(?:^|[：:\-\s]|执行[：:]?)((?:直接)?撤单|撤销)\s*([A-Za-z\u4e00-\u9fa5]{2,20})?")),
+            ("CANCEL", re.compile(r"(?:^|[：:\-\s]|执行[：:]?)((?:直接)?撤单|撤销)\s*([A-Za-z\u4e00-\u9fa5]{2,20})?(?:\s*[（(]\s*(\d{6})\s*[)）])?")),
         ]
 
         for raw_line in text.splitlines():
@@ -3958,9 +3958,14 @@ class AniuService:
                 match = pattern.search(line)
                 if not match:
                     continue
-                target = match.group(2) or "委托"
+                # 各模式分组数可能不同（CANCEL 的目标与代码均为可选），
+                # 必须按 groups 元组安全取值：对不存在的分组调用
+                # group(3) 会抛 IndexError "no such group"，让整次运行
+                # 在一致性校验阶段失败（生产 2026-10-20 11:15 事故）。
+                groups = match.groups()
+                target = (groups[1] if len(groups) > 1 else None) or "委托"
                 _push(action, target, line)
-                code = match.group(3)
+                code = groups[2] if len(groups) > 2 else None
                 if code:
                     _push(action, code, line)
 

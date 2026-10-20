@@ -973,3 +973,52 @@ def test_safe_compute_next_run_at_falls_back_when_calendar_fails() -> None:
 
     assert next_run_at is not None
     assert _assume_utc(next_run_at) > now_utc() + timedelta(minutes=29)
+
+
+# ---------------------------------------------------------------------------
+# 生产事故回归（2026-10-20 11:15）：撤单声明触发 IndexError: no such group
+# ---------------------------------------------------------------------------
+
+
+def test_claimed_cancel_line_does_not_crash_extraction() -> None:
+    """CANCEL 模式分组数少于 BUY/SELL，取组必须安全。
+
+    生产事故：模型最终答复出现可匹配的撤单句（如行首"撤销委托"），
+    match.group(3) 对只有 2 个分组的 CANCEL 匹配抛 IndexError，
+    导致整次运行在一致性校验阶段失败、最终答复丢失。
+    """
+    changes = aniu_service._extract_claimed_trade_changes(
+        "撤销委托\n已执行：撤单东方财富(600030)\n买入贵州茅台(600519) 1000股"
+    )
+
+    actions = {(change["action"], change["target"]) for change in changes}
+    assert ("CANCEL", "委托") in actions
+    assert ("CANCEL", "东方财富") in actions
+    assert ("CANCEL", "600030") in actions
+    assert ("BUY", "贵州茅台") in actions
+    assert ("BUY", "600519") in actions
+
+
+def test_claimed_bare_cancel_word_does_not_crash_extraction() -> None:
+    """仅有撤单动作词（无目标）的行也不能崩溃。"""
+    changes = aniu_service._extract_claimed_trade_changes("撤单")
+
+    assert changes == [{"action": "CANCEL", "target": "委托", "raw_query": "撤单"}]
+
+
+def test_has_trade_consistency_gap_survives_cancel_claim() -> None:
+    """事故调用链：_has_trade_consistency_gap → _extract_claimed_trade_changes。"""
+    # 声称撤单但无实际撤单 → 有缺口（True），且不抛异常
+    assert aniu_service._has_trade_consistency_gap("撤销委托", []) is True
+
+    # 存在实际撤单 → 视为一致（False）
+    executed = [
+        {
+            "action": "CANCEL",
+            "cancel_type": "order",
+            "order_id": "261114200000051761",
+            "stock_code": None,
+            "reason": "",
+        }
+    ]
+    assert aniu_service._has_trade_consistency_gap("撤销委托", executed) is False
