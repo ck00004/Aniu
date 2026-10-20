@@ -356,3 +356,77 @@ test('loadMoreMemories 追加分页并在失败时回退偏移', async () => {
     mocks.restore()
   }
 })
+
+test('triggerDream 指定日期时透传目标日期', async () => {
+  const mocks = installApiMocks()
+  try {
+    const manager = useMemories()
+    const triggered = await manager.triggerDream('2026-10-16')
+    assert.equal(triggered, true)
+    const call = mocks.calls.find(({ method }) => method === 'runMemoryDream')
+    assert.ok(call)
+    assert.deepEqual(call.args, ['2026-10-16'])
+    assert.equal(manager.noticeMessage.value.includes('2026-10-16'), true)
+  } finally {
+    mocks.restore()
+  }
+})
+
+test('backfillDream 未选日期时拒绝且不发起请求', async () => {
+  const mocks = installApiMocks()
+  try {
+    const manager = useMemories()
+    manager.backfillDate.value = ''
+    const succeeded = await manager.backfillDream()
+    assert.equal(succeeded, false)
+    assert.equal(manager.errorMessage.value.includes('选择'), true)
+    assert.equal(
+      mocks.calls.some(({ method }) => method === 'runMemoryDream'),
+      false,
+    )
+  } finally {
+    mocks.restore()
+  }
+})
+
+test('backfillDream 拒绝今天及未来日期（会占用当晚自动整理）', async () => {
+  const mocks = installApiMocks()
+  const today = new Date().toISOString().slice(0, 10)
+  try {
+    const manager = useMemories()
+    manager.backfillDate.value = today
+    const succeeded = await manager.backfillDream()
+    assert.equal(succeeded, false)
+    assert.equal(manager.errorMessage.value.includes('昨天及更早'), true)
+
+    manager.backfillDate.value = '2999-01-01'
+    const futureAttempt = await manager.backfillDream()
+    assert.equal(futureAttempt, false)
+    assert.equal(
+      mocks.calls.some(({ method }) => method === 'runMemoryDream'),
+      false,
+    )
+  } finally {
+    mocks.restore()
+  }
+})
+
+test('backfillDream 历史日期发起补整理并清空选择', async () => {
+  const mocks = installApiMocks()
+  const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000)
+    .toISOString()
+    .slice(0, 10)
+  try {
+    const manager = useMemories()
+    manager.backfillDate.value = yesterday
+    const succeeded = await manager.backfillDream()
+    assert.equal(succeeded, true)
+    const call = mocks.calls.find(({ method }) => method === 'runMemoryDream')
+    assert.ok(call)
+    assert.deepEqual(call.args, [yesterday])
+    assert.equal(manager.backfillDate.value, '')
+    assert.equal(manager.noticeMessage.value.includes(yesterday), true)
+  } finally {
+    mocks.restore()
+  }
+})

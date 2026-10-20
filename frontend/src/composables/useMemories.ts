@@ -39,6 +39,15 @@ export function useMemories() {
   const dreamsOffset = ref(0)
   const expandedDreamId = ref<number | null>(null)
   const dreamRunning = ref(false)
+  const backfillDate = ref('')
+  const backfillMaxDate = ref('')
+
+  function refreshBackfillMaxDate(): void {
+    const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000)
+    backfillMaxDate.value = yesterday.toISOString().slice(0, 10)
+  }
+
+  refreshBackfillMaxDate()
 
   // 活动
   const activities = ref<MemoryActivity[]>([])
@@ -221,14 +230,16 @@ export function useMemories() {
     }
   }
 
-  async function triggerDream(): Promise<boolean> {
+  async function triggerDream(targetDate?: string): Promise<boolean> {
     if (dreamRunning.value) return false
     dreamRunning.value = true
     resetMessages()
     try {
-      const payload = await api.runMemoryDream()
+      const payload = await api.runMemoryDream(targetDate)
       noticeMessage.value = payload.started
-        ? '梦境整理已启动，稍后刷新查看结果。'
+        ? (targetDate
+          ? `已启动 ${targetDate} 的梦境整理，稍后刷新查看结果。`
+          : '梦境整理已启动，稍后刷新查看结果。')
         : '梦境任务已在执行或排队中。'
       dreamsOffset.value = 0
       await loadDreams()
@@ -239,6 +250,28 @@ export function useMemories() {
     } finally {
       dreamRunning.value = false
     }
+  }
+
+  async function backfillDream(): Promise<boolean> {
+    const targetDate = backfillDate.value.trim()
+    if (!targetDate) {
+      resetMessages()
+      errorMessage.value = '请先选择要补整理的日期。'
+      return false
+    }
+    // 只允许补整理昨天及更早：当天的数据尚未完整，且会占用当晚的
+    // 自动整理（调度器发现当日已有梦境记录时会跳过触发）。
+    refreshBackfillMaxDate()
+    if (targetDate > backfillMaxDate.value) {
+      resetMessages()
+      errorMessage.value = '只能补整理昨天及更早的日期；当天数据尚未完整，且会占用当晚的自动整理。'
+      return false
+    }
+    const succeeded = await triggerDream(targetDate)
+    if (succeeded) {
+      backfillDate.value = ''
+    }
+    return succeeded
   }
 
   async function removeDream(dream: MemoryDream): Promise<boolean> {
@@ -345,6 +378,8 @@ export function useMemories() {
     hasMoreDreams,
     expandedDreamId,
     dreamRunning,
+    backfillDate,
+    backfillMaxDate,
     activities,
     activitiesTotal,
     hasMoreActivities,
@@ -359,6 +394,7 @@ export function useMemories() {
     loadDreams,
     loadMoreDreams,
     triggerDream,
+    backfillDream,
     removeDream,
     toggleDreamDetail,
     loadActivities,

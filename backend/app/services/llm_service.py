@@ -451,13 +451,25 @@ def _safe_json_dumps(payload: Any) -> str:
 
 
 def _slim_tool_result(tool_result: dict[str, Any]) -> dict[str, Any]:
-    """Pass raw tool payloads to the model while keeping minimal metadata."""
-    return {
-        "ok": tool_result.get("ok"),
-        "tool_name": tool_result.get("tool_name"),
-        "summary": tool_result.get("summary"),
-        "result": tool_result.get("result"),
-    }
+    """Pass raw tool payloads to the model while keeping minimal metadata.
+
+    mx 技能与 builtin_utils 返回 {ok, tool_name, summary, result} 规范形状，
+    按元数据精简；梦境/记忆等内置工具返回各自的结构化形状（runs/items/
+    action/error 等键），必须原样透传。统一按规范形状投影会把非规范载荷
+    剥成 {"ok": true, "result": null}，模型只能误判"无数据"——生产
+    2026-10-16~19 记忆梦境连续空转、记忆技能在所有智能体路径不可见的根因。
+    """
+    if "result" in tool_result or "summary" in tool_result:
+        slim = {
+            "ok": tool_result.get("ok"),
+            "tool_name": tool_result.get("tool_name"),
+            "summary": tool_result.get("summary"),
+            "result": tool_result.get("result"),
+        }
+        if "error" in tool_result:
+            slim["error"] = tool_result.get("error")
+        return slim
+    return dict(tool_result)
 
 
 def _iter_text_chunks(content: str, chunk_size: int = _FINAL_STREAM_CHUNK_SIZE):

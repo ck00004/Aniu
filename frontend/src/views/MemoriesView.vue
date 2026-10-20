@@ -115,6 +115,30 @@
 
         <!-- 梦境记录 -->
         <div v-if="activeTab === 'dreams'" class="memories-section">
+          <div class="memories-toolbar memories-backfill-bar">
+            <label class="memories-backfill-field">
+              <span class="meta-label">补整理指定日期</span>
+              <input
+                v-model="backfillDate"
+                class="memories-date-input"
+                type="date"
+                :max="backfillMaxDate"
+              />
+            </label>
+            <button
+              class="button primary small"
+              type="button"
+              :disabled="dreamRunning || !backfillDate"
+              title="重新整理指定历史日期的运行报告与记忆（已完成/失败的任务会重置重跑）"
+              @click="handleBackfillDream"
+            >
+              {{ dreamRunning ? '整理中…' : '补整理' }}
+            </button>
+            <p class="memories-backfill-hint">
+              用于补齐历史日期的整理（如修复部署前的空转记录）；当天日期不可选，以免占用当晚自动整理。
+            </p>
+          </div>
+
           <div v-if="dreams.length === 0 && !loading" class="memories-empty">
             还没有梦境记录。每晚到达整理时间会自动执行，也可以点击"立即整理记忆"。
           </div>
@@ -148,6 +172,15 @@
                   <span v-if="dream.finished_at">结束 {{ formatMemoryTime(dream.finished_at) }}</span>
                 </div>
                 <div class="memories-item-actions">
+                  <button
+                    class="button ghost small"
+                    type="button"
+                    :disabled="dreamRunning || dream.status === 'running'"
+                    :title="`重新整理 ${dream.target_date} 的运行报告与记忆`"
+                    @click="handleRerunDream(dream)"
+                  >
+                    重新整理
+                  </button>
                   <button
                     class="button ghost small memories-danger-button"
                     type="button"
@@ -282,6 +315,8 @@ const {
   hasMoreDreams,
   expandedDreamId,
   dreamRunning,
+  backfillDate,
+  backfillMaxDate,
   activities,
   activitiesTotal,
   hasMoreActivities,
@@ -294,6 +329,7 @@ const {
   removeMemory,
   loadMoreDreams,
   triggerDream,
+  backfillDream,
   removeDream,
   toggleDreamDetail,
   loadMoreActivities,
@@ -368,6 +404,18 @@ async function handleRefresh(): Promise<void> {
 
 async function handleTriggerDream(): Promise<void> {
   await triggerDream()
+}
+
+async function handleBackfillDream(): Promise<void> {
+  await backfillDream()
+}
+
+async function handleRerunDream(dream: MemoryDream): Promise<void> {
+  const confirmed = window.confirm(
+    `确定重新整理 ${dream.target_date} 吗？该日期已有的整理结果会被本次覆盖。`,
+  )
+  if (!confirmed) return
+  await triggerDream(dream.target_date)
 }
 
 async function handleSaveDraft(): Promise<void> {
