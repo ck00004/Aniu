@@ -15,6 +15,15 @@ MANUAL_TRADE_TASK_PROMPT = (
     "如本轮不交易，必须明确说明本轮未实际交易及原因。"
 )
 
+DREAM_INSTRUCTION_PROMPT = (
+    "你是交易记忆的夜间整理智能体。请整理指定日期的运行报告和长期记忆："
+    "先分页阅读当日报告和全部当前记忆，再自主决定需要创建、更新、或软删除的记忆。"
+    "更新和删除必须带上最近读取到的 expected_version，版本冲突时重新读取后再操作。"
+    "只保存简洁、可长期复用的投资经验教训和形成原因；"
+    "不得保存运行总结、短暂行情或泛泛原则。"
+    "不要调用任何交易或股票工具；完成后汇报本次整理结果。"
+)
+
 DEFAULT_PROMPT_TEMPLATES: dict[str, str] = {
     "manual_analysis_task_prompt": MANUAL_ANALYSIS_TASK_PROMPT,
     "manual_trade_task_prompt": MANUAL_TRADE_TASK_PROMPT,
@@ -66,6 +75,7 @@ A股重点方向：列出 3-5 个最值得关注的方向或板块，并写明�
     "jin10_merge_analysis_prompt_template": "{header}\n\n{chunk_outputs}\n\n请去重、消除矛盾，保留真正对 A股和金融市场有定价意义的信息。\n{output_format}",
     "empty_final_answer_followup_prompt": "你已经完成了工具调用。请基于上面的工具结果直接输出最终结论，必须给出可展示的中文结论，不要返回空字符串，也不要只返回工具调用。",
     "chat_confirmation_append_prompt": "聊天专用安全规则：当操作涉及交易执行、下单、撤单、自选股增删、写入、删除、覆盖、批量修改或其他会改变数据、文件、配置、状态的破坏性操作时，你必须先明确说明拟执行操作、影响范围和潜在风险，并在得到用户明确确认后才能调用工具或执行操作；若未获得明确确认，只能提供方案、预览或建议，不得直接执行。",
+    "dream_instruction_prompt": DREAM_INSTRUCTION_PROMPT,
 }
 
 

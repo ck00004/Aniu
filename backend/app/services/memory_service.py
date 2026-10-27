@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import func as sa_func, or_, select
+from sqlalchemy import and_, func as sa_func, or_, select
 
 from app.db.database import session_scope
 from app.db.models import MemoryActivity, MemoryItem
@@ -97,25 +97,26 @@ class MemoryService:
         normalized_limit = max(1, min(int(limit or _DEFAULT_LIMIT), _MAX_LIMIT))
 
         with session_scope() as db:
+            # 关键词过滤下推到 SQL 全库匹配：旧实现只取最近更新的 50 条
+            # 再在内存里匹配，记忆增长后较早的有效经验永远检索不到。
+            # contains → LIKE '%kw%'（autoescape 处理 % _ 通配符；
+            # SQLite LIKE 对 ASCII 默认不区分大小写，与旧实现一致）。
+            conditions = [
+                or_(
+                    MemoryItem.content.contains(keyword, autoescape=True),
+                    MemoryItem.reason.contains(keyword, autoescape=True),
+                )
+                for keyword in normalized
+            ]
+            combined = and_(*conditions) if mode == "all" else or_(*conditions)
             stmt = (
                 select(MemoryItem)
                 .where(MemoryItem.deleted_at.is_(None))
+                .where(combined)
                 .order_by(MemoryItem.updated_at.desc())
-                .limit(50)
+                .limit(normalized_limit)
             )
-            rows = list(db.scalars(stmt).all())
-            matched = []
-            for row in rows:
-                haystack = f"{row.content}\n{row.reason or ''}".lower()
-                hits = sum(
-                    1 for keyword in normalized if keyword.lower() in haystack
-                )
-                if (mode == "all" and hits == len(normalized)) or (
-                    mode == "any" and hits > 0
-                ):
-                    matched.append(row)
-                    if len(matched) >= normalized_limit:
-                        break
+            matched = list(db.scalars(stmt).all())
 
             _log_activity(
                 db,

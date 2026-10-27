@@ -41,3 +41,11 @@ test('settings store 同步并回传梦境整理时间', () => {
   assert.ok(storeSource.includes("settings.automation_dream_time = payload.automation_dream_time ?? '00:30'"))
   assert.ok(typesSource.includes('automation_dream_time?: string'))
 })
+
+test('settings view exposes configurable dream instruction prompt', () => {
+  const source = readFileSync(new URL('../src/views/SettingsView.vue', import.meta.url), 'utf-8')
+
+  assert.ok(source.includes('记忆梦境提示词'))
+  assert.ok(source.includes('dream_instruction_prompt'))
+  assert.ok(source.includes('梦境整理指令'))
+})

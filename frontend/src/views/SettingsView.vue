@@ -352,6 +352,19 @@ const promptSections: PromptSection[] = [
     ],
   },
   {
+    key: 'memory-dream',
+    title: '记忆梦境提示词',
+    description: '夜间记忆整理智能体的指令，控制如何归纳运行报告与沉淀长期记忆。',
+    items: [
+      {
+        key: 'dream_instruction_prompt',
+        label: '梦境整理指令',
+        description: '每晚梦境整理时拼接在系统提示词后的指令，决定整理流程、保存标准与禁止事项。',
+        rows: 6,
+      },
+    ],
+  },
+  {
     key: 'news-analysis',
     title: '资讯源诊断提示词',
     description: '用于 Jin10 / CLS 新闻预分析与分批合并诊断。',

@@ -15,6 +15,7 @@ from typing import Any
 
 from sqlalchemy import func as sa_func, select
 
+from app.core.prompt_templates import DREAM_INSTRUCTION_PROMPT, resolve_prompt_template
 from app.db.database import session_scope
 from app.db.models import MemoryDream
 from app.services.daily_report_service import daily_report_service
@@ -27,14 +28,9 @@ SHANGHAI_TZ = timezone(timedelta(hours=8))
 DEFAULT_DREAM_TIME = "00:30"
 _DREAM_TIME_PATTERN = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 
-_DREAM_INSTRUCTION = (
-    "你是交易记忆的夜间整理智能体。请整理指定日期的运行报告和长期记忆："
-    "先分页阅读当日报告和全部当前记忆，再自主决定需要创建、更新、或软删除的记忆。"
-    "更新和删除必须带上最近读取到的 expected_version，版本冲突时重新读取后再操作。"
-    "只保存简洁、可长期复用的投资经验教训和形成原因；"
-    "不得保存运行总结、短暂行情或泛泛原则。"
-    "不要调用任何交易或股票工具；完成后汇报本次整理结果。"
-)
+# 兼容别名：默认指令已迁入 prompt_templates（dream_instruction_prompt，
+# 设置页可配置），此处保留常量名供既有引用与测试使用。
+_DREAM_INSTRUCTION = DREAM_INSTRUCTION_PROMPT
 
 
 def _now_utc() -> datetime:
@@ -347,16 +343,23 @@ class MemoryDreamService:
             llm_api_key = str(settings.llm_api_key)
             system_prompt = str(settings.system_prompt or "").strip()
 
+        # 梦境指令接入 prompt_templates（设置页"梦境整理指令"可配置），
+        # 未配置时自动回退内置默认值。
+        dream_instruction = resolve_prompt_template(
+            getattr(settings, "prompt_templates", None),
+            "dream_instruction_prompt",
+        ) or _DREAM_INSTRUCTION
+
         dream_settings = SimpleNamespace(
             llm_model=llm_model,
             llm_base_url=llm_base_url,
             llm_api_key=llm_api_key,
             system_prompt=(
-                f"{system_prompt}\n\n{_DREAM_INSTRUCTION}".strip()
+                f"{system_prompt}\n\n{dream_instruction}".strip()
                 if system_prompt
-                else _DREAM_INSTRUCTION
+                else dream_instruction
             ),
-            prompt_templates={},
+            prompt_templates=getattr(settings, "prompt_templates", None) or {},
             run_type="dream",
             timeout_seconds=600,
             automation_context_window_tokens=None,

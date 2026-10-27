@@ -576,3 +576,96 @@ def test_agent_loop_tools_override_reaches_payload(monkeypatch) -> None:
         "memory_read",
         "memory_write",
     }
+
+
+def test_execute_dream_uses_configured_dream_instruction(
+    monkeypatch, tmp_path
+) -> None:
+    """梦境指令接入 prompt_templates：设置页可配置，未配置回退默认。"""
+    captured: dict[str, object] = {}
+
+    def fake_run_agent_with_messages(*, app_settings, client, messages, emit=None, tool_executor=None, **kwargs):
+        captured["app_settings"] = app_settings
+        return (
+            {"final_answer": "整理完成。", "tool_calls": []},
+            {},
+            {},
+            {},
+        )
+
+    monkeypatch.setattr(
+        llm_service, "run_agent_with_messages", fake_run_agent_with_messages
+    )
+
+    with create_test_client(monkeypatch, tmp_path):
+        _configure_llm_settings()
+        with session_scope() as db:
+            settings = aniu_service.get_or_create_settings(db)
+            settings.prompt_templates = {
+                "dream_instruction_prompt": "自定义梦境指令：只沉淀量价背离类经验。"
+            }
+            db.commit()
+
+        target = date(2026, 10, 15)
+        with session_scope() as db:
+            dream = memory_dream_service.create_or_get(db, target_date=target)
+            dream_id = dream.id
+
+        result = memory_dream_service.execute_dream(dream_id)
+        assert result is not None
+        assert result.status == "completed"
+
+        dream_settings = captured["app_settings"]
+        assert "自定义梦境指令：只沉淀量价背离类经验。" in dream_settings.system_prompt
+        assert "夜间整理智能体" not in dream_settings.system_prompt
+        # 真实模板字典透传给 agent（空结论重试等模板同样可配置）
+        assert (
+            dream_settings.prompt_templates.get("dream_instruction_prompt")
+            == "自定义梦境指令：只沉淀量价背离类经验。"
+        )
+    reset_db_state()
+
+
+def test_memory_search_finds_old_memories_beyond_recent_fifty(
+    monkeypatch, tmp_path
+) -> None:
+    """memory_read 检索必须覆盖全库：旧实现只扫最近 50 条，
+    记忆增长后较早的有效经验永远检索不到。"""
+    with create_test_client(monkeypatch, tmp_path):
+        with session_scope() as db:
+            oldest = memory_service.create_memory(
+                db,
+                content="地量十字星后放量突破平台是可靠的中线买点",
+                reason="2019 年多次验证的量价形态",
+            )
+            for index in range(60):
+                memory_service.create_memory(
+                    db,
+                    content=f"常规经验条目 {index}：控制单票仓位上限",
+                    reason="仓位管理",
+                )
+            # 把目标记忆的更新时间改为最早（模拟久远但仍有价值的经验）
+            oldest.updated_at = datetime(2020, 1, 1, tzinfo=timezone.utc)
+            db.add(oldest)
+            db.commit()
+
+        result = memory_service.search_for_agent(
+            keywords=["地量十字星"], match_mode="any", limit=5
+        )
+
+        assert result["ok"] is True
+        assert result["result_count"] == 1
+        assert "地量十字星" in result["items"][0]["content"]
+
+        # all 模式：关键词分别命中 content 与 reason 的久远记忆
+        result_all = memory_service.search_for_agent(
+            keywords=["地量十字星", "量价形态"], match_mode="all", limit=5
+        )
+        assert result_all["result_count"] == 1
+
+        # 不含关键词的常规条目不应命中
+        result_none = memory_service.search_for_agent(
+            keywords=["不存在的关键词xyz"], match_mode="any", limit=5
+        )
+        assert result_none["result_count"] == 0
+    reset_db_state()
