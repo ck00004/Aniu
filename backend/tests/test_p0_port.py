@@ -781,3 +781,17 @@ def test_tool_invocation_logs_api_endpoint(monkeypatch, tmp_path) -> None:
         assert unauthenticated.status_code == 401
 
     reset_db_state()
+
+
+def test_market_open_during_call_auction(monkeypatch) -> None:
+    """09:15-09:25 集合竞价时段允许交易（2026-10 调整：上午起点 09:30→09:15）。"""
+    _set_market_time(monkeypatch, 9, 15)
+    assert is_market_open() is True
+
+    _set_market_time(monkeypatch, 9, 20)
+    assert is_market_open() is True
+
+
+def test_market_closed_just_before_call_auction(monkeypatch) -> None:
+    _set_market_time(monkeypatch, 9, 14)
+    assert is_market_open() is False

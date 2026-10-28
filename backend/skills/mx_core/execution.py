@@ -13,9 +13,11 @@ from skills.mx_core.tool_specs import TOOL_PROFILES, TOOL_SPECS, build_tools
 logger = logging.getLogger(__name__)
 
 _SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
-# A 股连续竞价时段（分钟数，含边界）
+# A 股交易时段（分钟数，含边界）。上午从 09:15 起：09:15-09:25 集合竞价
+# 可挂单参与撮合，09:25-09:30 可挂单等待开盘连续撮合，定时任务可从
+# 09:15 开始触发（2026-10 调整，原起点 09:30）。
 _MARKET_SESSIONS: tuple[tuple[int, int], ...] = (
-    (9 * 60 + 30, 11 * 60 + 30),
+    (9 * 60 + 15, 11 * 60 + 30),
     (13 * 60, 15 * 60),
 )
 # 委托仍占用资金/份额的状态（已报/未成交/处理中）
@@ -80,7 +82,7 @@ def _order_status(row: dict[str, Any]) -> str:
 
 
 def is_market_open() -> bool:
-    """A 股是否处于连续竞价时段（上海时区）。
+    """A 股是否处于可交易时段（上海时区，上午含集合竞价）。
 
     交易日历不可用时退化为"周一至周五 + 时段"启发式并记录告警，
     避免日历故障完全阻断交易（节假日废单由远端拒绝兜底）。

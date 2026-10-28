@@ -355,8 +355,12 @@ test('validateSessionTimes 校验窗口/重复/空值/格式', () => {
   const { scheduleSettings, validateSessionTimes } = useScheduleForm()
 
   scheduleSettings.morning.timeMode = 'manual'
-  scheduleSettings.morning.manualTimes = ['09:20']
+  scheduleSettings.morning.manualTimes = ['09:14']
   assert.match(validateSessionTimes('morning') || '', /超出上午交易时段/)
+
+  // 09:15 起含集合竞价，属合法窗口
+  scheduleSettings.morning.manualTimes = ['09:15', '09:25']
+  assert.equal(validateSessionTimes('morning'), null)
 
   scheduleSettings.morning.manualTimes = ['11:40']
   assert.match(validateSessionTimes('morning') || '', /超出上午交易时段/)
@@ -393,23 +397,39 @@ test('addSessionManualTime 追加并遵守上限，removeSessionManualTime 删�
 
   addSessionManualTime('morning')
   assert.equal(getSessionManualTimes('morning').length, 1)
-  // 空列表时新条目取窗口中点
-  assert.equal(getSessionManualTimes('morning')[0], '10:30')
+  // 空列表时新条目取窗口中点（09:15-11:30 窗口 → 10:15）
+  assert.equal(getSessionManualTimes('morning')[0], '10:15')
 
   addSessionManualTime('morning')
   // 上一条 +30 分钟
-  assert.equal(getSessionManualTimes('morning')[1], '11:00')
-  // 超窗回落到窗口边界内
+  assert.equal(getSessionManualTimes('morning')[1], '10:45')
+  // 第三条 10:45+30=11:15，仍在窗口内
   addSessionManualTime('morning')
-  assert.equal(getSessionManualTimes('morning')[2], '11:30')
+  assert.equal(getSessionManualTimes('morning')[2], '11:15')
 
   removeSessionManualTime('morning', 0)
-  assert.deepEqual(getSessionManualTimes('morning'), ['11:00', '11:30'])
+  assert.deepEqual(getSessionManualTimes('morning'), ['10:45', '11:15'])
 
-  // 上限保护
-  scheduleSettings.morning.manualTimes = ['09:30', '09:35', '09:40', '09:45', '10:00', '10:05', '10:10', '10:15']
+  // 上限保护：上午 10（2026-10 调整，原 8）
+  scheduleSettings.morning.manualTimes = ['09:15', '09:20', '09:30', '09:35', '09:40', '09:45', '10:00', '10:05', '10:10', '10:15']
   addSessionManualTime('morning')
-  assert.equal(getSessionManualTimes('morning').length, 8)
+  assert.equal(getSessionManualTimes('morning').length, 10)
+})
+
+test('validateSessionTimes 上午上限 10、下午上限 8', () => {
+  const { scheduleSettings, validateSessionTimes } = useScheduleForm()
+
+  scheduleSettings.morning.timeMode = 'manual'
+  scheduleSettings.morning.manualTimes = Array.from({ length: 10 }, (_, i) => `09:${String(15 + i).padStart(2, '0')}`)
+  assert.equal(validateSessionTimes('morning'), null)
+  scheduleSettings.morning.manualTimes.push('11:00')
+  assert.match(validateSessionTimes('morning') || '', /最多 10 个/)
+
+  scheduleSettings.afternoon.timeMode = 'manual'
+  scheduleSettings.afternoon.manualTimes = Array.from({ length: 8 }, (_, i) => `13:${String(i * 5).padStart(2, '0')}`)
+  assert.equal(validateSessionTimes('afternoon'), null)
+  scheduleSettings.afternoon.manualTimes.push('14:30')
+  assert.match(validateSessionTimes('afternoon') || '', /最多 8 个/)
 })
 
 test('getSessionRunTimes 两种模式分别返回模板/手动时间', () => {

@@ -53,12 +53,18 @@ export const RUN_COUNT_OPTIONS = [1, 2, 3, 4] as const
 
 export type SessionTimeMode = 'auto' | 'manual'
 
-// 手动模式的次数上限（自动模式为 1-4；手动通过增删时间条目调整次数）
-export const MAX_MANUAL_TIMES = 8
+// 手动模式的次数上限（自动模式为 1-4；手动通过增删时间条目调整次数）。
+// 上午放宽到 10：窗口自 09:15 起（含集合竞价）更长；下午维持 8。
+export const MAX_MANUAL_TIMES_BY_SESSION: Record<SessionKey, number> = {
+  morning: 10,
+  afternoon: 8,
+}
 
-// 交易时段窗口（手动时间必须落在窗口内，否则交易运行会被交易时段门禁拦截）
+// 交易时段窗口（手动时间必须落在窗口内，否则交易运行会被交易时段门禁拦截）。
+// 上午起点 09:15：集合竞价（09:15-09:25）与开盘前间歇均可挂单，
+// 与后端 _MARKET_SESSIONS 保持一致。
 export const SESSION_WINDOWS: Record<SessionKey, { start: { hour: number; minute: number }; end: { hour: number; minute: number }; label: string }> = {
-  morning: { start: { hour: 9, minute: 30 }, end: { hour: 11, minute: 30 }, label: '09:30 - 11:30' },
+  morning: { start: { hour: 9, minute: 15 }, end: { hour: 11, minute: 30 }, label: '09:15 - 11:30' },
   afternoon: { start: { hour: 13, minute: 0 }, end: { hour: 15, minute: 0 }, label: '13:00 - 15:00' },
 }
 
@@ -392,7 +398,7 @@ export function useScheduleForm() {
 
   function addSessionManualTime(section: SessionKey) {
     const times = scheduleSettings[section].manualTimes
-    if (times.length >= MAX_MANUAL_TIMES) {
+    if (times.length >= MAX_MANUAL_TIMES_BY_SESSION[section]) {
       return
     }
     // 新条目默认取窗口中点（或最后一条 +30 分钟，超窗回落到窗口中点）
@@ -428,8 +434,8 @@ export function useScheduleForm() {
     if (current.manualTimes.length === 0) {
       return '请至少添加一个运行时间。'
     }
-    if (current.manualTimes.length > MAX_MANUAL_TIMES) {
-      return `运行时间最多 ${MAX_MANUAL_TIMES} 个。`
+    if (current.manualTimes.length > MAX_MANUAL_TIMES_BY_SESSION[section]) {
+      return `运行时间最多 ${MAX_MANUAL_TIMES_BY_SESSION[section]} 个。`
     }
     const window = SESSION_WINDOWS[section]
     const seen = new Set<string>()
@@ -457,7 +463,7 @@ export function useScheduleForm() {
     fixedTaskTimeOptions: FIXED_TASK_TIME_OPTIONS,
     runCountOptions: RUN_COUNT_OPTIONS,
     sessionWindows: SESSION_WINDOWS,
-    maxManualTimes: MAX_MANUAL_TIMES,
+    maxManualTimesBySession: MAX_MANUAL_TIMES_BY_SESSION,
     syncFromSchedules,
     buildPayload,
     setFixedTaskTime,

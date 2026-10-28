@@ -344,7 +344,7 @@
                     <div class="run-main">
                       <div class="run-meta">
                         <h4 class="run-name">上午运行</h4>
-                        <p class="run-time">09:30 - 11:30</p>
+                        <p class="run-time">09:15 - 11:30</p>
                       </div>
                       <div class="run-control">
                         <div class="choice-chip-group run-mode-group">
@@ -415,7 +415,7 @@
                         <button
                           type="button"
                           class="button ghost small manual-time-add"
-                          :disabled="getSessionManualTimes('morning').length >= maxManualTimes"
+                          :disabled="getSessionManualTimes('morning').length >= maxManualTimesBySession['morning']"
                           @click="addSessionManualTime('morning')"
                         >
                           + 添加时间
@@ -508,7 +508,7 @@
                         <button
                           type="button"
                           class="button ghost small manual-time-add"
-                          :disabled="getSessionManualTimes('afternoon').length >= maxManualTimes"
+                          :disabled="getSessionManualTimes('afternoon').length >= maxManualTimesBySession['afternoon']"
                           @click="addSessionManualTime('afternoon')"
                         >
                           + 添加时间
@@ -551,7 +551,7 @@ const {
   scheduleSettings,
   fixedTaskTimeOptions,
   runCountOptions,
-  maxManualTimes,
+  maxManualTimesBySession,
   syncFromSchedules,
   buildPayload,
   setFixedTaskTime,
