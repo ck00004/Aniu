@@ -144,7 +144,14 @@ def _order_terminal_status(row: dict[str, Any]) -> str:
         row, "dealCount", "tradeCount", "filledCount", "filledQty"
     )
     status = _row_str(row, "orderStatus", "status", "dbStatus") or "0"
-    if dealt > 0 and dealt >= ordered:
+    # P0-4（第四轮复审）：委托数量缺失时不得判定成交——
+    # ordered=0 时 dealt>=ordered 恒真，会把缺数量的委托误判为 filled。
+    if ordered <= 0:
+        return "unknown"
+    if dealt < 0 or dealt > ordered:
+        # 成交数量异常（超过委托量）：不可判定
+        return "unknown"
+    if dealt == ordered:
         return "filled"
     if dealt > 0:
         return "partially_filled"
@@ -532,7 +539,16 @@ class TradeIntentService:
                     resolved.append(intent)
                     continue
 
-                # unknown：可见性等待
+                # unknown：可见性等待 + 完整订单视图证据（P0-3 第四轮复审）
+                # 活动委托列表查不到不能证明未提交——订单可能已成交离开
+                # 列表。只有当本次委托列表包含已终局委托（canceled/filled
+                # 状态的历史痕迹）时，才说明接口返回当日全量委托视图，
+                # "无痕迹"才可作为未提交证据；否则保持阻塞等待人工核验。
+                list_shows_history = any(
+                    _order_terminal_status(row)
+                    in ("canceled", "filled", "partially_filled")
+                    for row in rows
+                )
                 checks = int(intent.unknown_checks or 0) + 1
                 first_at = intent.first_unknown_at
                 if first_at is None:
@@ -542,20 +558,29 @@ class TradeIntentService:
                     first_at = first_at.replace(tzinfo=timezone.utc)
                 intent.unknown_checks = checks
                 waited = (now - first_at).total_seconds() >= UNKNOWN_WAIT_SECONDS
-                if checks >= UNKNOWN_MIN_CHECKS and waited:
+                if (
+                    checks >= UNKNOWN_MIN_CHECKS
+                    and waited
+                    and list_shows_history
+                ):
                     intent.status = "failed"
                     intent.note = (
                         f"连续 {checks} 次独立核验且超过等待期，委托列表"
-                        "均无该标的委托痕迹，判定未提交"
+                        "（含历史委托视图）均无该标的委托痕迹，判定未提交"
                     )
                     intent.unknown_checks = 0
                     intent.first_unknown_at = None
                 else:
-                    intent.note = (
-                        f"委托列表暂无痕迹（第 {checks} 次核验，"
-                        f"需 ≥{UNKNOWN_MIN_CHECKS} 次且超过 "
-                        f"{UNKNOWN_WAIT_SECONDS}s 等待期才可判定未提交）"
+                    reason = (
+                        f"委托列表暂无痕迹（第 {checks} 次核验，需 ≥"
+                        f"{UNKNOWN_MIN_CHECKS} 次且超过 {UNKNOWN_WAIT_SECONDS}s"
                     )
+                    if not list_shows_history:
+                        reason += (
+                            "，且需委托列表包含历史委托视图以证明查询完整"
+                        )
+                    reason += "）"
+                    intent.note = reason
                 intent.updated_at = now
                 db.add(intent)
                 resolved.append(intent)
@@ -613,9 +638,18 @@ class TradeIntentService:
                     if terminal == "canceled":
                         intent.status = "verified"
                         intent.note = f"原委托 {order_id} 已撤销，撤单确认生效"
-                    elif terminal in ("filled", "partially_filled"):
+                    elif terminal == "filled":
                         intent.status = "filled"
-                        intent.note = f"原委托 {order_id} 已成交，撤单未生效"
+                        intent.note = f"原委托 {order_id} 已全部成交，撤单未生效"
+                    elif terminal == "partially_filled":
+                        # P1（第四轮复审）：部分成交 ≠ 全部成交——剩余委托
+                        # 仍在途，撤单仍在处理中（CANCEL_PENDING），绝不能
+                        # 归为 filled（否则剩余部分被永久锁死无法再撤）。
+                        intent.status = "submitted"
+                        intent.note = (
+                            f"原委托 {order_id} 部分成交、剩余仍在途，"
+                            "撤单处理中（CANCEL_PENDING）"
+                        )
                     elif terminal == "submitted":
                         intent.status = "submitted"
                         intent.note = f"原委托 {order_id} 仍待撤，撤单处理中"

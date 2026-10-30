@@ -451,12 +451,30 @@ def test_unknown_intent_visibility_wait_before_failed(
         assert resolved[0].status == "unknown"
         assert resolved[0].unknown_checks >= 2
 
-        # 等待期已过 + 次数达标 → 判定未提交（failed，解除阻塞）
+        # 等待期已过 + 次数达标，但委托列表无历史委托视图（只有空列表，
+        # 不能证明查询覆盖当日全量委托）→ 仍保持 UNKNOWN 阻塞
         _backdate_intent(
             intent.id,
             first_unknown_at=datetime.now(timezone.utc)
             - timedelta(seconds=UNKNOWN_WAIT_SECONDS + 10),
         )
+        resolved = trade_intent_service.reconcile_unknown_intents(
+            client, symbol="600519"
+        )
+        assert resolved[0].status == "unknown"
+
+        # 委托列表包含历史委托（已成交的其他标的）→ 证明是当日全量视图，
+        # 此时"无痕迹"才构成未提交的充分证据 → failed 解除阻塞
+        client.orders = [
+            {
+                "stockCode": "000001",
+                "orderDrt": "1",
+                "orderStatus": "3",
+                "orderCount": 100,
+                "dealCount": 100,
+                "orderID": "ORD-HIST",
+            }
+        ]
         resolved = trade_intent_service.reconcile_unknown_intents(
             client, symbol="600519"
         )
@@ -1438,5 +1456,273 @@ def test_action_id_backfill_matches_symbol_and_side(monkeypatch, tmp_path) -> No
         )
         assert _list_intents(symbol="000001")[0].action_id == 102
         assert _list_intents(symbol="600519")[0].action_id == 101
+    finally:
+        _reset_db_state()
+
+
+# ---------------------------------------------------------------------------
+# 第四轮复审专项
+# ---------------------------------------------------------------------------
+
+
+def test_unparseable_orders_blocks_buy_preflight() -> None:
+    """清单 #1：get_orders 返回无法识别结构 → BUY 被阻断（Fail-Closed）。"""
+    from skills.mx_core.execution import preflight_trade
+
+    class _BadOrdersClient:
+        def get_orders(self) -> dict:
+            return {"unexpected": "shape"}
+
+        def get_balance(self) -> dict:
+            return {"data": {"availBalance": 10_000_000.0}}
+
+    with pytest.raises(RuntimeError, match="无法解析委托列表"):
+        preflight_trade(
+            client=_BadOrdersClient(),
+            action="BUY",
+            symbol="600519",
+            quantity=100,
+            price_type="LIMIT",
+            price=20.0,
+        )
+
+
+def test_unparseable_positions_blocks_sell_preflight() -> None:
+    """持仓列表无法识别 → SELL 被阻断。"""
+    from skills.mx_core.execution import preflight_trade
+
+    class _BadPositionsClient:
+        def get_positions(self) -> dict:
+            return {"weird": 1}
+
+        def get_orders(self) -> dict:
+            return {"data": {"orders": []}}
+
+    with pytest.raises(RuntimeError, match="无法解析持仓列表"):
+        preflight_trade(
+            client=_BadPositionsClient(),
+            action="SELL",
+            symbol="600519",
+            quantity=100,
+            price_type="MARKET",
+            price=None,
+        )
+
+
+def test_unknown_status_pending_buy_blocks_new_buy() -> None:
+    """清单 #2：同标的在途订单用未知状态码 → 不允许重复买入。"""
+    from skills.mx_core.execution import preflight_trade
+
+    class _UnknownStatusClient:
+        def get_orders(self) -> dict:
+            return {
+                "data": {
+                    "orders": [
+                        {
+                            "stockCode": "600519",
+                            "orderDrt": "1",
+                            "orderStatus": "77",  # 未知状态
+                            "orderCount": 100,
+                            "dealCount": 0,
+                        }
+                    ]
+                }
+            }
+
+        def get_balance(self) -> dict:
+            return {"data": {"availBalance": 10_000_000.0}}
+
+    # 未知状态 + 已知剩余 > 0：在途买单路径（pending 判定不含 77）
+    # → 走未知状态保守阻塞
+    with pytest.raises(RuntimeError, match="无法识别状态"):
+        preflight_trade(
+            client=_UnknownStatusClient(),
+            action="BUY",
+            symbol="600519",
+            quantity=100,
+            price_type="LIMIT",
+            price=20.0,
+        )
+
+
+def test_missing_order_quantity_with_deals_is_unknown() -> None:
+    """清单 #3：委托数量缺失但成交数量>0 → UNKNOWN（不误判 filled）。"""
+    from app.services.trade_intent_service import _order_terminal_status
+
+    row = {"orderID": "ORD-100", "orderStatus": "1", "dealCount": 100}
+    assert _order_terminal_status(row) == "unknown"
+
+
+def test_dealt_exceeds_ordered_is_unknown() -> None:
+    """成交数量超过委托数量（数据异常）→ UNKNOWN。"""
+    from app.services.trade_intent_service import _order_terminal_status
+
+    row = {
+        "orderID": "ORD-X",
+        "orderStatus": "1",
+        "orderCount": 100,
+        "dealCount": 200,
+    }
+    assert _order_terminal_status(row) == "unknown"
+
+
+def test_intent_id_precise_association(monkeypatch, tmp_path) -> None:
+    """清单 #6：同股票两笔同方向不同数量的交易 → action_id 一对一关联。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        today = datetime.now(SHANGHAI_TZ).date().isoformat()
+        with session_scope() as db:
+            db.add_all(
+                [
+                    TradeIntent(
+                        signal_date=today,
+                        symbol="600519",
+                        side="BUY",
+                        tranche_id=1,
+                        intent_key=f"{today}:600519:BUY:1",
+                        run_id=1,
+                        quantity=100,
+                        status="submitted",
+                    ),
+                    TradeIntent(
+                        signal_date=today,
+                        symbol="600519",
+                        side="BUY",
+                        tranche_id=2,
+                        intent_key=f"{today}:600519:BUY:2",
+                        run_id=1,
+                        quantity=200,
+                        status="submitted",
+                    ),
+                ]
+            )
+            db.flush()
+            ids = [
+                row.id
+                for row in db.scalars(
+                    select(TradeIntent).order_by(TradeIntent.id)
+                ).all()
+            ]
+
+        # 第一笔（intent_id=ids[0]）成功执行 action 201
+        execution_runner_service._backfill_intent_action_id(
+            run_id=1,
+            action_id=201,
+            executed_action={
+                "action": "BUY",
+                "symbol": "600519",
+                "quantity": 100,
+                "intent_id": ids[0],
+            },
+        )
+        # 只有 ids[0] 被关联；ids[1]（同标的同方向不同数量）不受影响
+        assert _list_intents(id=ids[0])[0].action_id == 201
+        assert _list_intents(id=ids[1])[0].action_id is None
+
+        # 第二笔（intent_id=ids[1]）成功执行 action 202
+        execution_runner_service._backfill_intent_action_id(
+            run_id=1,
+            action_id=202,
+            executed_action={
+                "action": "BUY",
+                "symbol": "600519",
+                "quantity": 200,
+                "intent_id": ids[1],
+            },
+        )
+        assert _list_intents(id=ids[0])[0].action_id == 201
+        assert _list_intents(id=ids[1])[0].action_id == 202
+    finally:
+        _reset_db_state()
+
+
+def test_cancel_partial_fill_keeps_cancel_pending(monkeypatch, tmp_path) -> None:
+    """清单 #7：原委托部分成交仍有剩余 → CANCEL_PENDING（不锁死剩余撤单）。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        client = _IntentClient(
+            orders=[
+                {
+                    "stockCode": "600519",
+                    "orderDrt": "1",
+                    "orderStatus": "1",
+                    "orderCount": 1000,
+                    "dealCount": 400,  # 部分成交，剩余 600 在途
+                    "orderID": "ORD-PF",
+                }
+            ]
+        )
+        intent = trade_intent_service.check_and_register_cancel_intent(
+            order_id="ORD-PF"
+        )
+        trade_intent_service.mark_intent_submitted(intent.id, "ORD-PF")
+
+        resolved = trade_intent_service.reconcile_cancel_intents(client)
+        # 部分成交 → 撤单处理中（submitted/CANCEL_PENDING），不是 filled
+        assert resolved[0].status == "submitted"
+        assert "部分成交" in str(resolved[0].note or "")
+    finally:
+        _reset_db_state()
+
+
+def test_http_408_is_unknown_not_rejected() -> None:
+    """清单 #8：HTTP 408（超时）→ 状态不明，不自动认定业务拒绝。"""
+    import httpx
+
+    from skills.mx_core.client import MXResponseUnknown
+
+    request = httpx.Request("POST", "https://x/trade")
+    response = httpx.Response(408, request=request, text="timeout")
+    with pytest.raises(MXResponseUnknown, match="408"):
+        try:
+            raise httpx.HTTPStatusError(
+                "timeout", request=request, response=response
+            )
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code
+            if status_code in (408, 425, 429):
+                raise MXResponseUnknown(
+                    f"妙想接口 HTTP {status_code}（超时/限流），处理结果未知"
+                ) from exc
+            raise RuntimeError("不应到达") from exc
+
+
+def test_unknown_never_fails_without_history_view(monkeypatch, tmp_path) -> None:
+    """清单 #10：远端历史订单查询不可用（列表无历史委托）→ UNKNOWN 保持阻塞。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        # 委托列表只有活动委托（无历史视图）
+        client = _IntentClient(
+            orders=[
+                {
+                    "stockCode": "000001",
+                    "orderDrt": "1",
+                    "orderStatus": "1",
+                    "orderCount": 100,
+                    "dealCount": 0,
+                    "orderID": "ORD-ACTIVE",
+                }
+            ]
+        )
+        intent = trade_intent_service.check_and_register_trade_intent(
+            client=client, symbol="600519", side="BUY", quantity=100
+        )
+        _backdate_intent(
+            intent.id,
+            status="unknown",
+            unknown_checks=99,
+            first_unknown_at=datetime.now(timezone.utc)
+            - timedelta(seconds=UNKNOWN_WAIT_SECONDS + 100),
+        )
+
+        resolved = trade_intent_service.reconcile_unknown_intents(
+            client, symbol="600519"
+        )
+        # 无历史委托视图：即使次数和等待都满足，也保持 UNKNOWN
+        assert resolved[0].status == "unknown"
+        assert "历史委托视图" in str(resolved[0].note or "")
     finally:
         _reset_db_state()

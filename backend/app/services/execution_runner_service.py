@@ -263,6 +263,23 @@ class ExecutionRunnerService:
             or ""
         ).strip()
 
+        # P1（第四轮复审）：优先按 intent_id 精确关联（一对一）；
+        # 仅当执行记录未携带 intent_id 时才退回 标的+方向 匹配。
+        intent_id = executed_action.get("intent_id")
+        if isinstance(intent_id, int) and intent_id > 0:
+            with session_scope() as db:
+                db.execute(
+                    sa_update(TradeIntent)
+                    .where(
+                        and_(
+                            TradeIntent.id == intent_id,
+                            TradeIntent.action_id.is_(None),
+                        )
+                    )
+                    .values(action_id=action_id)
+                )
+            return
+
         with session_scope() as db:
             if action_name == "CANCEL":
                 # 撤单意图：按 run_id + 委托单号（symbol 字段存单号）匹配

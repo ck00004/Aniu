@@ -75,6 +75,13 @@ class MXClient:
                 response.raise_for_status()
             except httpx.HTTPStatusError as exc:
                 status_code = exc.response.status_code
+                # 408/425/429 是超时/过早关闭/限流：请求可能已送达并
+                # 被处理，不能按业务拒绝放行重试（第四轮复审）。
+                if status_code in (408, 425, 429):
+                    raise MXResponseUnknown(
+                        f"妙想接口 HTTP {status_code}（超时/限流），处理结果"
+                        f"未知: {exc.response.text[:200]}"
+                    ) from exc
                 if 400 <= status_code < 500:
                     # 4xx：远端明确拒绝该请求（可认定未生效）
                     raise MXBusinessRejected(

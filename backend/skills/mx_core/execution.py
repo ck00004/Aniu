@@ -49,26 +49,73 @@ def _normalize_symbol(value: Any) -> str:
     return str(value or "").strip().split(".")[0].strip()
 
 
+# 委托/持仓列表解析结果四态（第四轮复审 P0：原实现结构无法识别时
+# 静默返回空列表 = Fail-Open，异常响应会被当作"无在途委托"放行交易）。
+_ROWS_VALID_EMPTY = "VALID_EMPTY"
+_ROWS_VALID_DATA = "VALID_DATA"
+_ROWS_INVALID = "INVALID"
+_ROWS_ERROR = "ERROR"
+
+
 def _payload_rows(payload: Any) -> list[dict[str, Any]]:
-    source = payload.get("data") if isinstance(payload, dict) else None
+    """兼容旧调用：返回行列表（INVALID/ERROR 时返回空列表）。"""
+    rows, _state = _payload_rows_with_state(payload)
+    return rows
+
+
+def _payload_rows_with_state(payload: Any) -> tuple[list[dict[str, Any]], str]:
+    """解析列表载荷 → (行, 状态)。
+
+    状态四态：
+    - VALID_DATA：结构可识别，含有效行。
+    - VALID_EMPTY：结构可识别，确实为空（成功查询无数据）。
+    - INVALID：结构无法识别（既不是已知列表键，也不是列表）——
+      调用方必须拒绝依赖该数据的写操作。
+    - ERROR：载荷不是 dict（接口调用层异常的兜底形态）。
+    """
+    if not isinstance(payload, dict):
+        return [], _ROWS_ERROR
+    source = payload.get("data") if isinstance(payload.get("data"), (dict, list)) else payload
     if isinstance(source, dict):
-        rows = (
-            source.get("rows")
-            or source.get("list")
-            or source.get("data")
-            or source.get("orderList")
-            or source.get("orders")
+        rows = None
+        for key in (
+            "rows",
+            "list",
+            "data",
+            "orderList",
+            "orders",
             # 持仓接口的真实列表键是 posList（生产 2026-10-19 排查确认：
             # 漏掉该键导致卖出预检全部误判"未找到持仓"，当日零成交）
-            or source.get("posList")
-            or source.get("positionList")
-            or []
-        )
+            "posList",
+            "positionList",
+        ):
+            value = source.get(key)
+            if isinstance(value, list):
+                rows = value
+                break
+        if rows is None:
+            return [], _ROWS_INVALID
     elif isinstance(source, list):
         rows = source
     else:
-        rows = []
-    return [row for row in rows if isinstance(row, dict)]
+        return [], _ROWS_INVALID
+    parsed = [row for row in rows if isinstance(row, dict)]
+    state = _ROWS_VALID_DATA if parsed else _ROWS_VALID_EMPTY
+    return parsed, state
+
+
+def _require_parseable_rows(payload: Any, *, what: str) -> list[dict[str, Any]]:
+    """写操作预检用的列表解析：INVALID/ERROR 一律拒绝。
+
+    无法证明"没有在途委托"时，必须按存在处理（Fail-Closed）。
+    """
+    rows, state = _payload_rows_with_state(payload)
+    if state in (_ROWS_INVALID, _ROWS_ERROR):
+        raise RuntimeError(
+            f"无法解析{what}响应（结构不可识别），为防止重复委托"
+            "已阻断本次交易；请稍后重试或核对妙想接口状态。"
+        )
+    return rows
 
 
 def _row_int(row: dict[str, Any], *keys: str) -> int:
@@ -141,8 +188,12 @@ def preflight_trade(
     normalized_symbol = _normalize_symbol(symbol)
 
     if action.upper() == "BUY":
-        pending_buy = None
-        for row in _payload_rows(client.get_orders()):
+        # P0-1（第四轮复审）：委托列表解析必须 Fail-Closed——结构无法
+        # 识别时按"存在未知在途委托"处理，禁止放行。
+        buy_rows = _require_parseable_rows(
+            client.get_orders(), what="委托列表"
+        )
+        for row in buy_rows:
             if _normalize_symbol(
                 _row_str(row, "stockCode", "code", "SECURITY_CODE", "secCode")
             ) != normalized_symbol:
@@ -150,19 +201,25 @@ def preflight_trade(
             if _is_sell_side(row):
                 continue
             status = _order_status(row)
-            remaining = max(
-                _row_int(row, "orderCount", "count", "quantity", "orderQty")
-                - _row_int(row, "dealCount", "tradeCount", "filledCount", "filledQty"),
-                0,
+            ordered = _row_int(row, "orderCount", "count", "quantity", "orderQty")
+            dealt = _row_int(
+                row, "dealCount", "tradeCount", "filledCount", "filledQty"
             )
+            remaining = max(ordered - dealt, 0)
             if status in _PENDING_ORDER_STATUSES and remaining > 0:
-                pending_buy = row
-                break
-        if pending_buy is not None:
-            raise RuntimeError(
-                f"{symbol} 已存在未完成买入委托（在途买入），禁止重复提交同方向"
-                "委托；如需调整仓位请先撤单或等待该委托成交后再评估"
-            )
+                raise RuntimeError(
+                    f"{symbol} 已存在未完成买入委托（在途买入），禁止重复提交"
+                    "同方向委托；如需调整仓位请先撤单或等待该委托成交后再评估"
+                )
+            # P0-2（第四轮复审）：未知状态码 + 剩余数量不明/大于零 →
+            # 保守阻塞：不能因状态不认识就当作非在途订单放行。
+            if status not in _PENDING_ORDER_STATUSES and status != "0":
+                if ordered <= 0 or remaining > 0:
+                    raise RuntimeError(
+                        f"{symbol} 存在无法识别状态的买入委托（状态码 {status}，"
+                        f"剩余 {remaining} 股），为防止重复委托已阻断本次买入；"
+                        "请先调用 mx_get_orders 核对该委托状态。"
+                    )
         if price_type.upper() == "LIMIT" and price is not None:
             balance_payload = client.get_balance()
             balance = (
@@ -190,11 +247,12 @@ def preflight_trade(
         return
 
     # SELL：可卖 = 持仓 - 在途卖出委托占用
+    # P0-1（第四轮复审）：持仓/委托列表解析必须 Fail-Closed。
     positions_payload = client.get_positions()
     position_row = next(
         (
             row
-            for row in _payload_rows(positions_payload)
+            for row in _require_parseable_rows(positions_payload, what="持仓列表")
             if _normalize_symbol(
                 _row_str(row, "stockCode", "code", "SECURITY_CODE", "secCode")
             )
@@ -217,7 +275,7 @@ def preflight_trade(
     held = _row_int(position_row, "count", "quantity", "orderQty", "volume")
     orders_payload = client.get_orders()
     occupied = 0
-    for row in _payload_rows(orders_payload):
+    for row in _require_parseable_rows(orders_payload, what="委托列表"):
         if not _is_sell_side(row):
             continue
         if _normalize_symbol(
@@ -237,6 +295,15 @@ def preflight_trade(
                 f"无法确认 {symbol} 可卖数量；请求卖出 {quantity} 股，"
                 "请先确认未完成卖出委托"
             )
+        elif status not in _PENDING_ORDER_STATUSES and status != "0":
+            # P0-2：未知状态码的卖单，剩余不明时保守阻塞
+            ordered = _row_int(row, "orderCount", "count", "quantity", "orderQty")
+            if ordered <= 0 or remaining > 0:
+                raise RuntimeError(
+                    f"{symbol} 存在无法识别状态的卖出委托（状态码 {status}），"
+                    "为防止重复卖出已阻断本次交易；请先调用 mx_get_orders "
+                    "核对该委托状态。"
+                )
     available = max(held - occupied, 0)
     if quantity > available:
         raise RuntimeError(
@@ -907,6 +974,9 @@ class MXExecutionService:
                 "price_type": price_type,
                 "price": price,
                 "reason": reason,
+                # P1（第四轮复审）：意图 id 贯通到执行记录，回填 action_id
+                # 按 intent_id 精确关联，不再按标的+方向反查。
+                "intent_id": intent.id,
             },
         }
 
@@ -1004,6 +1074,7 @@ class MXExecutionService:
                 "order_id": order_id,
                 "stock_code": stock_code,
                 "reason": reason,
+                "intent_id": intent.id,
             },
         }
 

@@ -453,8 +453,10 @@ class _FakeMXClient:
         orders: dict | None = None,
     ) -> None:
         self._balance = balance or {}
-        self._positions = positions or {}
-        self._orders = orders or {}
+        # 空 dict 会被 Fail-Closed 解析判为 INVALID（第四轮复审 P0）；
+        # 未提供时默认给可识别的空列表结构。
+        self._positions = positions if positions is not None else {"data": {"posList": []}}
+        self._orders = orders if orders is not None else {"data": {"orders": []}}
 
     def get_balance(self) -> dict:
         return self._balance
