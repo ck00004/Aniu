@@ -866,7 +866,9 @@ def test_partially_filled_then_cancelled_is_terminal(monkeypatch, tmp_path) -> N
         )
         trade_intent_service.mark_intent_submitted(intent.id, "ORD-P")
 
-        # 部分成交 40 股，剩余撤销（非 pending 状态）
+        # 部分成交 40 股，剩余 60 股撤销成功（状态码 3 = 已撤终态）
+        # → canceled_partial 终态（第七轮复审 P0-2：终态优先于部分成交，
+        # 不再被当作"剩余仍在途"的 partially_filled）
         client.orders = [
             {
                 "stockCode": "600519",
@@ -880,9 +882,10 @@ def test_partially_filled_then_cancelled_is_terminal(monkeypatch, tmp_path) -> N
         resolved = trade_intent_service.reconcile_open_trade_intents(
             client, symbol="600519"
         )
-        assert resolved[0].status == "partially_filled"
+        assert resolved[0].status == "canceled_partial"
 
-        # 剩余全部撤销且无成交 → canceled 终态
+        # 剩余全部撤销且无成交 → canceled 终态（重新置为开放状态后核验）
+        _backdate_intent(intent.id, status="submitted")
         client.orders = [
             {
                 "stockCode": "600519",
@@ -2247,3 +2250,320 @@ def test_action_id_rejects_cross_run_intent(monkeypatch, tmp_path) -> None:
         assert _list_intents(id=1)[0].action_id is None
     finally:
         _reset_db_state()
+
+
+# ---------------------------------------------------------------------------
+# 第七轮复审专项
+# ---------------------------------------------------------------------------
+
+
+def test_canceled_buy_order_not_blocking() -> None:
+    """清单 #1：已撤销买单（未成交）→ 不再视为在途买单。"""
+    from skills.mx_core.execution import preflight_trade
+
+    class _CanceledBuyClient:
+        def get_orders(self) -> dict:
+            return {
+                "data": {
+                    "orders": [
+                        {
+                            "stockCode": "600519",
+                            "orderDrt": "1",
+                            "orderStatus": "3",  # 已撤销
+                            "orderCount": 100,
+                            "dealCount": 0,
+                            "orderID": "ORD-CX",
+                        }
+                    ]
+                }
+            }
+
+        def get_balance(self) -> dict:
+            return {"data": {"availBalance": 10_000_000.0}}
+
+    # 已撤销订单不阻塞新买入
+    preflight_trade(
+        client=_CanceledBuyClient(),
+        action="BUY",
+        symbol="600519",
+        quantity=100,
+        price_type="LIMIT",
+        price=20.0,
+    )
+
+
+def test_canceled_sell_order_not_occupying() -> None:
+    """清单 #2：已撤销卖单（未成交）→ 不占用可卖数量。"""
+    from skills.mx_core.execution import preflight_trade
+
+    class _CanceledSellClient:
+        def get_positions(self) -> dict:
+            return {
+                "data": {"posList": [{"stockCode": "600519", "count": 1000}]}
+            }
+
+        def get_orders(self) -> dict:
+            return {
+                "data": {
+                    "orders": [
+                        {
+                            "stockCode": "600519",
+                            "orderDrt": "2",
+                            "orderStatus": "3",
+                            "orderCount": 500,
+                            "dealCount": 0,
+                            "orderID": "ORD-CXS",
+                        }
+                    ]
+                }
+            }
+
+    # 已撤销卖单不占用：1000 - 0 = 1000 可卖
+    preflight_trade(
+        client=_CanceledSellClient(),
+        action="SELL",
+        symbol="600519",
+        quantity=800,
+        price_type="MARKET",
+        price=None,
+    )
+
+
+def test_canceled_partial_is_terminal() -> None:
+    """清单 #3：部分成交 400 股、剩余 600 股已撤销 → canceled_partial。"""
+    from skills.mx_core.order_schema import order_terminal_status
+
+    row = {
+        "stockCode": "600519",
+        "orderDrt": "1",
+        "orderStatus": "3",
+        "orderCount": 1000,
+        "dealCount": 400,
+    }
+    assert order_terminal_status(row) == "canceled_partial"
+
+
+def test_cancel_after_partial_fill_verified(monkeypatch, tmp_path) -> None:
+    """清单 #4：部分成交后撤单成功 → 撤单意图 VERIFIED（不卡 CANCEL_PENDING）。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        client = _IntentClient(
+            orders=[
+                {
+                    "stockCode": "600519",
+                    "orderDrt": "1",
+                    "orderStatus": "3",  # 撤销成功
+                    "orderCount": 1000,
+                    "dealCount": 400,  # 部分成交
+                    "orderID": "ORD-CP",
+                }
+            ]
+        )
+        intent = trade_intent_service.check_and_register_cancel_intent(
+            order_id="ORD-CP"
+        )
+        trade_intent_service.mark_intent_submitted(intent.id, "ORD-CP")
+
+        resolved = trade_intent_service.reconcile_cancel_intents(client)
+        assert resolved[0].status == "verified"
+        assert "部分成交后剩余已撤销" in str(resolved[0].note or "")
+    finally:
+        _reset_db_state()
+
+
+def test_cancel_pending_when_remainder_still_active(monkeypatch, tmp_path) -> None:
+    """清单 #5：部分成交后剩余仍在途（待处理状态）→ CANCEL_PENDING。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        client = _IntentClient(
+            orders=[
+                {
+                    "stockCode": "600519",
+                    "orderDrt": "1",
+                    "orderStatus": "1",  # 仍在途
+                    "orderCount": 1000,
+                    "dealCount": 400,
+                    "orderID": "ORD-CP2",
+                }
+            ]
+        )
+        intent = trade_intent_service.check_and_register_cancel_intent(
+            order_id="ORD-CP2"
+        )
+        trade_intent_service.mark_intent_submitted(intent.id, "ORD-CP2")
+
+        resolved = trade_intent_service.reconcile_cancel_intents(client)
+        assert resolved[0].status == "cancel_pending"
+    finally:
+        _reset_db_state()
+
+
+def test_avail_count_zero_rejects_sell() -> None:
+    """清单 #6：可卖数量显式为 0（T+1 当日买入）→ 拒绝任何正数量卖出。"""
+    from skills.mx_core.execution import preflight_trade
+
+    class _T1Client:
+        def get_positions(self) -> dict:
+            return {
+                "data": {
+                    "posList": [
+                        {"stockCode": "600519", "count": 1000, "availCount": 0}
+                    ]
+                }
+            }
+
+        def get_orders(self) -> dict:
+            return {"data": {"orders": []}}
+
+    with pytest.raises(RuntimeError, match="可卖数量 0"):
+        preflight_trade(
+            client=_T1Client(),
+            action="SELL",
+            symbol="600519",
+            quantity=500,
+            price_type="MARKET",
+            price=None,
+        )
+
+
+def test_avail_count_missing_falls_back() -> None:
+    """清单 #7：可卖字段缺失 → 走持仓-在途推算（无在途卖单时放行）。"""
+    from skills.mx_core.execution import preflight_trade
+
+    class _NoAvailClient:
+        def get_positions(self) -> dict:
+            return {
+                "data": {"posList": [{"stockCode": "600519", "count": 1000}]}
+            }
+
+        def get_orders(self) -> dict:
+            return {"data": {"orders": []}}
+
+    preflight_trade(
+        client=_NoAvailClient(),
+        action="SELL",
+        symbol="600519",
+        quantity=500,
+        price_type="MARKET",
+        price=None,
+    )
+
+
+def test_avail_count_invalid_format_rejects_sell() -> None:
+    """清单 #8：可卖字段格式异常 → 拒绝卖出（不当作缺失）。"""
+    from skills.mx_core.execution import preflight_trade
+
+    class _BadAvailClient:
+        def get_positions(self) -> dict:
+            return {
+                "data": {
+                    "posList": [
+                        {"stockCode": "600519", "count": 1000, "availCount": "abc"}
+                    ]
+                }
+            }
+
+        def get_orders(self) -> dict:
+            return {"data": {"orders": []}}
+
+    with pytest.raises(RuntimeError, match="可卖数量字段格式异常"):
+        preflight_trade(
+            client=_BadAvailClient(),
+            action="SELL",
+            symbol="600519",
+            quantity=100,
+            price_type="MARKET",
+            price=None,
+        )
+
+
+def test_submitted_without_order_id_becomes_untracked(monkeypatch, tmp_path) -> None:
+    """清单 #9：提交成功但无订单号 → SUBMITTED_UNTRACKED，等待人工绑定。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        client = _IntentClient()
+        intent = trade_intent_service.check_and_register_trade_intent(
+            client=client, symbol="600519", side="BUY", quantity=100
+        )
+        trade_intent_service.mark_intent_submitted(intent.id, None)
+
+        stored = _list_intents(id=intent.id)[0]
+        assert stored.status == "submitted_untracked"
+        assert "人工核验" in str(stored.note or "")
+        # 阻塞同向新委托
+        with pytest.raises(RuntimeError, match="未完成/未确认"):
+            trade_intent_service.check_and_register_trade_intent(
+                client=client, symbol="600519", side="BUY", quantity=100
+            )
+
+        # 人工绑定单号后 → submitted，恢复精确匹配同步
+        bound = trade_intent_service.bind_provider_order_id(
+            intent.id, "ORD-MANUAL"
+        )
+        assert bound.status == "submitted"
+        assert bound.provider_order_id == "ORD-MANUAL"
+    finally:
+        _reset_db_state()
+
+
+def test_bind_order_rejects_wrong_status(monkeypatch, tmp_path) -> None:
+    """绑定单号只允许 submitted_untracked/unknown 状态。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        client = _IntentClient()
+        intent = trade_intent_service.check_and_register_trade_intent(
+            client=client, symbol="600519", side="BUY", quantity=100
+        )
+        trade_intent_service.mark_intent_submitted(intent.id, "ORD-1")
+        with pytest.raises(RuntimeError, match="仅 submitted_untracked"):
+            trade_intent_service.bind_provider_order_id(intent.id, "ORD-2")
+    finally:
+        _reset_db_state()
+
+
+def test_mixed_history_and_active_orders() -> None:
+    """清单 #10：历史已撤订单与当前在途订单并存 → 只对在途计算占用。"""
+    from skills.mx_core.execution import preflight_trade
+
+    class _MixedClient:
+        def get_orders(self) -> dict:
+            return {
+                "data": {
+                    "orders": [
+                        {
+                            "stockCode": "600519",
+                            "orderDrt": "1",
+                            "orderStatus": "3",  # 历史已撤
+                            "orderCount": 500,
+                            "dealCount": 0,
+                            "orderID": "ORD-OLD",
+                        },
+                        {
+                            "stockCode": "600519",
+                            "orderDrt": "1",
+                            "orderStatus": "1",  # 当前在途
+                            "orderCount": 200,
+                            "dealCount": 0,
+                            "orderID": "ORD-ACT",
+                        },
+                    ]
+                }
+            }
+
+        def get_balance(self) -> dict:
+            return {"data": {"availBalance": 10_000_000.0}}
+
+    # 在途 200 股的买单存在 → 阻塞
+    with pytest.raises(RuntimeError, match="未完成买入委托"):
+        preflight_trade(
+            client=_MixedClient(),
+            action="BUY",
+            symbol="600519",
+            quantity=100,
+            price_type="LIMIT",
+            price=20.0,
+        )

@@ -425,6 +425,47 @@ INVALID → 保持 UNKNOWN（#12）、跨 run intent_id 拒绝关联（#13）。
 
 **全量回归：后端 440 passed，前端 86 passed，vue-tsc/build 通过。**
 
+### 第九轮：第七轮复审 P0×3 + P1×2 修复（2026-10-30 第七次外部复审）
+
+**P0-1 已撤销订单不再占用在途**：BUY/SELL 预检显式识别
+CANCELED_ORDER_STATUSES——已撤销/已废单委托的剩余未成交部分已不在途，
+不再阻塞新买入、不再占用可卖数量。此前状态 3（已撤）的 100 股委托
+会被当作"未知状态 + 剩余 100"持续阻塞（错误阻塞：合法交易无法执行）。
+
+**P0-2 部分成交后撤单成功成为真正终态**：`order_terminal_status` 状态
+优先级修正——**终态状态码优先于 dealt>0**。委托 1000 股、成交 400 股、
+剩余 600 股撤销成功（状态 3）→ `canceled_partial`（终态），不再是
+`partially_filled`（会被当作剩余仍在途，撤单意图永久卡在 CANCEL_PENDING）。
+意图状态集同步：canceled_partial 为终态（不阻塞）；撤单闭环对
+canceled_partial → VERIFIED（撤单确认生效，已成交部分已形成持仓变化）。
+
+**P0-3 可卖数量为零禁止卖出（T+1 保护）**：SELL 预检用
+`_row_int_optional` 区分三种情况——
+- availCount 显式为 0（当日买入，T+1 不可卖）→ 拒绝任何正数量卖出，
+  不再落入"持仓 - 在途"推算绕过保护；
+- 字段缺失 → 才走推算路径；
+- 字段存在但格式异常（"abc"）→ 拒绝（不当作缺失）。
+
+**P1 两项**：
+- **SUBMITTED_UNTRACKED 状态**：提交成功但响应未含远端单号 →
+  submitted_untracked（阻塞同向新委托，但明确标记"无法自动同步，
+  需人工绑定"）；新增 `bind_provider_order_id` + API
+  `POST /trade-intents/{id}/bind-order` + `GET /trade-intents` 列表
+  （含待人工核验项）。人工绑定后恢复单号精确匹配同步——不重新引入
+  模糊匹配。
+- **过期文档清理**：移除"无单号按标的+方向唯一匹配""两次核验+90 秒
+  可判 FAILED"等已失效描述；UNKNOWN_MIN_CHECKS/UNKNOWN_WAIT_SECONDS
+  标注为无行为作用的历史常量。
+
+**第七轮专项测试**（新增 11 个）：已撤销买/卖单不阻塞/不占用（#1/#2）、
+部分成交后撤单 → canceled_partial（#3）+ 撤单意图 VERIFIED（#4）、
+剩余仍在途 → CANCEL_PENDING（#5）、availCount=0 拒绝卖出（#6）、
+字段缺失走推算（#7）、格式异常拒绝（#8）、无单号提交 →
+SUBMITTED_UNTRACKED + 人工绑定恢复（#9）、绑定状态限制、
+历史已撤与当前在途并存只对在途计算占用（#10）。
+
+**全量回归：后端 451 passed，前端 86 passed，vue-tsc/build 通过。**
+
 ### 已知边界（如实记录）
 
 - signal_id 是日级标识（交易日+标的+方向），45 分钟冷却放行第二档
@@ -436,7 +477,9 @@ INVALID → 保持 UNKNOWN（#12）、跨 run intent_id 拒绝关联（#13）。
 - tdx-stock-api 等动态技能的必需工具映射待部署环境确认工具名后
   纳入（本地未部署该技能，无法验证）。
 - 委托状态码语义：终态白名单（撤单/废单编码）基于常见约定推断，
-  未知码一律 UNKNOWN 保持阻塞（安全默认），需真实接口验证后修正。
+  未知码一律 UNKNOWN 保持阻塞（安全默认）。**已撤销状态（3/4/5/6/9/-1）
+  现在会解除占用——若真实接口中某状态码并非终局（如"部分撤单中"），
+  需真实接口验证后从白名单移除**，否则可能错误放行。
 - 进程租约（worker_id/heartbeat/lease_expires）未实现：当前以
   单 worker 部署为约束；run 状态守卫覆盖正常启动竞争，强杀进程
   （run 停留 running）的意图需等 run 状态收敛后才会恢复。

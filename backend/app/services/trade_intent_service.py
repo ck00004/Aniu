@@ -58,20 +58,29 @@ _BLOCKING_STATUSES = {
     "planned",
     "executing",
     "submitted",
+    "submitted_untracked",
     "unknown",
     "partially_filled",
 }
-# 终态（可按规则重试或开新档）
-_TERMINAL_STATUSES = {"filled", "canceled", "failed", "cancel_unknown"}
+# 终态（可按规则重试或开新档）。canceled_partial：部分成交后剩余已
+# 撤销——委托不再在途（第七轮复审 P0-2），已成交部分已形成持仓变化。
+_TERMINAL_STATUSES = {
+    "filled",
+    "canceled",
+    "canceled_partial",
+    "failed",
+    "cancel_unknown",
+}
 
 # 撤单意图的 signal_date 用固定哨兵值：撤单按委托单号全局唯一，
 # 不按天滚动（委托不会跨天存在，但哨兵值让唯一性绝对成立）。
 _CANCEL_SIGNAL_DATE = "PERM"
 
-# UNKNOWN 可见性核验：远端委托列表查不到对应委托时，不能立即判定
-# "未提交"——订单可能已提交但暂时不可见（列表延迟/分页）。需要连续
-# UNKNOWN_MIN_CHECKS 次独立核验且距首次 UNKNOWN 超过等待期，才允许
-# 收敛为 failed（解除阻塞）。在此之前保持 UNKNOWN 阻塞同向提交。
+# 历史遗留说明（第七轮复审清理）：UNKNOWN 曾设计"连续多次核验 + 等待期
+# 后自动收敛 failed"，该逻辑已在第五轮复审后移除——活动委托列表查不到
+# 不能证明未提交，UNKNOWN 一律保持阻塞，等待单号精确匹配或人工核验。
+# 保留 unknown_checks / first_unknown_at 字段仅为记录核验轨迹。
+# 以下两个常量已无行为作用（保留供历史测试引用，勿在新代码使用）。
 UNKNOWN_MIN_CHECKS = 2
 UNKNOWN_WAIT_SECONDS = 90
 
@@ -329,15 +338,60 @@ class TradeIntentService:
     def mark_intent_submitted(
         self, intent_id: int, provider_order_id: str | None = None
     ) -> None:
+        """提交成功。无远端单号 → submitted_untracked（第七轮复审 P1）。
+
+        submitted_untracked 同样阻塞同向新委托（订单确认提交过），
+        但无法自动状态同步——需要人工核验后绑定单号
+        （bind_provider_order_id），禁止模糊匹配自动认领。
+        """
         with session_scope() as db:
             intent = db.get(TradeIntent, intent_id)
             if intent is None:
                 return
-            intent.status = "submitted"
             if provider_order_id:
+                intent.status = "submitted"
                 intent.provider_order_id = str(provider_order_id)
+            else:
+                intent.status = "submitted_untracked"
+                intent.note = (
+                    "提交成功但未能从响应提取远端单号：无法自动同步状态，"
+                    "请人工核验后绑定单号（POST /api/aniu/trade-intents/"
+                    f"{intent_id}/bind-order）"
+                )
             intent.updated_at = _now_utc()
             db.add(intent)
+
+    def bind_provider_order_id(
+        self, intent_id: int, provider_order_id: str
+    ) -> TradeIntent | None:
+        """人工核验后绑定远端单号（submitted_untracked → submitted）。
+
+        绑定后状态同步恢复单号精确匹配；不改变阻塞语义。
+        """
+        normalized = str(provider_order_id or "").strip()
+        if not normalized:
+            raise RuntimeError("远端委托单号不能为空。")
+        with session_scope() as db:
+            intent = db.get(TradeIntent, intent_id)
+            if intent is None:
+                return None
+            if str(intent.status or "") not in (
+                "submitted_untracked",
+                "unknown",
+            ):
+                raise RuntimeError(
+                    f"意图当前状态为 {intent.status}，仅 submitted_untracked/"
+                    "unknown 状态允许人工绑定单号。"
+                )
+            intent.provider_order_id = normalized
+            intent.status = "submitted"
+            intent.note = f"人工核验绑定单号：{normalized}"
+            intent.updated_at = _now_utc()
+            db.add(intent)
+            db.flush()
+            db.refresh(intent)
+            db.expunge(intent)
+            return intent
 
     def mark_intent_unknown(self, intent_id: int, note: str) -> None:
         """超时/传输中断：远端可能��接受，状态未知（阻塞后续同向意图）。"""
@@ -412,7 +466,12 @@ class TradeIntentService:
                     select(TradeIntent).where(
                         TradeIntent.symbol == normalized_symbol,
                         TradeIntent.status.in_(
-                            ["submitted", "partially_filled", "unknown"]
+                            [
+                                "submitted",
+                                "submitted_untracked",
+                                "partially_filled",
+                                "unknown",
+                            ]
                         ),
                         TradeIntent.side.in_(["BUY", "SELL"]),
                     )
@@ -550,9 +609,15 @@ class TradeIntentService:
                     )
                 else:
                     terminal = order_terminal_status(matched)
-                    if terminal == "canceled":
+                    if terminal in ("canceled", "canceled_partial"):
                         intent.status = "verified"
-                        intent.note = f"原委托 {order_id} 已撤销，撤单确认生效"
+                        if terminal == "canceled_partial":
+                            intent.note = (
+                                f"原委托 {order_id} 部分成交后剩余已撤销，"
+                                "撤单确认生效（已成交部分已形成持仓变化）"
+                            )
+                        else:
+                            intent.note = f"原委托 {order_id} 已撤销，撤单确认生效"
                     elif terminal == "filled":
                         intent.status = "filled"
                         intent.note = f"原委托 {order_id} 已全部成交，撤单未生效"
@@ -592,7 +657,12 @@ class TradeIntentService:
                     select(TradeIntent.symbol)
                     .where(
                         TradeIntent.status.in_(
-                            ["submitted", "partially_filled", "unknown"]
+                            [
+                                "submitted",
+                                "submitted_untracked",
+                                "partially_filled",
+                                "unknown",
+                            ]
                         ),
                         TradeIntent.side.in_(["BUY", "SELL"]),
                     )

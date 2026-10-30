@@ -166,9 +166,13 @@ def parse_order_snapshot(payload: Any) -> tuple[list[dict[str, Any]], str]:
 
 
 def order_terminal_status(row: dict[str, Any]) -> str:
-    """按委托行计算意图终态（数量缺失/异常 → unknown，不默认成交）。
+    """按委托行计算意图终态（第七轮复审 P0-2：终态优先于部分成交）。
 
-    filled / partially_filled / submitted / canceled / unknown。
+    filled / partially_filled / submitted / canceled / canceled_partial /
+    unknown。关键顺序：**终态状态码优先于 dealt>0**——部分成交 400 股
+    后剩余 600 股撤销成功（状态码 3）必须是 canceled_partial（终态），
+    而不是 partially_filled（会被当作剩余仍在途，撤单意图永久卡在
+    CANCEL_PENDING）。
     """
     ordered, dealt = get_order_quantities(row)
     status = get_order_status(row) or "0"
@@ -178,10 +182,9 @@ def order_terminal_status(row: dict[str, Any]) -> str:
         return "unknown"
     if dealt == ordered:
         return "filled"
-    if dealt > 0:
-        return "partially_filled"
-    if status in PENDING_ORDER_STATUSES:
-        return "submitted"
+    # 终态状态码优先：剩余部分已撤销/废单，委托不再在途
     if status in CANCELED_ORDER_STATUSES:
-        return "canceled"
+        return "canceled_partial" if dealt > 0 else "canceled"
+    if status in PENDING_ORDER_STATUSES:
+        return "partially_filled" if dealt > 0 else "submitted"
     return "unknown"

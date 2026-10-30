@@ -16,6 +16,7 @@ from skills.mx_core.client import (
     MXResponseUnknown,
 )
 from skills.mx_core.order_schema import (
+    CANCELED_ORDER_STATUSES as _CANCELED_ORDER_STATUSES,
     PENDING_ORDER_STATUSES as _PENDING_ORDER_STATUSES,
     parse_order_snapshot as _parse_order_snapshot,
     row_int_optional as _row_int_optional,
@@ -249,9 +250,11 @@ def preflight_trade(
                         "成交后再评估"
                     )
                 continue
-            # P0-2/P0-3（第六轮复审）：未知状态码（含 "0"——状态字段
-            # 缺失的缺省值）+ 剩余数量不明或大于零 → 保守阻塞。
-            # BUY 此前对 "0" 直接放行，与 SELL 不一致。
+            # P0-1（第七轮复审）：已撤销/已废单（终态状态码）不再占用
+            # 在途——剩余未成交部分已撤销，不得继续阻塞新买入。
+            if status in _CANCELED_ORDER_STATUSES:
+                continue
+            # 未知状态码（含 "0"）+ 剩余数量不明或大于零 → 保守阻塞。
             if ordered is None or dealt is None or max(ordered - dealt, 0) > 0:
                 raise RuntimeError(
                     f"{symbol} 存在无法识别状态的买入委托（状态码 {status}，"
@@ -301,15 +304,34 @@ def preflight_trade(
     if position_row is None:
         raise RuntimeError(f"卖出数量 {quantity} 超过 {symbol} 可卖数量 0（未找到该标的持仓）")
 
-    available = _row_int(position_row, "availCount", "availableCount", "enableQty")
-    if available > 0:
+    # P0-3（第七轮复审）：可卖数量显式为 0（A 股 T+1：当日买入不可卖）
+    # 与字段缺失是两种完全不同的情况——availCount=0 必须直接拒绝任何
+    # 正数量卖出，不得落入"持仓 - 在途"推算绕过 T+1 保护。
+    # 字段存在但格式异常同样拒绝（不得当作缺失走推算）。
+    _avail_raw = _row_str(
+        position_row, "availCount", "availableCount", "enableQty"
+    )
+    available = _row_int_optional(
+        position_row, "availCount", "availableCount", "enableQty"
+    )
+    if _avail_raw and available is None:
+        raise RuntimeError(
+            f"{symbol} 可卖数量字段格式异常（{_avail_raw}），为防止违规"
+            "卖出已阻断本次交易；请核对持仓数据。"
+        )
+    if available is not None:
+        if available < 0:
+            raise RuntimeError(
+                f"{symbol} 可卖数量字段异常（{available}），为防止违规卖出"
+                "已阻断本次交易；请核对持仓数据。"
+            )
         if quantity > available:
             raise RuntimeError(
                 f"卖出数量 {quantity} 超过 {symbol} 可卖数量 {available}"
             )
         return
 
-    # 持仓未提供可卖字段时，用 持仓数量 - 在途卖出占用 推算
+    # 仅当可卖字段确实缺失时，才用 持仓数量 - 在途卖出占用 推算
     held = _row_int(position_row, "count", "quantity", "orderQty", "volume")
     orders_payload = client.get_orders()
     occupied = 0
@@ -336,6 +358,10 @@ def preflight_trade(
                     "mx_get_orders 核对该委托。"
                 )
             occupied += max(ordered - dealt, 0)
+        elif status in _CANCELED_ORDER_STATUSES:
+            # P0-1（第七轮复审）：已撤销/已废单卖单不占用可卖——
+            # 剩余未成交部分已撤销，历史已撤卖单不得持续影响当日交易。
+            continue
         elif status == "0":
             if (ordered is None or dealt is None) or max(ordered - dealt, 0) > 0:
                 raise RuntimeError(

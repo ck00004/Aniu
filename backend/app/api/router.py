@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 from datetime import date, datetime, timezone
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Path, Query, UploadFile
+from typing import Any
+
+from fastapi import Body, APIRouter, Depends, File, Form, HTTPException, Path, Query, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
@@ -401,6 +403,74 @@ def delete_memory(
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {"deleted": True, "memory_id": memory_id}
+
+
+@router.get("/trade-intents", response_model=list[dict[str, Any]])
+def list_trade_intents(
+    symbol: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    _user: str = Depends(get_current_user),
+) -> list[dict[str, Any]]:
+    """交易意图列表（含 UNKNOWN/SUBMITTED_UNTRACKED 待人工核验项）。"""
+    from app.services.trade_intent_service import trade_intent_service
+
+    intents = trade_intent_service.list_intents(
+        symbol=symbol,
+        limit=limit,
+    )
+    return [
+        {
+            "id": item.id,
+            "signal_date": item.signal_date,
+            "symbol": item.symbol,
+            "side": item.side,
+            "tranche_id": item.tranche_id,
+            "intent_key": item.intent_key,
+            "run_id": item.run_id,
+            "action_id": item.action_id,
+            "provider_order_id": item.provider_order_id,
+            "quantity": item.quantity,
+            "status": item.status,
+            "note": item.note,
+            "unknown_checks": item.unknown_checks,
+            "created_at": item.created_at.isoformat(),
+            "updated_at": item.updated_at.isoformat(),
+        }
+        for item in intents
+    ]
+
+
+@router.post(
+    "/trade-intents/{intent_id}/bind-order", response_model=dict[str, Any]
+)
+def bind_trade_intent_order(
+    intent_id: int,
+    payload: dict[str, Any] = Body(...),
+    _user: str = Depends(get_current_user),
+) -> dict[str, Any]:
+    """人工核验后为 submitted_untracked/unknown 意图绑定远端单号。
+
+    绑定后状态同步恢复单号精确匹配；不改变阻塞语义（第七轮复审 P1）。
+    """
+    from app.services.trade_intent_service import trade_intent_service
+
+    order_id = str(payload.get("provider_order_id") or "").strip()
+    if not order_id:
+        raise HTTPException(status_code=422, detail="缺少 provider_order_id。")
+    try:
+        intent = trade_intent_service.bind_provider_order_id(
+            intent_id, order_id
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if intent is None:
+        raise HTTPException(status_code=404, detail="交易意图不存在。")
+    return {
+        "bound": True,
+        "intent_id": intent.id,
+        "provider_order_id": intent.provider_order_id,
+        "status": intent.status,
+    }
 
 
 @router.get("/memory-dreams", response_model=MemoryDreamListRead)
