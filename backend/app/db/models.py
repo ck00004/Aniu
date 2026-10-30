@@ -429,3 +429,33 @@ class TradeIntent(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()
     )
+
+
+class SelfSelectIntent(Base):
+    """自选股操作意图（第十二轮复审 P1：跨轮持久化防重复）。
+
+    与 trade_intents 分离——自选股操作没有档位/信号语义。UNKNOWN 状态
+    跨轮阻塞同标的同方向的重复写请求：写请求已发出但回查失败时，
+    下一轮任务不得因"列表暂时读不到目标状态"而重复发送 ADD/REMOVE。
+    """
+
+    __tablename__ = "self_select_intents"
+    # 不设 (symbol, operation, status) 唯一约束：终态（verified/noop/
+    # failed）可重复（删除后再添加是合法序列）；开放意图的跨轮阻塞由
+    # 服务层检查实现（进程内 _SELF_SELECT_OP_LOCK 已串行化自选股操作，
+    # 多进程为已记录的单 worker 部署约束）。
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(16), index=True)
+    operation: Mapped[str] = mapped_column(String(8), index=True)  # ADD/REMOVE
+    run_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # executing / submitted / verified / noop / unknown / failed
+    status: Mapped[str] = mapped_column(String(16), default="executing", index=True)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    request_time: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now()
+    )
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )

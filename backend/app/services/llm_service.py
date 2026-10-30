@@ -1119,13 +1119,26 @@ class LLMService:
                     arguments=arguments,
                     status="running",
                 )
-                try:
+                # 第十二轮复审 P1：执行前用签名判断回调参数形态——
+                # 原实现捕获全部 TypeError 后重试整个回调，会把"写请求
+                # 已发出后本地处理响应时的 TypeError"误判为参数不匹配
+                # 而二次执行（重复写请求）。
+                import inspect as _inspect
+
+                _executor_params = _inspect.signature(tool_executor).parameters
+                _accepts_tool_call_id = any(
+                    param.kind == _inspect.Parameter.VAR_POSITIONAL
+                    or param.kind == _inspect.Parameter.VAR_KEYWORD
+                    or param.name == "tool_call_id"
+                    for param in _executor_params.values()
+                )
+                if _accepts_tool_call_id:
                     tool_result = tool_executor(
                         tool_name,
                         arguments,
                         tool_call.get("id"),
                     )
-                except TypeError:
+                else:
                     tool_result = tool_executor(tool_name, arguments)  # type: ignore[misc, call-arg]
                 _emit(
                     "tool_call",

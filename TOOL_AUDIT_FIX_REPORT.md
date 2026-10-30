@@ -596,6 +596,46 @@ handler 立即通过专用方法（mark_cancel_intent_verified/filled/pending）
 
 **全量回归：后端 470 passed，前端 86 passed，vue-tsc/build 通过。**
 
+### 第十四轮：第十二轮复审 P0×1 + P1×3 修复（2026-10-30 第十二次外部复审）
+
+**复审核心发现的核实结果**：复审称远程缺少 mark_cancel_intent_verified/
+filled/pending 三方法——**三个方法在本地代码中已存在**（第十三轮实现，
+含 side=CANCEL 校验与意图不存在报错），执行器调用链完整。复审看到的仍是
+推送前的远程 main。**推送后即可见**；推送前以本地代码与本报告为准。
+
+**P0-2 撤单持久化失败不伪装成功**：状态持久化异常时，结果中
+`status_persist_failed=True` + summary 追加"⚠ 持久化失败，请人工核对
+交易意图状态"——远端已提交是事实（ok=True 保留），但数据库状态未落
+必须可见，不得静默吞掉（否则即时核验成功、数据库仍 submitted，下一轮
+委托消失退化 UNKNOWN 且无人知道持久化失败过）。
+
+**P1-1 自选股持久化意图表**（self_select_intents + 服务）：
+- 状态机 EXECUTING → SUBMITTED → VERIFIED / NOOP / UNKNOWN / FAILED；
+- **UNKNOWN 跨轮阻塞**：写请求已发出但回查失败/未确认 → 持久化
+  UNKNOWN，下一轮同标的同方向被拒绝（复审场景：10:00 ADD 超时 →
+  10:15 重复 ADD——此前 UNKNOWN 只存在于本轮模型输出）；
+- 下一轮先 reconcile：重新读取列表，目标状态已达成 → VERIFIED 解除
+  阻塞；仍无法确认 → 继续阻塞；只有人工确认远端未执行才允许重试；
+- 与 trade_intents 分离（自选股操作无档位/信号语义）；不设
+  (symbol, operation, status) 唯一约束（删除后再添加是合法终态序列），
+  开放意图阻塞由服务层检查（进程内锁已串行 + 单 worker 部署约束）。
+
+**P1-2 llm_service TypeError 二次调用消除**：`_agent_loop` 的工具
+回调改 `inspect.signature` 执行前判断（三参数/二参数形态）——原实现
+捕获全部 TypeError 后重试整个回调，自定义执行器在写请求发出后的
+内部 TypeError 会被误判为参数不匹配而二次执行。
+
+**P1-3 自选股名称精确匹配**：`_target_in_state` 名称匹配从子串改为
+精确（目标"中芯"不再被误判为已在列表的"中芯国际"）；无法唯一确定时
+宁可走写请求+回查确认。
+
+**第十二轮专项测试**（新增 4 个）：自选股 UNKNOWN 跨轮阻塞 E2E
+（写→回查失败→下一轮拒→目标确认后解除）、名称精确匹配、
+agent loop TypeError 单次执行、撤单持久化失败可见性。
+另修正 4 个自选股测试接入意图表（含持久化断言）。
+
+**全量回归：后端 474 passed，前端 86 passed，vue-tsc/build 通过。**
+
 ### 已知边界（如实记录）
 
 - signal_id 是日级标识（交易日+标的+方向），45 分钟冷却放行第二档

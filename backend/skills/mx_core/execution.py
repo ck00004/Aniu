@@ -854,21 +854,63 @@ class MXExecutionService:
                 },
             }
 
+        # 第十二轮复审 P1-1：注册持久化操作意图——UNKNOWN 跨轮阻塞
+        # 同标的同方向的重复写请求（此前 UNKNOWN 只存在于本轮模型
+        # 输出，下一轮任务会重复发送 ADD/REMOVE）。
+        from app.services.self_select_intent_service import (
+            self_select_intent_service,
+        )
+
+        target_key = code or name
+        # 先核对历史 UNKNOWN：目标状态已确认则解除阻塞
+        unblocked = self_select_intent_service.reconcile_unknown_intent(
+            symbol=target_key,
+            operation=operation,
+            read_state=lambda: self._read_self_select_state(client),
+        )
+        if not unblocked:
+            raise RuntimeError(
+                f"{target_key} 存在未确认的 {operation} 操作意图且目标状态"
+                "尚未确认，为防止重复写请求已阻断本次操作；请先调用 "
+                "mx_get_self_selects 核对列表状态。"
+            )
+        ss_intent = self_select_intent_service.check_and_register_intent(
+            symbol=target_key,
+            operation=operation,
+        )
+
         result = client.manage_self_select(query)
+        self_select_intent_service.mark_submitted(ss_intent.id)
 
         verified = self._read_self_select_state(client)
+        # 第十二轮复审 P1-1：回查结果持久化到意图——
+        # verified（目标状态确认）/ unknown（跨轮阻塞，防重复写）。
         if verified is None:
+            # 持久化 UNKNOWN：跨轮阻塞同标的同方向的重复写请求
+            self_select_intent_service.mark_unknown(
+                ss_intent.id,
+                f"自选股操作已提交但回查失败（{query}）：写请求可能已生效，"
+                "确认前不得重复提交",
+            )
             raise RuntimeError(
                 f"自选股操作已提交但回查失败，状态未知（UNKNOWN）：{query}。"
                 "请调用 mx_get_self_selects 核对当前列表，确认前不得重复提交。"
             )
         in_list = self._target_in_state(code, name, verified)
         if (operation == "ADD" and not in_list) or (operation == "REMOVE" and in_list):
+            self_select_intent_service.mark_unknown(
+                ss_intent.id,
+                f"自选股操作已提交但回查未确认目标状态（{query}）：写请求"
+                "可能未生效或列表延迟，确认前不得重复提交",
+            )
             raise RuntimeError(
                 f"自选股操作已提交但回查未确认目标状态（UNKNOWN）：{query}。"
                 "请调用 mx_get_self_selects 核对当前列表，确认前不得重复提交。"
             )
 
+        self_select_intent_service.mark_verified(
+            ss_intent.id, f"回查确认目标状态已达成：{query}"
+        )
         return {
             "ok": True,
             "tool_name": "mx_manage_self_select",
@@ -888,7 +930,13 @@ class MXExecutionService:
         codes, names = state
         if code:
             return code in codes
-        return bool(name) and any(name in row_name for row_name in names)
+        # 第十二轮复审 P1-3：名称精确匹配（原子串匹配会把目标"中芯"
+        # 误判为已在列表的"中芯国际"）。名称无法唯一确定时宁可走
+        # 写请求 + 回查确认，也不凭子串认定目标状态。
+        if not name:
+            return False
+        normalized = name.strip()
+        return any(row_name.strip() == normalized for row_name in names)
 
     def _parse_self_select_intent(
         self, query: str
@@ -1193,6 +1241,11 @@ class MXExecutionService:
         verify_status, verify_note = self._verify_cancel_result(
             client, order_id
         )
+        # 第十二轮复审 P0-2：状态持久化失败不得伪装成完整成功——
+        # 远端已提交是事实，但数据库状态未落，必须在结果中可见并
+        # 触发告警（否则即时核验成功、数据库仍是 submitted，下一轮
+        # 委托消失会退化 UNKNOWN，且无人知道持久化失败过）。
+        persist_failed = False
         try:
             if verify_status == "verified":
                 trade_intent_service.mark_cancel_intent_verified(
@@ -1209,13 +1262,25 @@ class MXExecutionService:
             elif verify_status == "unknown":
                 trade_intent_service.mark_intent_unknown(intent.id, verify_note)
         except Exception as exc:  # noqa: BLE001
+            persist_failed = True
             logger.warning(
-                "cancel intent immediate status persist failed: %s", exc
+                "cancel intent immediate status persist failed: intent=%s "
+                "verify_status=%s error=%s",
+                intent.id,
+                verify_status,
+                exc,
             )
+        persist_warning = (
+            "⚠ 撤单请求已提交且核验完成，但意图状态持久化失败——"
+            "请人工核对交易意图状态（POST /api/aniu/trade-intents 查询）。"
+            if persist_failed
+            else ""
+        )
         return {
             "ok": True,
             "tool_name": "mx_moni_cancel",
-            "summary": f"已提交撤单请求：{order_id}。{verify_note}",
+            "summary": f"已提交撤单请求：{order_id}。{verify_note}{persist_warning}",
+            "status_persist_failed": persist_failed,
             "result": result,
             "executed_action": {
                 "action": "CANCEL",

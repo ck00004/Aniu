@@ -503,21 +503,37 @@ class _SelfSelectClient:
         return {"code": "200", "message": "成功"}
 
 
-def test_manage_self_select_add_verified_by_state_readback() -> None:
+def test_manage_self_select_add_verified_by_state_readback(monkeypatch, tmp_path) -> None:
     from skills.mx_core.execution import mx_execution_service
 
-    client = _SelfSelectClient(rows=[])
-    result = mx_execution_service.execute_tool(
-        client=client,
-        app_settings=None,
-        tool_name="mx_manage_self_select",
-        arguments={"query": "将600519加入自选股"},
-    )
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        client = _SelfSelectClient(rows=[])
+        result = mx_execution_service.execute_tool(
+            client=client,
+            app_settings=None,
+            tool_name="mx_manage_self_select",
+            arguments={"query": "将600519加入自选股"},
+        )
 
-    assert result["ok"] is True
-    assert "回查确认" in result["summary"]
-    assert result["executed_action"]["verified"] is True
-    assert len(client.manage_calls) == 1
+        assert result["ok"] is True
+        assert "回查确认" in result["summary"]
+        assert result["executed_action"]["verified"] is True
+        assert len(client.manage_calls) == 1
+
+        # 意图持久化为 verified
+        from app.services.self_select_intent_service import (
+            self_select_intent_service,
+        )
+
+        intents = self_select_intent_service.list_intents()
+        assert len(intents) == 1
+        assert intents[0].status == "verified"
+        assert intents[0].symbol == "600519"
+        assert intents[0].operation == "ADD"
+    finally:
+        _reset_db_state()
 
 
 def test_manage_self_select_add_noop_when_already_in_list() -> None:
@@ -555,53 +571,80 @@ def test_manage_self_select_remove_noop_when_not_in_list() -> None:
     assert client.manage_calls == []
 
 
-def test_manage_self_select_unverified_state_reports_unknown() -> None:
-    """接口返回成功但回查未确认目标状态：不得声称完成（UNKNOWN）。"""
+def test_manage_self_select_unverified_state_reports_unknown(monkeypatch, tmp_path) -> None:
+    """接口返回成功但回查未确认目标状态：不得声称完成（UNKNOWN 持久化）。"""
     from skills.mx_core.execution import mx_execution_service
 
-    # manage 不真正生效（列表不变）：ADD 后回查仍不在列表
-    client = _SelfSelectClient(rows=[], manage_no_effect=True)
-    result = mx_execution_service.execute_tool(
-        client=client,
-        app_settings=None,
-        tool_name="mx_manage_self_select",
-        arguments={"query": "将600519加入自选股"},
-    )
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        # manage 不真正生效（列表不变）：ADD 后回查仍不在列表
+        client = _SelfSelectClient(rows=[], manage_no_effect=True)
+        result = mx_execution_service.execute_tool(
+            client=client,
+            app_settings=None,
+            tool_name="mx_manage_self_select",
+            arguments={"query": "将600519加入自选股"},
+        )
 
-    assert result["ok"] is False
-    assert "回查未确认目标状态" in str(result.get("error") or "")
-    assert "mx_get_self_selects" in str(result.get("error") or "")
-    assert len(client.manage_calls) == 1  # 写请求只发过一次
+        assert result["ok"] is False
+        assert "回查未确认目标状态" in str(result.get("error") or "")
+        assert "mx_get_self_selects" in str(result.get("error") or "")
+        assert len(client.manage_calls) == 1  # 写请求只发过一次
+
+        # UNKNOWN 持久化：下一轮同标的同方向被阻塞
+        from app.services.self_select_intent_service import (
+            self_select_intent_service,
+        )
+
+        intents = self_select_intent_service.list_intents()
+        assert len(intents) == 1
+        assert intents[0].status == "unknown"
+    finally:
+        _reset_db_state()
 
 
-def test_manage_self_select_readback_failure_reports_unknown() -> None:
-    """写请求已发出但回查读取失败：UNKNOWN，不自动重试。
+def test_manage_self_select_readback_failure_reports_unknown(monkeypatch, tmp_path) -> None:
+    """写请求已发出但回查读取失败：UNKNOWN 持久化，不自动重试。
 
     第十一轮复审后预读取失败会被直接拒绝（不发写请求），因此本测试
     用有状态桩：预读取成功（空列表）→ 发送 ADD → 回查失败。
     """
     from skills.mx_core.execution import mx_execution_service
 
-    client = _SelfSelectClient(rows=[])
-    # 预读取成功；写请求发出后回查失败
-    original_read = client.get_self_selects
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        client = _SelfSelectClient(rows=[])
+        # 预读取成功；写请求发出后回查失败
+        original_read = client.get_self_selects
 
-    def _stateful_read():
-        if len(client.manage_calls) == 0:
-            return original_read()
-        raise RuntimeError("读取失败")
+        def _stateful_read():
+            if len(client.manage_calls) == 0:
+                return original_read()
+            raise RuntimeError("读取失败")
 
-    client.get_self_selects = _stateful_read
-    result = mx_execution_service.execute_tool(
-        client=client,
-        app_settings=None,
-        tool_name="mx_manage_self_select",
-        arguments={"query": "将600519加入自选股"},
-    )
+        client.get_self_selects = _stateful_read
+        result = mx_execution_service.execute_tool(
+            client=client,
+            app_settings=None,
+            tool_name="mx_manage_self_select",
+            arguments={"query": "将600519加入自选股"},
+        )
 
-    assert result["ok"] is False
-    assert "回查失败" in str(result.get("error") or "")
-    assert len(client.manage_calls) == 1
+        assert result["ok"] is False
+        assert "回查失败" in str(result.get("error") or "")
+        assert len(client.manage_calls) == 1
+
+        # UNKNOWN 持久化：跨轮阻塞
+        from app.services.self_select_intent_service import (
+            self_select_intent_service,
+        )
+
+        intents = self_select_intent_service.list_intents()
+        assert intents[0].status == "unknown"
+    finally:
+        _reset_db_state()
 
 
 def test_manage_self_select_pre_read_failure_rejects_write() -> None:
@@ -697,31 +740,36 @@ def test_manage_self_select_name_and_code_resolve_to_same_target() -> None:
     assert by_name[2] == "贵州茅台"
 
 
-def test_manage_self_select_add_remove_add_sequence_allowed() -> None:
+def test_manage_self_select_add_remove_add_sequence_allowed(monkeypatch, tmp_path) -> None:
     """先 ADD、再 REMOVE、又因新原因 ADD：合法状态变更不被误拦（清单 #7）。"""
     from skills.mx_core.execution import mx_execution_service
 
-    client = _SelfSelectClient(rows=[])
-    r1 = mx_execution_service.execute_tool(
-        client=client, app_settings=None,
-        tool_name="mx_manage_self_select",
-        arguments={"query": "将600519加入自选股"},
-    )
-    assert r1["ok"] is True
-    client.rows = [{"stockCode": "600519", "stockName": "贵州茅台"}]
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        client = _SelfSelectClient(rows=[])
+        r1 = mx_execution_service.execute_tool(
+            client=client, app_settings=None,
+            tool_name="mx_manage_self_select",
+            arguments={"query": "将600519加入自选股"},
+        )
+        assert r1["ok"] is True
+        client.rows = [{"stockCode": "600519", "stockName": "贵州茅台"}]
 
-    r2 = mx_execution_service.execute_tool(
-        client=client, app_settings=None,
-        tool_name="mx_manage_self_select",
-        arguments={"query": "将600519从自选股删除"},
-    )
-    assert r2["ok"] is True
-    client.rows = []
+        r2 = mx_execution_service.execute_tool(
+            client=client, app_settings=None,
+            tool_name="mx_manage_self_select",
+            arguments={"query": "将600519从自选股删除"},
+        )
+        assert r2["ok"] is True
+        client.rows = []
 
-    r3 = mx_execution_service.execute_tool(
-        client=client, app_settings=None,
-        tool_name="mx_manage_self_select",
-        arguments={"query": "将600519加入自选股"},
-    )
-    assert r3["ok"] is True
-    assert len(client.manage_calls) == 3
+        r3 = mx_execution_service.execute_tool(
+            client=client, app_settings=None,
+            tool_name="mx_manage_self_select",
+            arguments={"query": "将600519加入自选股"},
+        )
+        assert r3["ok"] is True
+        assert len(client.manage_calls) == 3
+    finally:
+        _reset_db_state()
