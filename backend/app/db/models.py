@@ -397,6 +397,12 @@ class TradeIntent(Base):
             "tranche_id",
             name="uq_trade_intent_signal_tranche",
         ),
+        # 第八轮复审：远端单号全局唯一——同一订单不得绑定到两个意图
+        #（人工误操作兜底；NULL 不参与唯一约束）。
+        UniqueConstraint(
+            "provider_order_id",
+            name="uq_trade_intent_provider_order_id",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)

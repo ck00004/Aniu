@@ -459,7 +459,10 @@ def bind_trade_intent_order(
         raise HTTPException(status_code=422, detail="缺少 provider_order_id。")
     try:
         intent = trade_intent_service.bind_provider_order_id(
-            intent_id, order_id
+            intent_id,
+            order_id,
+            expected_symbol=payload.get("symbol"),
+            expected_side=payload.get("side"),
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

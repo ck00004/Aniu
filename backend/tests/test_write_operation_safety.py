@@ -2468,7 +2468,7 @@ def test_avail_count_invalid_format_rejects_sell() -> None:
         def get_orders(self) -> dict:
             return {"data": {"orders": []}}
 
-    with pytest.raises(RuntimeError, match="可卖数量字段格式异常"):
+    with pytest.raises(RuntimeError, match="可卖数量字段存在但格式异常"):
         preflight_trade(
             client=_BadAvailClient(),
             action="SELL",
@@ -2567,3 +2567,154 @@ def test_mixed_history_and_active_orders() -> None:
             price_type="LIMIT",
             price=20.0,
         )
+
+
+def test_avail_count_empty_string_rejects_sell() -> None:
+    """第八轮复审 P0-1：availCount 为空字符串 → 拒绝（不走回退推算）。"""
+    from skills.mx_core.execution import preflight_trade
+
+    class _EmptyAvailClient:
+        def get_positions(self) -> dict:
+            return {
+                "data": {
+                    "posList": [
+                        {"stockCode": "600519", "count": 1000, "availCount": ""}
+                    ]
+                }
+            }
+
+        def get_orders(self) -> dict:
+            return {"data": {"orders": []}}
+
+    with pytest.raises(RuntimeError, match="存在但格式异常"):
+        preflight_trade(
+            client=_EmptyAvailClient(),
+            action="SELL",
+            symbol="600519",
+            quantity=100,
+            price_type="MARKET",
+            price=None,
+        )
+
+
+def test_avail_count_null_rejects_sell() -> None:
+    """availCount 为 null（字段存在）→ 拒绝。"""
+    from skills.mx_core.execution import preflight_trade
+
+    class _NullAvailClient:
+        def get_positions(self) -> dict:
+            return {
+                "data": {
+                    "posList": [
+                        {"stockCode": "600519", "count": 1000, "availCount": None}
+                    ]
+                }
+            }
+
+        def get_orders(self) -> dict:
+            return {"data": {"orders": []}}
+
+    with pytest.raises(RuntimeError, match="存在但格式异常"):
+        preflight_trade(
+            client=_NullAvailClient(),
+            action="SELL",
+            symbol="600519",
+            quantity=100,
+            price_type="MARKET",
+            price=None,
+        )
+
+
+# ---------------------------------------------------------------------------
+# 第八轮复审专项
+# ---------------------------------------------------------------------------
+
+
+def test_bind_rejects_duplicate_order_id(monkeypatch, tmp_path) -> None:
+    """绑定安全：同一单号不得绑定到两个意图。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        client = _IntentClient()
+        first = trade_intent_service.check_and_register_trade_intent(
+            client=client, symbol="600519", side="BUY", quantity=100
+        )
+        trade_intent_service.mark_intent_submitted(first.id, None)
+
+        second = trade_intent_service.check_and_register_trade_intent(
+            client=client, symbol="000001", side="BUY", quantity=100
+        )
+        trade_intent_service.mark_intent_submitted(second.id, None)
+
+        trade_intent_service.bind_provider_order_id(first.id, "ORD-DUP")
+        with pytest.raises(RuntimeError, match="已被意图"):
+            trade_intent_service.bind_provider_order_id(second.id, "ORD-DUP")
+    finally:
+        _reset_db_state()
+
+
+def test_bind_rejects_symbol_mismatch(monkeypatch, tmp_path) -> None:
+    """绑定安全：单号所属标的与意图不一致 → 拒绝。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        client = _IntentClient()
+        intent = trade_intent_service.check_and_register_trade_intent(
+            client=client, symbol="600519", side="BUY", quantity=100
+        )
+        trade_intent_service.mark_intent_submitted(intent.id, None)
+
+        with pytest.raises(RuntimeError, match="标的与意图不一致"):
+            trade_intent_service.bind_provider_order_id(
+                intent.id, "ORD-X", expected_symbol="000001"
+            )
+    finally:
+        _reset_db_state()
+
+
+def test_bind_rejects_side_mismatch(monkeypatch, tmp_path) -> None:
+    """绑定安全：方向不一致 → 拒绝。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        client = _IntentClient()
+        intent = trade_intent_service.check_and_register_trade_intent(
+            client=client, symbol="600519", side="BUY", quantity=100
+        )
+        trade_intent_service.mark_intent_submitted(intent.id, None)
+
+        with pytest.raises(RuntimeError, match="方向与意图不一致"):
+            trade_intent_service.bind_provider_order_id(
+                intent.id, "ORD-X", expected_side="SELL"
+            )
+    finally:
+        _reset_db_state()
+
+
+def test_cancel_verify_reports_canceled_partial_verified() -> None:
+    """撤单即时回查：部分成交后剩余已撤 → VERIFIED（与 reconcile 口径一致）。"""
+    from skills.mx_core.execution import mx_execution_service
+
+    class _PartialCanceledClient:
+        def get_orders(self) -> dict:
+            return {
+                "data": {
+                    "orders": [
+                        {
+                            "stockCode": "600519",
+                            "orderDrt": "1",
+                            "orderStatus": "3",
+                            "orderCount": 1000,
+                            "dealCount": 400,
+                            "orderID": "ORD-PC",
+                        }
+                    ]
+                }
+            }
+
+    note = mx_execution_service._verify_cancel_result(
+        _PartialCanceledClient(), "ORD-PC"
+    )
+    assert "VERIFIED" in note
+    assert "未成交部分已撤销" in note
+    assert "已成交部分保留为实际持仓变化" in note

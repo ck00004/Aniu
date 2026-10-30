@@ -362,11 +362,20 @@ class TradeIntentService:
             db.add(intent)
 
     def bind_provider_order_id(
-        self, intent_id: int, provider_order_id: str
+        self,
+        intent_id: int,
+        provider_order_id: str,
+        *,
+        expected_symbol: str | None = None,
+        expected_side: str | None = None,
     ) -> TradeIntent | None:
         """人工核验后绑定远端单号（submitted_untracked → submitted）。
 
-        绑定后状态同步恢复单号精确匹配；不改变阻塞语义。
+        第八轮复审安全加固：
+        - 仅 submitted_untracked / unknown 状态可绑定（重复绑定拒绝）；
+        - 可选校验标的与方向与意图一致（防误绑到其他意图的订单）；
+        - 单号全局唯一：已被其他意图绑定的单号拒绝（数据库唯一约束兜底）；
+        - 绑定后状态为 submitted，恢复单号精确匹配同步。
         """
         normalized = str(provider_order_id or "").strip()
         if not normalized:
@@ -381,7 +390,34 @@ class TradeIntentService:
             ):
                 raise RuntimeError(
                     f"意图当前状态为 {intent.status}，仅 submitted_untracked/"
-                    "unknown 状态允许人工绑定单号。"
+                    "unknown 状态允许人工绑定单号（重复绑定被拒绝）。"
+                )
+            if expected_symbol is not None and _normalize_symbol(
+                expected_symbol
+            ) != _normalize_symbol(intent.symbol):
+                raise RuntimeError(
+                    f"单号所属标的与意图不一致（意图 {intent.symbol}，"
+                    f"请求 {expected_symbol}），绑定被拒绝。"
+                )
+            if (
+                expected_side is not None
+                and str(expected_side).upper() != str(intent.side).upper()
+            ):
+                raise RuntimeError(
+                    f"单号所属方向与意图不一致（意图 {intent.side}，"
+                    f"请求 {expected_side}），绑定被拒绝。"
+                )
+            # 单号唯一性：同一单号不得绑定到两个意图
+            existing = db.scalar(
+                select(TradeIntent).where(
+                    TradeIntent.provider_order_id == normalized,
+                    TradeIntent.id != intent_id,
+                )
+            )
+            if existing is not None:
+                raise RuntimeError(
+                    f"委托单号 {normalized} 已被意图 #{existing.id} 绑定，"
+                    "同一订单不得绑定到两个交易意图。"
                 )
             intent.provider_order_id = normalized
             intent.status = "submitted"
@@ -391,6 +427,11 @@ class TradeIntentService:
             db.flush()
             db.refresh(intent)
             db.expunge(intent)
+            logger.info(
+                "trade intent %s manually bound to order %s",
+                intent_id,
+                normalized,
+            )
             return intent
 
     def mark_intent_unknown(self, intent_id: int, note: str) -> None:

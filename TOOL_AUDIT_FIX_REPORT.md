@@ -466,6 +466,39 @@ SUBMITTED_UNTRACKED + 人工绑定恢复（#9）、绑定状态限制、
 
 **全量回归：后端 451 passed，前端 86 passed，vue-tsc/build 通过。**
 
+### 第十轮：第八轮复审 P0-1 + P1×2 修复（2026-10-30 第八次外部复审）
+
+**P0-1 availCount 字段存在性检查**：原实现 `_avail_raw and available
+is None` 用真假判断——空字符串 `""` 因 falsy 被当作字段缺失，落入
+"持仓 - 在途"推算绕过 T+1 保护。改为 `any(key in position_row)` 的
+**字段存在性**检查：空字符串 / null / 格式异常一律"字段存在但不可
+解析"→ 拒绝卖出；只有字段确实不存在才走推算。测试覆盖空字符串与
+null 两种形态。
+
+**P1-1 撤单即时回查识别 canceled_partial**：`_verify_cancel_result`
+对 canceled_partial 返回 VERIFIED（"未成交部分已撤销，撤单确认生效；
+已成交部分保留为实际持仓变化"）——与 `reconcile_cancel_intents` 的
+口径完全一致（此前即时回查会返回 UNKNOWN，与后续同步报告矛盾）。
+撤单状态四处口径（即时回查 / reconcile / 执行报告 / 前端卡片）现在
+统一：VERIFIED（含 canceled_partial）/ FILLED / CANCEL_PENDING /
+UNKNOWN。
+
+**P1-2 绑定接口安全加固**（第八轮复审清单逐项）：
+- 仅 submitted_untracked / unknown 可绑定（重复绑定拒绝）；
+- 标的一致性校验（expected_symbol，API 透传）；
+- 方向一致性校验（expected_side）；
+- **单号全局唯一**：数据库新增 `uq_trade_intent_provider_order_id`
+  唯一约束 + 服务层查重（同一订单绑定到两个意图被拒绝）；
+- 绑定记录审计日志（logger.info）；
+- API 已有 get_current_user 认证（与全部管理接口同源）。
+
+**第八轮专项测试**（新增 4 个）：availCount 空字符串/null 拒绝、
+单号重复绑定拒绝、标的/方向不一致拒绝、撤单回查 canceled_partial
+→ VERIFIED。
+
+**全量回归：后端 457 passed（451 + 新增 6，含 P0-1 的 2 个形态测试），
+前端 86 passed。**
+
 ### 已知边界（如实记录）
 
 - signal_id 是日级标识（交易日+标的+方向），45 分钟冷却放行第二档
@@ -476,10 +509,13 @@ SUBMITTED_UNTRACKED + 人工绑定恢复（#9）、绑定状态限制、
   数据库级互斥（当前以单 worker 部署为约束）。
 - tdx-stock-api 等动态技能的必需工具映射待部署环境确认工具名后
   纳入（本地未部署该技能，无法验证）。
-- 委托状态码语义：终态白名单（撤单/废单编码）基于常见约定推断，
-  未知码一律 UNKNOWN 保持阻塞（安全默认）。**已撤销状态（3/4/5/6/9/-1）
-  现在会解除占用——若真实接口中某状态码并非终局（如"部分撤单中"），
-  需真实接口验证后从白名单移除**，否则可能错误放行。
+- **委托状态码语义（当前最大外部依赖风险）**：终态白名单
+  （3/4/5/6/9/-1）基于常见约定推断。已撤销状态现在会**解除占用**——
+  若真实接口中某状态码并非终局（如"正在撤单/部分撤单处理中"），
+  会错误放行重复交易。**恢复自动交易前必须用真实妙想账户验证**：
+  正常提交→等待→部分成交→撤单（未成交/部分成交两种）→撤单完成→
+  全部成交的完整生命周期，记录原始 JSON（而非转换后状态），
+  形成经验证的状态映射表后再确定白名单。
 - 进程租约（worker_id/heartbeat/lease_expires）未实现：当前以
   单 worker 部署为约束；run 状态守卫覆盖正常启动竞争，强杀进程
   （run 停留 running）的意图需等 run 状态收敛后才会恢复。

@@ -304,20 +304,18 @@ def preflight_trade(
     if position_row is None:
         raise RuntimeError(f"卖出数量 {quantity} 超过 {symbol} 可卖数量 0（未找到该标的持仓）")
 
-    # P0-3（第七轮复审）：可卖数量显式为 0（A 股 T+1：当日买入不可卖）
-    # 与字段缺失是两种完全不同的情况——availCount=0 必须直接拒绝任何
-    # 正数量卖出，不得落入"持仓 - 在途"推算绕过 T+1 保护。
-    # 字段存在但格式异常同样拒绝（不得当作缺失走推算）。
-    _avail_raw = _row_str(
-        position_row, "availCount", "availableCount", "enableQty"
-    )
-    available = _row_int_optional(
-        position_row, "availCount", "availableCount", "enableQty"
-    )
-    if _avail_raw and available is None:
+    # P0-3（第七轮复审）+ P0-1（第八轮复审）：可卖数量显式为 0
+    # （A 股 T+1：当日买入不可卖）与字段缺失是两种完全不同的情况。
+    # 字段**存在性**检查（而非值非空）：空字符串/null/格式异常都算
+    # "字段存在但不可解析"——一律拒绝，绝不落入"持仓 - 在途"推算
+    # 绕过 T+1 保护（此前空字符串会因 falsy 判断被当作缺失）。
+    _avail_keys = ("availCount", "availableCount", "enableQty")
+    _avail_present = any(key in position_row for key in _avail_keys)
+    available = _row_int_optional(position_row, *_avail_keys)
+    if _avail_present and available is None:
         raise RuntimeError(
-            f"{symbol} 可卖数量字段格式异常（{_avail_raw}），为防止违规"
-            "卖出已阻断本次交易；请核对持仓数据。"
+            f"{symbol} 可卖数量字段存在但格式异常（无法解析为整数），"
+            "为防止违规卖出已阻断本次交易；请核对持仓数据。"
         )
     if available is not None:
         if available < 0:
@@ -1173,6 +1171,13 @@ class MXExecutionService:
                 terminal = order_terminal_status(row)
                 if terminal == "canceled":
                     return "（回查（VERIFIED）：该委托已撤销，撤单确认生效。）"
+                if terminal == "canceled_partial":
+                    # 第八轮复审 P1：部分成交后剩余已撤——撤单确认生效，
+                    # 已成交部分保留为实际持仓变化（与 reconcile 口径一致）。
+                    return (
+                        "（回查（VERIFIED）：未成交部分已撤销，撤单确认生效；"
+                        "已成交部分保留为实际持仓变化。）"
+                    )
                 if terminal == "filled":
                     return "（回查（FILLED）：该委托已全部成交，撤单未生效。）"
                 if terminal in ("submitted", "partially_filled"):
