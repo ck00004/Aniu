@@ -121,6 +121,18 @@ async def app_lifespan(_app: FastAPI):
             trade_intent_service.reconcile_stale_executing_intents()
         except Exception as exc:
             logger.warning("failed to reconcile stale trade intents: %s", exc)
+        # 自选股意图启动恢复（第十三轮复审 P0-3）：遗留 EXECUTING →
+        # UNKNOWN（写请求状态不明，阻塞直到核对），不因重启判 FAILED。
+        try:
+            from app.services.self_select_intent_service import (
+                self_select_intent_service,
+            )
+
+            self_select_intent_service.reconcile_stale_intents()
+        except Exception as exc:
+            logger.warning(
+                "failed to reconcile stale self-select intents: %s", exc
+            )
 
     _run_with_lock_retry("restore_runtime_state", _restore_runtime_state)
     step = _log_step("restore_runtime_state", step)

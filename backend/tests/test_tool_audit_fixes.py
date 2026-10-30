@@ -536,39 +536,49 @@ def test_manage_self_select_add_verified_by_state_readback(monkeypatch, tmp_path
         _reset_db_state()
 
 
-def test_manage_self_select_add_noop_when_already_in_list() -> None:
+def test_manage_self_select_add_noop_when_already_in_list(monkeypatch, tmp_path) -> None:
     """目标已在自选股列表：NOOP，不发送写请求（幂等）。"""
     from skills.mx_core.execution import mx_execution_service
 
-    client = _SelfSelectClient(
-        rows=[{"stockCode": "600519", "stockName": "贵州茅台"}]
-    )
-    result = mx_execution_service.execute_tool(
-        client=client,
-        app_settings=None,
-        tool_name="mx_manage_self_select",
-        arguments={"query": "将600519加入自选股"},
-    )
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        client = _SelfSelectClient(
+            rows=[{"stockCode": "600519", "stockName": "贵州茅台"}]
+        )
+        result = mx_execution_service.execute_tool(
+            client=client,
+            app_settings=None,
+            tool_name="mx_manage_self_select",
+            arguments={"query": "将600519加入自选股"},
+        )
 
-    assert result["ok"] is True
-    assert result["executed_action"]["noop"] is True
-    assert client.manage_calls == []  # 未发送写请求
+        assert result["ok"] is True
+        assert result["executed_action"]["noop"] is True
+        assert client.manage_calls == []  # 未发送写请求
+    finally:
+        _reset_db_state()
 
 
-def test_manage_self_select_remove_noop_when_not_in_list() -> None:
+def test_manage_self_select_remove_noop_when_not_in_list(monkeypatch, tmp_path) -> None:
     from skills.mx_core.execution import mx_execution_service
 
-    client = _SelfSelectClient(rows=[])
-    result = mx_execution_service.execute_tool(
-        client=client,
-        app_settings=None,
-        tool_name="mx_manage_self_select",
-        arguments={"query": "将600519从自选股删除"},
-    )
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        client = _SelfSelectClient(rows=[])
+        result = mx_execution_service.execute_tool(
+            client=client,
+            app_settings=None,
+            tool_name="mx_manage_self_select",
+            arguments={"query": "将600519从自选股删除"},
+        )
 
-    assert result["ok"] is True
-    assert result["executed_action"]["noop"] is True
-    assert client.manage_calls == []
+        assert result["ok"] is True
+        assert result["executed_action"]["noop"] is True
+        assert client.manage_calls == []
+    finally:
+        _reset_db_state()
 
 
 def test_manage_self_select_unverified_state_reports_unknown(monkeypatch, tmp_path) -> None:

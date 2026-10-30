@@ -3295,3 +3295,267 @@ def test_cancel_persist_failure_visible_in_result(monkeypatch, tmp_path) -> None
         assert "人工核对" in result["summary"]
     finally:
         _reset_db_state()
+
+
+# ---------------------------------------------------------------------------
+# 第十三轮复审专项
+# ---------------------------------------------------------------------------
+
+
+def test_add_unknown_blocks_reverse_remove(monkeypatch, tmp_path) -> None:
+    """P0-1：ADD UNKNOWN 后发起 REMOVE → 阻止（反方向也阻塞）。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        from app.services.self_select_intent_service import (
+            self_select_intent_service,
+        )
+
+        # 构造：ADD 意图 UNKNOWN（写请求已发出未确认）
+        intent = self_select_intent_service.check_and_register_intent(
+            symbol="600519", operation="ADD"
+        )
+        self_select_intent_service.mark_unknown(
+            intent.id, "写请求状态不明"
+        )
+
+        # 反方向 REMOVE 也被阻塞
+        with pytest.raises(RuntimeError, match="未确认的自选股操作意图"):
+            self_select_intent_service.check_and_register_intent(
+                symbol="600519", operation="REMOVE"
+            )
+    finally:
+        _reset_db_state()
+
+
+def test_remove_unknown_blocks_reverse_add(monkeypatch, tmp_path) -> None:
+    """P0-1：REMOVE UNKNOWN 后发起 ADD → 阻止。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        from app.services.self_select_intent_service import (
+            self_select_intent_service,
+        )
+
+        intent = self_select_intent_service.check_and_register_intent(
+            symbol="600519", operation="REMOVE"
+        )
+        self_select_intent_service.mark_unknown(intent.id, "状态不明")
+
+        with pytest.raises(RuntimeError, match="未确认的自选股操作意图"):
+            self_select_intent_service.check_and_register_intent(
+                symbol="600519", operation="ADD"
+            )
+    finally:
+        _reset_db_state()
+
+
+def test_add_unknown_blocks_remove_noop_claim(monkeypatch, tmp_path) -> None:
+    """P0-1：ADD UNKNOWN 后 REMOVE 不得直接返回 NOOP_VERIFIED。
+
+    复审场景：10:00 ADD 超时 UNKNOWN → 10:15 REMOVE 判"列表无此股"
+    返回 NOOP → 10:20 ADD 延迟生效 → 用户以为删除成功实际没有。
+    现在 NOOP 判断前先核验开放意图（含反方向）。
+    """
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        from skills.mx_core import execution as mx_execution
+        from app.services.self_select_intent_service import (
+            self_select_intent_service,
+        )
+
+        # ADD 意图 UNKNOWN
+        intent = self_select_intent_service.check_and_register_intent(
+            symbol="600519", operation="ADD"
+        )
+        self_select_intent_service.mark_unknown(
+            intent.id, "写请求已发出但回查失败"
+        )
+
+        # 列表当前无该股（ADD 未生效/延迟）——REMOVE 若先判 NOOP 会
+        # 错误声称"已满足目标状态"；现在被开放意图核验阻断
+        class _EmptyListClient:
+            def get_self_selects(self) -> dict:
+                return {"data": {"rows": []}}
+
+            def manage_self_select(self, query: str) -> dict:
+                raise AssertionError("未确认意图存在时不得发送写请求")
+
+        result = mx_execution.mx_execution_service.execute_tool(
+            client=_EmptyListClient(),
+            app_settings=None,
+            tool_name="mx_manage_self_select",
+            arguments={"query": "将600519从自选股删除"},
+        )
+        assert result["ok"] is False
+        assert "未确认" in str(result.get("error") or "")
+        # 没有 NOOP 声明
+        assert result.get("executed_action") is None
+    finally:
+        _reset_db_state()
+
+
+def test_self_select_write_exception_marks_unknown(monkeypatch, tmp_path) -> None:
+    """P0-2：写请求超时/异常 → 意图进入 UNKNOWN（不卡 EXECUTING）。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        from skills.mx_core import execution as mx_execution
+        from app.services.self_select_intent_service import (
+            self_select_intent_service,
+        )
+
+        class _TimeoutClient:
+            def get_self_selects(self) -> dict:
+                return {"data": {"rows": []}}
+
+            def manage_self_select(self, query: str) -> dict:
+                import httpx
+
+                raise httpx.ReadTimeout("timed out")
+
+        result = mx_execution.mx_execution_service.execute_tool(
+            client=_TimeoutClient(),
+            app_settings=None,
+            tool_name="mx_manage_self_select",
+            arguments={"query": "将600519加入自选股"},
+        )
+        assert result["ok"] is False
+        # 意图为 UNKNOWN（非 EXECUTING）
+        intents = self_select_intent_service.list_intents()
+        assert intents[0].status == "unknown"
+        assert "状态不明" in str(intents[0].note or "")
+    finally:
+        _reset_db_state()
+
+
+def test_self_select_write_rejected_marks_failed(monkeypatch, tmp_path) -> None:
+    """P0-2：明确业务拒绝 → 意图 FAILED（解除阻塞允许重试）。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        from skills.mx_core import execution as mx_execution
+        from skills.mx_core.client import MXBusinessRejected
+        from app.services.self_select_intent_service import (
+            self_select_intent_service,
+        )
+
+        class _RejectedClient:
+            def get_self_selects(self) -> dict:
+                return {"data": {"rows": []}}
+
+            def manage_self_select(self, query: str) -> dict:
+                raise MXBusinessRejected("妙想接口业务错误 code=501: 拒绝")
+
+        result = mx_execution.mx_execution_service.execute_tool(
+            client=_RejectedClient(),
+            app_settings=None,
+            tool_name="mx_manage_self_select",
+            arguments={"query": "将600519加入自选股"},
+        )
+        assert result["ok"] is False
+        intents = self_select_intent_service.list_intents()
+        assert intents[0].status == "failed"
+        # failed 不阻塞：允许重试
+        retry = self_select_intent_service.check_and_register_intent(
+            symbol="600519", operation="ADD"
+        )
+        assert retry.id != intents[0].id
+    finally:
+        _reset_db_state()
+
+
+def test_self_select_startup_recovery(monkeypatch, tmp_path) -> None:
+    """P0-3：启动恢复——遗留 EXECUTING → UNKNOWN。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        from app.services.self_select_intent_service import (
+            self_select_intent_service,
+        )
+
+        intent = self_select_intent_service.check_and_register_intent(
+            symbol="600519", operation="ADD"
+        )
+        # 模拟崩溃：意图停留在 EXECUTING
+
+        recovered = self_select_intent_service.reconcile_stale_intents()
+        assert recovered == 1
+        stored = self_select_intent_service.list_intents()[0]
+        assert stored.status == "unknown"
+        assert "服务重启" in str(stored.note or "")
+    finally:
+        _reset_db_state()
+
+
+def test_name_form_unknown_recovers_by_name(monkeypatch, tmp_path) -> None:
+    """P1：名称形式的 UNKNOWN 通过名称精确匹配恢复。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        from app.services.self_select_intent_service import (
+            self_select_intent_service,
+        )
+
+        # 名称形式的意图（模型只提供名称）
+        intent = self_select_intent_service.check_and_register_intent(
+            symbol="中芯国际", operation="ADD"
+        )
+        self_select_intent_service.mark_unknown(intent.id, "状态不明")
+
+        # 列表已出现该名称 → 目标状态确认 → 解除阻塞
+        unblocked = self_select_intent_service.reconcile_open_intents(
+            symbol="中芯国际",
+            read_state=lambda: (set(), ["中芯国际"]),
+        )
+        assert unblocked is True
+        assert self_select_intent_service.list_intents()[0].status == "verified"
+    finally:
+        _reset_db_state()
+
+
+def test_invoke_tool_executor_signature_forms() -> None:
+    """P1：签名 bind 适配——三参数/关键字/keyword-only/**kwargs 各调用一次。"""
+    from app.services.llm_service import _invoke_tool_executor
+
+    calls = []
+
+    def three_args(name, arguments, tool_call_id):
+        calls.append(("three", name))
+        return {"ok": True, "form": "three"}
+
+    def kw_only(name, arguments, *, tool_call_id=None):
+        calls.append(("kw_only", name))
+        return {"ok": True, "form": "kw_only"}
+
+    def var_kwargs(name, arguments, **kwargs):
+        calls.append(("var_kwargs", name))
+        return {"ok": True, "form": "var_kwargs"}
+
+    def two_args(name, arguments):
+        calls.append(("two", name))
+        return {"ok": True, "form": "two"}
+
+    assert _invoke_tool_executor(three_args, "t", {}, "id-1")["form"] == "three"
+    assert _invoke_tool_executor(kw_only, "t", {}, "id-1")["form"] == "kw_only"
+    assert _invoke_tool_executor(var_kwargs, "t", {}, "id-1")["form"] == "var_kwargs"
+    assert _invoke_tool_executor(two_args, "t", {}, "id-1")["form"] == "two"
+    # 每种签名只调用一次
+    assert len(calls) == 4
+
+
+def test_invoke_tool_executor_internal_error_not_retried() -> None:
+    """P1：回调内部 TypeError 只执行一次（bind 在调用前完成）。"""
+    from app.services.llm_service import _invoke_tool_executor
+
+    call_count = {"value": 0}
+
+    def flaky(name, arguments, tool_call_id):
+        del name, arguments, tool_call_id
+        call_count["value"] += 1
+        raise TypeError("响应处理内部异常")
+
+    with pytest.raises(TypeError):
+        _invoke_tool_executor(flaky, "t", {}, "id-1")
+    assert call_count["value"] == 1  # 只执行一次，无重试

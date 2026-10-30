@@ -804,7 +804,12 @@ class MXExecutionService:
             )
 
     def _handle_manage_self_select_unlocked(
-        self, *, client: MXClient, app_settings: Any, arguments: dict[str, Any]
+        self,
+        *,
+        client: MXClient,
+        app_settings: Any,
+        arguments: dict[str, Any],
+        run_id: int | None = None,
     ) -> dict[str, Any]:
         query = self._resolve_query(arguments, app_settings)
         self._ensure_single_self_select_target(query)
@@ -833,6 +838,26 @@ class MXExecutionService:
                 "为防止基于错误状态的写操作，本次新增/删除请求已被拒绝；"
                 "请先调用 mx_get_self_selects 确认列表可正常读取后再操作。"
             )
+        # 第十三轮复审 P0-1：NOOP 判断之前先核验同标的全部开放意图
+        #（含反方向）——未确认的 ADD 不得被 REMOVE 的 NOOP 判断覆盖
+        #（ADD UNKNOWN → REMOVE 判"列表无此股"→ NOOP → ADD 延迟生效
+        # → 用户以为删除成功实际没有）。
+        from app.services.self_select_intent_service import (
+            self_select_intent_service,
+        )
+
+        target_key = code or name
+        unblocked = self_select_intent_service.reconcile_open_intents(
+            symbol=target_key,
+            read_state=lambda: self._read_self_select_state(client),
+        )
+        if not unblocked:
+            raise RuntimeError(
+                f"{target_key} 存在未确认的自选股操作意图且目标状态尚未"
+                "确认，为防止重复写请求已阻断本次操作；请先调用 "
+                "mx_get_self_selects 核对列表状态。"
+            )
+
         in_list = self._target_in_state(code, name, current)
         if (operation == "ADD" and in_list) or (
             operation == "REMOVE" and not in_list
@@ -854,32 +879,32 @@ class MXExecutionService:
                 },
             }
 
-        # 第十二轮复审 P1-1：注册持久化操作意图——UNKNOWN 跨轮阻塞
-        # 同标的同方向的重复写请求（此前 UNKNOWN 只存在于本轮模型
-        # 输出，下一轮任务会重复发送 ADD/REMOVE）。
-        from app.services.self_select_intent_service import (
-            self_select_intent_service,
-        )
-
-        target_key = code or name
-        # 先核对历史 UNKNOWN：目标状态已确认则解除阻塞
-        unblocked = self_select_intent_service.reconcile_unknown_intent(
-            symbol=target_key,
-            operation=operation,
-            read_state=lambda: self._read_self_select_state(client),
-        )
-        if not unblocked:
-            raise RuntimeError(
-                f"{target_key} 存在未确认的 {operation} 操作意图且目标状态"
-                "尚未确认，为防止重复写请求已阻断本次操作；请先调用 "
-                "mx_get_self_selects 核对列表状态。"
-            )
+        # 注册持久化意图 + 写请求异常分类（P0-2）
         ss_intent = self_select_intent_service.check_and_register_intent(
             symbol=target_key,
             operation=operation,
+            run_id=run_id,
         )
 
-        result = client.manage_self_select(query)
+        try:
+            result = client.manage_self_select(query)
+        except Exception as exc:  # noqa: BLE001
+            # 写请求异常分类（与交易 handler 同口径）：
+            # 明确业务拒绝 → FAILED（解除阻塞允许重试）；
+            # 超时/传输中断/响应不确定/未分类 → UNKNOWN（阻塞）。
+            from skills.mx_core.client import MXBusinessRejected
+
+            if isinstance(exc, MXBusinessRejected):
+                self_select_intent_service.mark_failed(
+                    ss_intent.id, f"远端明确拒绝：{exc}"
+                )
+            else:
+                self_select_intent_service.mark_unknown(
+                    ss_intent.id,
+                    f"写请求状态不明（{type(exc).__name__}）：{exc}，"
+                    "确认前不得重复提交",
+                )
+            raise
         self_select_intent_service.mark_submitted(ss_intent.id)
 
         verified = self._read_self_select_state(client)

@@ -450,6 +450,38 @@ def _safe_json_dumps(payload: Any) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
+def _invoke_tool_executor(
+    tool_executor: Callable[..., Any],
+    tool_name: str,
+    arguments: dict[str, Any],
+    tool_call_id: str | None,
+) -> Any:
+    """按签名 bind 确定调用形态后执行一次工具回调（十三轮复审 P1）。
+
+    优先级：三位置参数 → 关键字 tool_call_id → 二参数。bind 失败的
+    TypeError 发生在真正调用之前，回调本身只执行一次。
+    """
+    import inspect as _inspect
+
+    signature = _inspect.signature(tool_executor)
+    # bind 与执行必须分离：若执行在 try 内，回调内部的 TypeError 会
+    # 被误判为"签名不匹配"而落入下一形态二次执行（复审警告的模式）。
+    try:
+        signature.bind(tool_name, arguments, tool_call_id)
+        call_args = (tool_name, arguments, tool_call_id)
+        call_kwargs: dict[str, Any] = {}
+    except TypeError:
+        try:
+            signature.bind(tool_name, arguments, tool_call_id=tool_call_id)
+            call_args = (tool_name, arguments)
+            call_kwargs = {"tool_call_id": tool_call_id}
+        except TypeError:
+            signature.bind(tool_name, arguments)
+            call_args = (tool_name, arguments)
+            call_kwargs = {}
+    return tool_executor(*call_args, **call_kwargs)
+
+
 def _slim_tool_result(tool_result: dict[str, Any]) -> dict[str, Any]:
     """Pass raw tool payloads to the model while keeping minimal metadata.
 
@@ -1119,27 +1151,16 @@ class LLMService:
                     arguments=arguments,
                     status="running",
                 )
-                # 第十二轮复审 P1：执行前用签名判断回调参数形态——
-                # 原实现捕获全部 TypeError 后重试整个回调，会把"写请求
-                # 已发出后本地处理响应时的 TypeError"误判为参数不匹配
-                # 而二次执行（重复写请求）。
-                import inspect as _inspect
-
-                _executor_params = _inspect.signature(tool_executor).parameters
-                _accepts_tool_call_id = any(
-                    param.kind == _inspect.Parameter.VAR_POSITIONAL
-                    or param.kind == _inspect.Parameter.VAR_KEYWORD
-                    or param.name == "tool_call_id"
-                    for param in _executor_params.values()
+                # 第十二/十三轮复审 P1：执行前用 signature.bind 确定调用
+                # 形态（三位置参数 / 关键字 tool_call_id / 二参数）——
+                # 原实现捕获 TypeError 后重试整个回调会重复执行写请求；
+                # 简单参数名判断又无法处理 **kwargs / keyword-only 签名。
+                tool_result = _invoke_tool_executor(
+                    tool_executor,
+                    tool_name,
+                    arguments,
+                    tool_call.get("id"),
                 )
-                if _accepts_tool_call_id:
-                    tool_result = tool_executor(
-                        tool_name,
-                        arguments,
-                        tool_call.get("id"),
-                    )
-                else:
-                    tool_result = tool_executor(tool_name, arguments)  # type: ignore[misc, call-arg]
                 _emit(
                     "tool_call",
                     phase="llm",

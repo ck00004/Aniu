@@ -63,11 +63,14 @@ class SelfSelectIntentService:
             raise RuntimeError(f"自选股操作只能是 ADD 或 REMOVE：{operation}")
 
         with session_scope() as db:
+            # 第十三轮复审 P0-1：同标的**任一方向**的开放意图都阻塞——
+            # 未确认的 ADD 不得被 REMOVE 覆盖（反之亦然）。否则：
+            # ADD UNKNOWN → REMOVE 判 NOOP（列表暂无该股）→ ADD 延迟
+            # 生效 → 用户以为删除成功实际没有。
             open_intents = list(
                 db.scalars(
                     select(SelfSelectIntent).where(
                         SelfSelectIntent.symbol == normalized_symbol,
-                        SelfSelectIntent.operation == normalized_op,
                         SelfSelectIntent.status.in_(_OPEN_STATUSES),
                     )
                 ).all()
@@ -75,10 +78,11 @@ class SelfSelectIntentService:
             if open_intents:
                 latest = open_intents[-1]
                 raise RuntimeError(
-                    f"{normalized_symbol} 存在未确认的 {normalized_op} 操作意图"
-                    f"（状态 {latest.status}，{latest.request_time} 发起）。"
-                    "写请求可能已提交但未获回查确认，禁止重复发送；"
-                    "请先调用 mx_get_self_selects 核对当前列表状态。"
+                    f"{normalized_symbol} 存在未确认的自选股操作意图"
+                    f"（{latest.operation}，状态 {latest.status}，"
+                    f"{latest.request_time} 发起）。写请求可能已提交但未获"
+                    "回查确认，禁止同标的任何方向的重复操作；请先调用 "
+                    "mx_get_self_selects 核对当前列表状态。"
                 )
 
             intent = SelfSelectIntent(
@@ -152,6 +156,64 @@ class SelfSelectIntentService:
             intent.updated_at = _now_utc()
             db.add(intent)
 
+    def reconcile_open_intents(
+        self,
+        *,
+        symbol: str,
+        read_state: Callable[[], tuple[set[str], list[str]] | None],
+    ) -> bool:
+        """核对同标的全部开放意图（含反方向）；全部确认后解除阻塞。
+
+        第十三轮复审 P0-1：NOOP 判断前必须先处理所有未完成意图。
+        read_state：读取自选股列表的回调（返回 (codes, names) 或 None）。
+        返回 True 表示该标的已无开放意图（可继续本轮操作）。
+        """
+        normalized_symbol = _normalize_symbol(symbol)
+
+        with session_scope() as db:
+            open_intents = list(
+                db.scalars(
+                    select(SelfSelectIntent).where(
+                        SelfSelectIntent.symbol == normalized_symbol,
+                        SelfSelectIntent.status.in_(_OPEN_STATUSES),
+                    )
+                ).all()
+            )
+            if not open_intents:
+                return True
+
+        state = read_state()
+        if state is None:
+            # 列表不可读：开放意图继续阻塞
+            return False
+        codes, names = state
+        # 名称形式的意图：按名称精确匹配判断在列状态
+        is_code = normalized_symbol.isdigit()
+        if is_code:
+            in_list = normalized_symbol in codes
+        else:
+            in_list = any(
+                row_name.strip() == normalized_symbol for row_name in names
+            )
+
+        with session_scope() as db:
+            all_confirmed = True
+            for intent in open_intents:
+                achieved = (
+                    intent.operation == "ADD" and in_list
+                ) or (intent.operation == "REMOVE" and not in_list)
+                if achieved:
+                    intent.status = "verified"
+                    intent.verified_at = _now_utc()
+                    intent.note = "经重新读取确认目标状态已达成"
+                    intent.updated_at = _now_utc()
+                    db.add(intent)
+                else:
+                    # 目标状态未确认：保持开放（阻塞）
+                    all_confirmed = False
+            return all_confirmed
+
+    # 兼容旧名
     def reconcile_unknown_intent(
         self,
         *,
@@ -159,49 +221,34 @@ class SelfSelectIntentService:
         operation: str,
         read_state: Callable[[], tuple[set[str], list[str]] | None],
     ) -> bool:
-        """核对 UNKNOWN 意图：目标状态已确认 → verified（解除阻塞）。
+        return self.reconcile_open_intents(symbol=symbol, read_state=read_state)
 
-        read_state：读取自选股列表的回调（返回 (codes, names) 或 None）。
-        返回 True 表示该标的+方向已解除阻塞（可继续本轮操作）。
+    def reconcile_stale_intents(self) -> int:
+        """启动恢复（第十三轮复审 P0-3）：
+
+        - 遗留 EXECUTING → UNKNOWN（写请求状态不明，阻塞直到核对）；
+        - 遗留 SUBMITTED → 保持（下一轮操作前的 reconcile 会重新核验）。
+        不能仅因进程重启判定 FAILED。
         """
-        normalized_symbol = _normalize_symbol(symbol)
-        normalized_op = str(operation or "").strip().upper()
-
         with session_scope() as db:
-            unknowns = list(
+            stale = list(
                 db.scalars(
                     select(SelfSelectIntent).where(
-                        SelfSelectIntent.symbol == normalized_symbol,
-                        SelfSelectIntent.operation == normalized_op,
-                        SelfSelectIntent.status == "unknown",
+                        SelfSelectIntent.status == "executing"
                     )
                 ).all()
             )
-            if not unknowns:
-                return True
-
-        state = read_state()
-        if state is None:
-            # 列表仍不可读：UNKNOWN 继续阻塞
-            return False
-        codes, _names = state
-        in_list = normalized_symbol in codes
-        achieved = (normalized_op == "ADD" and in_list) or (
-            normalized_op == "REMOVE" and not in_list
-        )
-        if not achieved:
-            # 目标状态未确认（例如 ADD 后列表仍无该标的——可能未生效
-            # 或列表延迟）：保持 UNKNOWN 阻塞，等待人工核验
-            return False
-
-        with session_scope() as db:
-            for intent in unknowns:
-                intent.status = "verified"
-                intent.verified_at = _now_utc()
-                intent.note = "UNKNOWN 经重新读取确认目标状态已达成"
+            for intent in stale:
+                intent.status = "unknown"
+                intent.note = "服务重启：写请求状态不明，已收敛为 unknown 等待核对"
                 intent.updated_at = _now_utc()
                 db.add(intent)
-        return True
+            if stale:
+                logger.warning(
+                    "reconciled %s stale self-select intents to unknown",
+                    len(stale),
+                )
+            return len(stale)
 
     def list_intents(
         self, *, symbol: str | None = None, limit: int = 50

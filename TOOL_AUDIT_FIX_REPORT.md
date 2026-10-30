@@ -636,6 +636,47 @@ agent loop TypeError 单次执行、撤单持久化失败可见性。
 
 **全量回归：后端 474 passed，前端 86 passed，vue-tsc/build 通过。**
 
+### 第十五轮：第十三轮复审 P0×3 + P1 修复（2026-10-30 第十三次外部复审）
+
+**P0-1 双向阻塞 + NOOP 顺序**：
+- `check_and_register_intent` 改为同标的**任一方向**的开放意图都阻塞——
+  复审场景（ADD UNKNOWN → REMOVE 判"列表无此股"返回 NOOP_VERIFIED →
+  ADD 延迟生效 → 用户以为删除成功实际没有）从两个层面堵住：
+- handler 执行顺序调整：**NOOP 判断之前先核验同标的全部开放意图**
+  （含反方向）——未确认的 ADD 不得被 REMOVE 的 NOOP 判断覆盖。
+- `reconcile_unknown_intent` 升级为 `reconcile_open_intents`（双向核对）。
+
+**P0-2 写请求异常分类持久化**：`client.manage_self_select` 包异常
+分类——明确业务拒绝（MXBusinessRejected）→ FAILED（解除阻塞允许
+重试）；超时/传输中断/未分类 → UNKNOWN（阻塞）。原实现无异常处理，
+超时后意图永久卡在 EXECUTING（reconcile 只查 UNKNOWN）。
+
+**P0-3 启动恢复**：`main.py` 接入 `self_select_intent_service.
+reconcile_stale_intents()`——遗留 EXECUTING → UNKNOWN（写请求状态
+不明，阻塞直到核对），不因重启判 FAILED；SUBMITTED 保持，下一轮
+操作前的 reconcile 会重新核验。
+
+**P1 四项**：
+- 名称形式意图的恢复：`reconcile_open_intents` 按意图标识形态
+  （代码/名称）分别与 codes/names 精确匹配（名称意图不再因与
+  六位代码集合比较而永远无法解除）。源头统一解析为代码属策略
+  语义（需行情/基础信息工具配合），记为后续项。
+- run_id 贯通到自选股意图（handler 签名 + 注册传参）。
+- `_invoke_tool_executor`（生产代码独立函数，测试直接调用）：
+  signature.bind 确定调用形态（三位置参数/关键字 tool_call_id/
+  二参数），**bind 与执行分离**——bind 的 TypeError 在调用前发生，
+  回调内部异常不会被误判为签名不匹配而二次执行（实现时踩过这个
+  坑：bind+执行同 try 会让执行异常落入下一形态重试，测试抓出后分离）。
+- 测试真实调用生产代码（不再自证）。
+
+**第十三轮专项测试**（新增 9 个）：ADD/REMOVE UNKNOWN 双向阻塞、
+ADD UNKNOWN 阻止 REMOVE NOOP 声明（E2E）、写超时→UNKNOWN、明确拒绝
+→FAILED+允许重试、启动恢复 EXECUTING→UNKNOWN、名称意图恢复、
+四种签名形态各调用一次、回调内部 TypeError 只执行一次。
+另 2 个 NOOP 测试接入意图表（NOOP 前核验需要 DB）。
+
+**全量回归：后端 483 passed，前端 86 passed，vue-tsc/build 通过。**
+
 ### 已知边界（如实记录）
 
 - signal_id 是日级标识（交易日+标的+方向），45 分钟冷却放行第二档
