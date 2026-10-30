@@ -677,6 +677,32 @@ ADD UNKNOWN 阻止 REMOVE NOOP 声明（E2E）、写超时→UNKNOWN、明确拒
 
 **全量回归：后端 483 passed，前端 86 passed，vue-tsc/build 通过。**
 
+### 第十六轮：第十四轮复审 P0（TOCTOU）+ P1（run_id 贯通）（2026-10-30 第十四次外部复审）
+
+**P0 TOCTOU 修复**（复审"确保 reconcile 后的状态与随后决策使用同一份
+最新快照"）：`reconcile_open_intents` 返回结构化 `(是否解除, 最新状态)`——
+
+- 有开放意图且已核验：返回**本次核验读取的最新快照**，handler 用它
+  做 NOOP/写决策（不再使用核验前的旧快照）；
+- 无开放意图：不重读（调用方刚读过，重读徒增远端请求与失败面），
+  返回 None 表示沿用调用方快照；
+- 复审场景（T1 预读无股票 → T2 远端 ADD 延迟生效 → T3 reconcile
+  读到股票、旧意图 VERIFIED → T4 旧快照会重复发送 ADD）：现在基于
+  T3 快照判 NOOP，不发送。反向场景（预读股票存在 → REMOVE 延迟
+  生效 → 新 ADD 基于旧快照会错误 NOOP）：现在真实执行 ADD。
+
+**P1 run_id 贯通**：外层 `_handle_manage_self_select` 包装接收并传递
+run_id（execute_tool 的签名判断看外层——漏传会让内部拿到 None）。
+主执行路径（execute_plan → mx execute_tool(run_id) → handler →
+SelfSelectIntent.run_id）全链路打通，数据库测试验证 run_id=42 落库。
+聊天路径（无 run）run_id 为 None，属预期。
+
+**第十四轮专项测试**（新增 3 个）：延迟生效 ADD → 基于最新快照 NOOP
+（不重复发送）、REMOVE 延迟生效 → 新 ADD 真实执行（不错误 NOOP）、
+run_id 贯通落库。另 2 个测试适配结构化返回。
+
+**全量回归：后端 486 passed，前端 86 passed，vue-tsc/build 通过。**
+
 ### 已知边界（如实记录）
 
 - signal_id 是日级标识（交易日+标的+方向），45 分钟冷却放行第二档

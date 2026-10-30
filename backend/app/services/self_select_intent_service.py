@@ -161,12 +161,14 @@ class SelfSelectIntentService:
         *,
         symbol: str,
         read_state: Callable[[], tuple[set[str], list[str]] | None],
-    ) -> bool:
-        """核对同标的全部开放意图（含反方向）；全部确认后解除阻塞。
+    ) -> tuple[bool, tuple[set[str], list[str]] | None]:
+        """核对同标的全部开放意图（含反方向）；返回 (是否解除, 最新状态)。
 
         第十三轮复审 P0-1：NOOP 判断前必须先处理所有未完成意图。
-        read_state：读取自选股列表的回调（返回 (codes, names) 或 None）。
-        返回 True 表示该标的已无开放意图（可继续本轮操作）。
+        第十四轮复审 P0（TOCTOU）：返回**本次核验读取的最新状态**——
+        调用方必须用这份快照做 NOOP/写决策，不得继续使用核验前的
+        旧快照（否则旧意图刚被确认解除、新操作仍按旧状态重复发送）。
+        无开放意图时也返回 read_state 的结果（供调用方统一取状态）。
         """
         normalized_symbol = _normalize_symbol(symbol)
 
@@ -179,13 +181,15 @@ class SelfSelectIntentService:
                     )
                 ).all()
             )
-            if not open_intents:
-                return True
 
+        if not open_intents:
+            # 无开放意图：不重读（调用方刚读过，重读徒增远端请求与
+            # 失败面），返回 None 表示"沿用调用方的快照"。
+            return (True, None)
         state = read_state()
         if state is None:
             # 列表不可读：开放意图继续阻塞
-            return False
+            return (False, None)
         codes, names = state
         # 名称形式的意图：按名称精确匹配判断在列状态
         is_code = normalized_symbol.isdigit()
@@ -211,7 +215,7 @@ class SelfSelectIntentService:
                 else:
                     # 目标状态未确认：保持开放（阻塞）
                     all_confirmed = False
-            return all_confirmed
+            return (all_confirmed, state)
 
     # 兼容旧名
     def reconcile_unknown_intent(
@@ -220,7 +224,8 @@ class SelfSelectIntentService:
         symbol: str,
         operation: str,
         read_state: Callable[[], tuple[set[str], list[str]] | None],
-    ) -> bool:
+    ) -> tuple[bool, tuple[set[str], list[str]] | None]:
+        del operation  # 双向核验不再按方向过滤
         return self.reconcile_open_intents(symbol=symbol, read_state=read_state)
 
     def reconcile_stale_intents(self) -> int:

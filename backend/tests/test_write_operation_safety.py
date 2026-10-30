@@ -3504,12 +3504,13 @@ def test_name_form_unknown_recovers_by_name(monkeypatch, tmp_path) -> None:
         )
         self_select_intent_service.mark_unknown(intent.id, "状态不明")
 
-        # 列表已出现该名称 → 目标状态确认 → 解除阻塞
-        unblocked = self_select_intent_service.reconcile_open_intents(
+        # 列表已出现该名称 → 目标状态确认 → 解除阻塞（返回最新状态）
+        unblocked, fresh = self_select_intent_service.reconcile_open_intents(
             symbol="中芯国际",
             read_state=lambda: (set(), ["中芯国际"]),
         )
         assert unblocked is True
+        assert "中芯国际" in fresh[1]
         assert self_select_intent_service.list_intents()[0].status == "verified"
     finally:
         _reset_db_state()
@@ -3559,3 +3560,189 @@ def test_invoke_tool_executor_internal_error_not_retried() -> None:
     with pytest.raises(TypeError):
         _invoke_tool_executor(flaky, "t", {}, "id-1")
     assert call_count["value"] == 1  # 只执行一次，无重试
+
+
+# ---------------------------------------------------------------------------
+# 第十四轮复审专项（TOCTOU + run_id 贯通）
+# ---------------------------------------------------------------------------
+
+
+def test_reconcile_uses_fresh_state_for_noop_decision(monkeypatch, tmp_path) -> None:
+    """P0（TOCTOU）：延迟生效的 ADD 在 reconcile 时被确认 → 新 ADD
+    必须基于**核验读取的最新快照**判 NOOP，不得重复发送。
+
+    复审场景：T1 第一次读取（无股票）→ T2 远端 ADD 延迟生效 →
+    T3 reconcile 第二次读取（股票已出现，旧意图 VERIFIED）→
+    T4 若用旧快照会再次发送 ADD（重复写请求）。
+    """
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        from skills.mx_core import execution as mx_execution
+        from app.services.self_select_intent_service import (
+            self_select_intent_service,
+        )
+
+        # 构造：历史 ADD 意图 UNKNOWN
+        old_intent = self_select_intent_service.check_and_register_intent(
+            symbol="600519", operation="ADD"
+        )
+        self_select_intent_service.mark_unknown(
+            old_intent.id, "写请求已发出但回查失败"
+        )
+
+        # 有状态客户端：第一次读取（handler 预读）无股票；
+        # 第二次读取（reconcile）股票已出现（延迟生效）
+        read_count = {"value": 0}
+
+        class _DelayedEffectClient:
+            def get_self_selects(self) -> dict:
+                read_count["value"] += 1
+                if read_count["value"] <= 1:
+                    return {"data": {"rows": []}}  # 预读：无股票
+                return {  # reconcile 及之后：股票已出现
+                    "data": {
+                        "rows": [
+                            {"stockCode": "600519", "stockName": "贵州茅台"}
+                        ]
+                    }
+                }
+
+            def manage_self_select(self, query: str) -> dict:
+                raise AssertionError(
+                    "目标状态已达成（最新快照），不得重复发送写请求"
+                )
+
+        result = mx_execution.mx_execution_service.execute_tool(
+            client=_DelayedEffectClient(),
+            app_settings=None,
+            tool_name="mx_manage_self_select",
+            arguments={"query": "将600519加入自选股"},
+        )
+
+        # 基于最新快照：已在列表 → NOOP（不发送写请求）
+        assert result["ok"] is True
+        assert result["executed_action"]["noop"] is True
+        # 旧意图被确认为 VERIFIED
+        assert (
+            self_select_intent_service.list_intents()[0].status == "verified"
+        )
+    finally:
+        _reset_db_state()
+
+
+def test_reconcile_fresh_state_prevents_stale_noop(monkeypatch, tmp_path) -> None:
+    """P0（TOCTOU 反向）：第一次读取股票存在 → REMOVE 在 reconcile 时
+    被确认 → 新 ADD 不得基于旧快照判 NOOP（实际已被移除）。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        from skills.mx_core import execution as mx_execution
+        from app.services.self_select_intent_service import (
+            self_select_intent_service,
+        )
+
+        # 历史 REMOVE 意图 UNKNOWN
+        old_intent = self_select_intent_service.check_and_register_intent(
+            symbol="600519", operation="REMOVE"
+        )
+        self_select_intent_service.mark_unknown(
+            old_intent.id, "写请求已发出但回查失败"
+        )
+
+        read_count = {"value": 0}
+
+        class _RemovedClient:
+            def __init__(self) -> None:
+                self.manage_calls: list[str] = []
+
+            def get_self_selects(self) -> dict:
+                read_count["value"] += 1
+                if read_count["value"] <= 1:
+                    # 预读：股票仍存在（REMOVE 延迟未生效）
+                    return {
+                        "data": {
+                            "rows": [
+                                {"stockCode": "600519", "stockName": "贵州茅台"}
+                            ]
+                        }
+                    }
+                if self.manage_calls:
+                    # 新 ADD 已执行：股票重新加入
+                    return {
+                        "data": {
+                            "rows": [
+                                {"stockCode": "600519", "stockName": "贵州茅台"}
+                            ]
+                        }
+                    }
+                # reconcile：REMOVE 已生效，股票已移除
+                return {"data": {"rows": []}}
+
+            def manage_self_select(self, query: str) -> dict:
+                # 新 ADD 应该真实执行（股票已被移除，不在列表）
+                self.manage_calls.append(query)
+                return {"code": "200", "message": "成功"}
+
+        result = mx_execution.mx_execution_service.execute_tool(
+            client=_RemovedClient(),
+            app_settings=None,
+            tool_name="mx_manage_self_select",
+            arguments={"query": "将600519加入自选股"},
+        )
+
+        # 基于最新快照：不在列表 → 真实执行 ADD（不是基于旧快照的 NOOP）
+        assert result["ok"] is True
+        assert result.get("executed_action", {}).get("noop") is not True
+        assert "回查确认" in result["summary"]
+    finally:
+        _reset_db_state()
+
+
+def test_run_id_persisted_to_self_select_intent(monkeypatch, tmp_path) -> None:
+    """P1：run_id 贯通——execute_tool(run_id=N) → SelfSelectIntent.run_id=N。
+
+    验证外层包装（签名判断看到的函数）正确传递 run_id 到内部与意图。
+    """
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        from skills.mx_core import execution as mx_execution
+        from app.services.self_select_intent_service import (
+            self_select_intent_service,
+        )
+
+        class _AddClient:
+            def get_self_selects(self) -> dict:
+                # 预读空列表 → ADD 执行 → 回查时已加入
+                if not self.manage_calls:
+                    return {"data": {"rows": []}}
+                return {
+                    "data": {
+                        "rows": [
+                            {"stockCode": "600519", "stockName": "贵州茅台"}
+                        ]
+                    }
+                }
+
+            def __init__(self) -> None:
+                self.manage_calls: list[str] = []
+
+            def manage_self_select(self, query: str) -> dict:
+                self.manage_calls.append(query)
+                return {"code": "200", "message": "成功"}
+
+        result = mx_execution.mx_execution_service.execute_tool(
+            client=_AddClient(),
+            app_settings=None,
+            tool_name="mx_manage_self_select",
+            arguments={"query": "将600519加入自选股"},
+            run_id=42,
+        )
+        assert result["ok"] is True
+
+        intents = self_select_intent_service.list_intents()
+        assert len(intents) == 1
+        assert intents[0].run_id == 42  # 贯通到数据库
+    finally:
+        _reset_db_state()

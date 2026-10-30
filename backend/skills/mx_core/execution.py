@@ -796,11 +796,21 @@ class MXExecutionService:
         }
 
     def _handle_manage_self_select(
-        self, *, client: MXClient, app_settings: Any, arguments: dict[str, Any]
+        self,
+        *,
+        client: MXClient,
+        app_settings: Any,
+        arguments: dict[str, Any],
+        run_id: int | None = None,
     ) -> dict[str, Any]:
+        # 第十四轮复审 P1：外层包装必须接收并传递 run_id——
+        # execute_tool 的签名判断看的是外层，漏传会让内部拿到 None。
         with _SELF_SELECT_OP_LOCK:
             return self._handle_manage_self_select_unlocked(
-                client=client, app_settings=app_settings, arguments=arguments
+                client=client,
+                app_settings=app_settings,
+                arguments=arguments,
+                run_id=run_id,
             )
 
     def _handle_manage_self_select_unlocked(
@@ -839,15 +849,16 @@ class MXExecutionService:
                 "请先调用 mx_get_self_selects 确认列表可正常读取后再操作。"
             )
         # 第十三轮复审 P0-1：NOOP 判断之前先核验同标的全部开放意图
-        #（含反方向）——未确认的 ADD 不得被 REMOVE 的 NOOP 判断覆盖
-        #（ADD UNKNOWN → REMOVE 判"列表无此股"→ NOOP → ADD 延迟生效
-        # → 用户以为删除成功实际没有）。
+        #（含反方向）——未确认的 ADD 不得被 REMOVE 的 NOOP 判断覆盖。
+        # 第十四轮复审 P0（TOCTOU）：核验返回**本次读取的最新状态**，
+        # NOOP/写决策必须基于这份快照——不得继续用核验前的 current
+        # （否则旧意图刚确认解除、新操作按旧状态重复发送）。
         from app.services.self_select_intent_service import (
             self_select_intent_service,
         )
 
         target_key = code or name
-        unblocked = self_select_intent_service.reconcile_open_intents(
+        unblocked, fresh_state = self_select_intent_service.reconcile_open_intents(
             symbol=target_key,
             read_state=lambda: self._read_self_select_state(client),
         )
@@ -857,6 +868,10 @@ class MXExecutionService:
                 "确认，为防止重复写请求已阻断本次操作；请先调用 "
                 "mx_get_self_selects 核对列表状态。"
             )
+        if fresh_state is not None:
+            # 有开放意图且已核验：用核验读取的最新快照（TOCTOU 修复）
+            current = fresh_state
+        # fresh_state 为 None 表示无开放意图——沿用开头的快照即可
 
         in_list = self._target_in_state(code, name, current)
         if (operation == "ADD" and in_list) or (
