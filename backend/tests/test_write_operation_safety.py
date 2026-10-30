@@ -2468,7 +2468,7 @@ def test_avail_count_invalid_format_rejects_sell() -> None:
         def get_orders(self) -> dict:
             return {"data": {"orders": []}}
 
-    with pytest.raises(RuntimeError, match="可卖数量字段存在但格式异常"):
+    with pytest.raises(RuntimeError, match="可卖数量字段 availCount 存在但格式异常"):
         preflight_trade(
             client=_BadAvailClient(),
             action="SELL",
@@ -2833,3 +2833,148 @@ def test_avail_alias_conflict_rejects_sell() -> None:
             price_type="MARKET",
             price=None,
         )
+
+
+def test_avail_alias_partial_invalid_rejects_sell() -> None:
+    """第十轮复审 P1：availCount=500 + availableCount="abc" → 拒绝。
+
+    原实现只把可解析的别名放入冲突集合，部分异常字段被静默跳过。
+    """
+    from skills.mx_core.execution import preflight_trade
+
+    class _PartialInvalidClient:
+        def get_positions(self) -> dict:
+            return {
+                "data": {
+                    "posList": [
+                        {
+                            "stockCode": "600519",
+                            "count": 1000,
+                            "availCount": 500,
+                            "availableCount": "abc",
+                        }
+                    ]
+                }
+            }
+
+        def get_orders(self) -> dict:
+            return {"data": {"orders": []}}
+
+    with pytest.raises(RuntimeError, match="availableCount 存在但格式异常"):
+        preflight_trade(
+            client=_PartialInvalidClient(),
+            action="SELL",
+            symbol="600519",
+            quantity=100,
+            price_type="MARKET",
+            price=None,
+        )
+
+
+def test_cancel_handler_uses_dedicated_intent_submit_method(
+    monkeypatch, tmp_path
+) -> None:
+    """第十轮复审 P0-2 E2E：真实调用 _handle_moni_cancel 成功路径。
+
+    完整链路：BUY 意图绑定 ORD-100 → 撤单接口返回 orderID=ORD-100 →
+    handler 调用 mark_cancel_intent_submitted（不写 provider_order_id，
+    无唯一约束冲突、无 AttributeError）→ 撤单意图 SUBMITTED →
+    回查结果与远端订单状态一致。
+    """
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        from skills.mx_core import execution as mx_execution
+
+        monkeypatch.setattr(mx_execution, "is_market_open", lambda: True)
+
+        # 有状态 mock：撤单前 ORD-100 待撤（预检通过），撤单后变已撤销
+        remote_orders = [
+            {
+                "stockCode": "600519",
+                "orderDrt": "1",
+                "orderStatus": "1",  # 待撤
+                "orderCount": 100,
+                "dealCount": 0,
+                "orderID": "ORD-100",
+            }
+        ]
+
+        class _CancelClient:
+            def get_orders(self) -> dict:
+                return {"data": {"orders": remote_orders}}
+
+            def cancel_order(self, *, cancel_type, order_id, stock_code):
+                # 撤单成功：远端状态变为已撤销；响应返回原委托编号
+                remote_orders[0]["orderStatus"] = "3"
+                return {
+                    "code": "200",
+                    "message": "成功",
+                    "data": {"orderID": order_id},
+                }
+
+        # 1. 创建 BUY 意图并绑定 ORD-100
+        client = _CancelClient()
+        buy = trade_intent_service.check_and_register_trade_intent(
+            client=client, symbol="600519", side="BUY", quantity=100
+        )
+        trade_intent_service.mark_intent_submitted(buy.id, "ORD-100")
+
+        # 2. 真实执行 _handle_moni_cancel（handler 自行注册 CANCEL 意图）
+        result = mx_execution.mx_execution_service.execute_tool(
+            client=client,
+            app_settings=None,
+            tool_name="mx_moni_cancel",
+            arguments={
+                "cancel_type": "order",
+                "order_id": "ORD-100",
+                "stock_code": "600519",
+            },
+        )
+
+        # 3. 无 AttributeError，撤单工具成功
+        assert result["ok"] is True
+        assert "已提交撤单请求" in result["summary"]
+        # 4. 回查结果与远端状态一致（撤单后已撤销 → VERIFIED）
+        assert "VERIFIED" in result["summary"]
+
+        # 5. BUY 意图的 provider_order_id 不变
+        assert _list_intents(id=buy.id)[0].provider_order_id == "ORD-100"
+        # 6. handler 注册的 CANCEL 意图进入 SUBMITTED，
+        #    未写 provider_order_id（无唯一约束冲突）
+        cancel_intents = [
+            item for item in _list_intents() if item.side == "CANCEL"
+        ]
+        assert len(cancel_intents) == 1
+        cancel_stored = cancel_intents[0]
+        assert cancel_stored.symbol == "ORD-100"  # 原委托编号在 symbol
+        assert cancel_stored.status == "submitted"
+        assert cancel_stored.provider_order_id is None
+    finally:
+        _reset_db_state()
+
+
+def test_mark_cancel_intent_rejects_non_cancel_intent(monkeypatch, tmp_path) -> None:
+    """撤单专用方法只允许更新 side=CANCEL 的意图。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        client = _IntentClient()
+        buy = trade_intent_service.check_and_register_trade_intent(
+            client=client, symbol="600519", side="BUY", quantity=100
+        )
+        with pytest.raises(RuntimeError, match="不是撤单意图"):
+            trade_intent_service.mark_cancel_intent_submitted(buy.id)
+    finally:
+        _reset_db_state()
+
+
+def test_mark_cancel_intent_rejects_missing_intent(monkeypatch, tmp_path) -> None:
+    """意图不存在 → 报错（不静默返回）。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        with pytest.raises(RuntimeError, match="撤单意图不存在"):
+            trade_intent_service.mark_cancel_intent_submitted(99999)
+    finally:
+        _reset_db_state()

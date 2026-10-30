@@ -315,16 +315,21 @@ def preflight_trade(
     _avail_keys = ("availCount", "availableCount", "enableQty")
     _avail_present = any(key in position_row for key in _avail_keys)
     available = _row_int_optional(position_row, *_avail_keys)
-    # 第九轮复审 P1：多个别名同时存在但数值冲突 → 数据源内部矛盾，
-    # 明确拒绝（不静默采用第一个字段——如 availCount=0 +
-    # availableCount=500 可能掩盖真实可卖数量）。
-    if _avail_present and available is not None:
-        alias_values = set()
+    # 第九/十轮复审 P1：可卖数量别名数据质量挡板——
+    # 1. 任一存在的别名无法解析 → 拒绝（不静默跳过该字段）；
+    # 2. 多个可解析别名数值冲突 → 拒绝（数据源内部矛盾）。
+    if _avail_present:
+        alias_values: set[int] = set()
         for key in _avail_keys:
             if key in position_row:
                 value = _row_int_optional(position_row, key)
-                if value is not None:
-                    alias_values.add(value)
+                if value is None:
+                    raise RuntimeError(
+                        f"{symbol} 可卖数量字段 {key} 存在但格式异常"
+                        f"（{position_row.get(key)!r}），为防止违规卖出已"
+                        "阻断本次交易；请核对持仓数据。"
+                    )
+                alias_values.add(value)
         if len(alias_values) > 1:
             raise RuntimeError(
                 f"{symbol} 可卖数量字段别名数值冲突"

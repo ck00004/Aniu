@@ -375,7 +375,14 @@ class TradeIntentService:
         with session_scope() as db:
             intent = db.get(TradeIntent, intent_id)
             if intent is None:
-                return
+                # 第十轮复审：意图不存在必须报错——静默返回会让
+                # "远端撤单已成功、本地无记录"的问题不可见。
+                raise RuntimeError(f"撤单意图不存在：{intent_id}")
+            if str(intent.side or "") != "CANCEL":
+                # 只允许更新撤单意图，防止误用更新交易意图
+                raise RuntimeError(
+                    f"意图 {intent_id} 不是撤单意图（side={intent.side}）"
+                )
             intent.status = "submitted"
             intent.note = note or "撤单请求已提交，等待核验"
             intent.updated_at = _now_utc()

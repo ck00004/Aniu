@@ -523,6 +523,44 @@ provider_order_id 全局唯一约束冲突 → "远端撤单已成功、本地�
 
 **全量回归：后端 460 passed，前端 86 passed，vue-tsc/build 通过。**
 
+### 第十二轮：第十轮复审核实 + 加固（2026-10-30 第十次外部复审）
+
+**复审核心发现的核实结果**：复审称远程 main 的
+trade_intent_service.py 缺少 mark_cancel_intent_submitted——**方法在
+本地代码中实际存在且被调用**（trade_intent_service.py 定义 +
+execution.py 撤单 handler 调用），460 项测试全部通过。复审看到的是
+远程 main 分支：**本会话的全部修复（第六轮起）尚未推送**，这正是复审
+第六节假设的第一种情况（"测试运行的是包含新方法的本地版本，但远程
+main 没有同步该文件"）。**推送后远程即可见**；推送前请以本地代码与
+本报告为准。
+
+尽管如此，复审的三项要求仍然有效，本轮全部落实：
+
+**P0-2 加固 mark_cancel_intent_submitted**（采纳复审建议的防护）：
+- 意图不存在 → **报错**（原静默返回会让"远端撤单成功、本地无记录"
+  不可见）；
+- side≠CANCEL → 拒绝（只允许更新撤单意图）。
+
+**P0-2 E2E 测试（复审指定必须真实调用 handler）**：
+test_cancel_handler_uses_dedicated_intent_submit_method ——完整链路：
+BUY 意图绑定 ORD-100 → 有状态 mock（撤单前待撤、撤单后已撤销）→
+真实执行 _handle_moni_cancel → 无 AttributeError → 撤单成功 →
+回查 VERIFIED 与远端状态一致 → BUY 意图 provider_order_id 不变 →
+handler 注册的 CANCEL 意图 SUBMITTED 且未写 provider_order_id
+（无唯一约束冲突）。测试实现中修正了两个问题：预注册意图与 handler
+自身注册冲突（改为 handler 全流程注册后查库断言）；无状态 mock 会被
+预检"已撤销不可撤"拒绝（改为有状态 mock）。
+
+**P1 别名部分异常拒绝**：availCount=500 + availableCount="abc" →
+拒绝（原实现只把可解析的别名放入冲突集合，部分异常字段被静默跳过，
+与"字段存在但格式异常必须拒绝"原则不一致）。现在任一存在的别名
+无法解析即拒绝，多个可解析别名数值冲突也拒绝。
+
+**第十轮专项测试**（新增 4 个）：撤单 handler E2E（真实调用）、
+非撤单意图拒绝、意图不存在报错、别名部分异常拒绝。
+
+**全量回归：后端 464 passed，前端 86 passed，vue-tsc/build 通过。**
+
 ### 已知边界（如实记录）
 
 - signal_id 是日级标识（交易日+标的+方向），45 分钟冷却放行第二档
