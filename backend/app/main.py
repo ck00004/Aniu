@@ -112,6 +112,15 @@ async def app_lifespan(_app: FastAPI):
                 memory_dream_service.fail_stale_running_dreams(db)
             except Exception as exc:
                 logger.warning("failed to mark stale running dreams: %s", exc)
+        # 补丁 C 启动恢复：进程崩溃/重启时正在发送的交易意图状态不明，
+        # 收敛为 UNKNOWN（阻塞同标的同方向的后续提交直到核对），绝不
+        # 把未完成操作当作新操作重新执行。
+        try:
+            from app.services.trade_intent_service import trade_intent_service
+
+            trade_intent_service.reconcile_stale_executing_intents()
+        except Exception as exc:
+            logger.warning("failed to reconcile stale trade intents: %s", exc)
 
     _run_with_lock_retry("restore_runtime_state", _restore_runtime_state)
     step = _log_step("restore_runtime_state", step)

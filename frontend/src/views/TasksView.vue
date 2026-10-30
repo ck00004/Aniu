@@ -367,6 +367,98 @@
                   </div>
                 </section>
 
+                <section v-if="displayBackendExecutionReport" class="execution-card execution-report-card">
+                  <div class="execution-card-head">
+                    <div class="execution-card-title">执行结果（后端权威记录）</div>
+                    <span
+                      class="execution-overview-badge"
+                      :class="reportOverallBadgeClass"
+                    >
+                      {{ displayBackendExecutionReport.overallStatusText }}
+                    </span>
+                  </div>
+                  <p class="execution-report-hint">
+                    模型负责解释为什么操作，后端负责证明操作是否发生；以下状态以后端记录为准。
+                  </p>
+
+                  <div v-if="displayBackendExecutionReport.trades.length" class="execution-report-group">
+                    <span class="execution-report-group-label">交易执行</span>
+                    <div class="execution-report-rows">
+                      <div
+                        v-for="(item, index) in displayBackendExecutionReport.trades"
+                        :key="`trade-${index}`"
+                        class="execution-report-row"
+                      >
+                        <span class="execution-report-main">{{ item.action }} {{ item.symbol }} {{ item.quantity }}股</span>
+                        <span class="execution-report-status" :class="`tone-${item.tone}`">{{ item.statusText }}</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div v-if="displayBackendExecutionReport.cancels.length" class="execution-report-group">
+                    <span class="execution-report-group-label">撤单请求</span>
+                    <div class="execution-report-rows">
+                      <div
+                        v-for="(item, index) in displayBackendExecutionReport.cancels"
+                        :key="`cancel-${index}`"
+                        class="execution-report-row"
+                      >
+                        <span class="execution-report-main">撤单 {{ item.orderId }}{{ item.stockCode ? `（${item.stockCode}）` : '' }}</span>
+                        <span class="execution-report-status" :class="`tone-${item.tone}`">{{ item.statusText }}</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div v-if="displayBackendExecutionReport.selfSelects.length" class="execution-report-group">
+                    <span class="execution-report-group-label">自选股变更</span>
+                    <div class="execution-report-rows">
+                      <div
+                        v-for="(item, index) in displayBackendExecutionReport.selfSelects"
+                        :key="`self-select-${index}`"
+                        class="execution-report-row"
+                      >
+                        <span class="execution-report-main">{{ item.query }}</span>
+                        <span class="execution-report-status" :class="`tone-${item.tone}`">{{ item.statusText }}</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div v-if="displayBackendExecutionReport.notCalledClaims.length" class="execution-report-group">
+                    <span class="execution-report-group-label">声明未获执行确认</span>
+                    <div class="execution-report-rows">
+                      <div
+                        v-for="(item, index) in displayBackendExecutionReport.notCalledClaims"
+                        :key="`claim-${index}`"
+                        class="execution-report-row"
+                      >
+                        <span class="execution-report-main">{{ item.action }} {{ item.target }}</span>
+                        <span class="execution-report-status tone-error">声明未执行</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div v-if="displayBackendExecutionReport.blockedActions.length" class="execution-report-group">
+                    <span class="execution-report-group-label">数据门禁拦截</span>
+                    <div class="execution-report-rows">
+                      <div
+                        v-for="(item, index) in displayBackendExecutionReport.blockedActions"
+                        :key="`blocked-${index}`"
+                        class="execution-report-row"
+                      >
+                        <span class="execution-report-main">{{ item.toolName }}（{{ item.actionType }}）</span>
+                        <span class="execution-report-status tone-error">已拦截</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div v-if="displayBackendExecutionReport.unresolvedCount > 0" class="execution-report-note tone-warning">
+                    未落地计划动作 {{ displayBackendExecutionReport.unresolvedCount }} 条，相关操作不得表述为已执行。
+                  </div>
+                  <div v-if="!displayBackendExecutionReport.dataValidationPassed" class="execution-report-note tone-error">
+                    必需数据工具缺失（{{ displayBackendExecutionReport.missingRequiredTools.join('、') }}），本轮分析不完整。
+                  </div>
+                </section>
+
                 <section class="execution-card execution-actions-card">
                   <div class="execution-card-head">
                     <div class="execution-card-title">动作时间线</div>
@@ -855,7 +947,9 @@ const displaySelfSelectRemovals = computed(() => selectedRun.value?.selfSelectRe
 
 const displayExecutionVisible = computed(
   () => !liveVisible.value && !!selectedRun.value?.detailLoaded && (
-    !!selectedRun.value?.executionSummary || !!selectedRun.value?.runActions.length
+    !!selectedRun.value?.executionSummary
+    || !!selectedRun.value?.runActions.length
+    || !!selectedRun.value?.backendExecutionReport
   ),
 )
 
@@ -864,6 +958,17 @@ const displayExecutionSummary = computed(() => selectedRun.value?.executionSumma
 const displayExecutionStatusCounts = computed(
   () => displayExecutionSummary.value?.statusCounts ?? [],
 )
+
+const displayBackendExecutionReport = computed(
+  () => selectedRun.value?.backendExecutionReport ?? null,
+)
+
+const reportOverallBadgeClass = computed(() => {
+  const tone = displayBackendExecutionReport.value?.overallTone ?? 'neutral'
+  if (tone === 'success') return 'success'
+  if (tone === 'error' || tone === 'warning') return 'warning'
+  return 'neutral'
+})
 
 const displayRunActions = computed(() => selectedRun.value?.runActions ?? [])
 
@@ -1837,6 +1942,87 @@ onBeforeUnmount(() => {
   color: #dbeafe;
   background: rgba(59, 130, 246, 0.12);
   border-color: rgba(96, 165, 250, 0.22);
+}
+
+.execution-report-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.execution-report-hint {
+  margin: 0;
+  color: #8ea4c5;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.execution-report-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.execution-report-group-label {
+  color: #9db1d4;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.execution-report-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.execution-report-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: rgba(2, 6, 23, 0.22);
+  border: 1px solid rgba(145, 170, 214, 0.08);
+}
+
+.execution-report-main {
+  color: #e4ecfb;
+  font-size: 12.5px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.execution-report-status {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  border: 1px solid transparent;
+}
+
+.execution-report-note {
+  padding: 8px 12px;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.execution-report-note.tone-warning {
+  color: #fef3c7;
+  background: rgba(245, 158, 11, 0.12);
+  border: 1px solid rgba(245, 158, 11, 0.2);
+}
+
+.execution-report-note.tone-error {
+  color: #fee2e2;
+  background: rgba(239, 68, 68, 0.12);
+  border: 1px solid rgba(239, 68, 68, 0.2);
 }
 
 .execution-stat-grid {

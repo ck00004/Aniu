@@ -100,29 +100,12 @@ def test_enforce_trade_consistency_skipped_for_analysis_runs() -> None:
 
 
 def test_enforce_trade_consistency_runs_for_trade_runs(monkeypatch) -> None:
-    """交易任务中声称未执行的交易仍应触发 autofill 流程（进入分析分支）。"""
-    captured: dict[str, object] = {}
-
-    def fake_autofill(**kwargs):
-        captured["called"] = True
-        analysis = {
-            "schema": "consistency_operation_v1",
-            "check_name": "trade",
-            "operations": [],
-            "materialized_operations": [],
-            "materialized_tool_calls": [],
-            "autofill_applied": False,
-        }
-        return analysis, []
-
-    monkeypatch.setattr(
-        aniu_service, "_build_trade_consistency_autofill_tool_calls", fake_autofill
-    )
+    """交易任务中声称未执行的交易会标记缺口并追加一致性警告（不再自动补单）。"""
     decision = {
         "final_answer": "执行情况：买入贵州茅台(600519) 1000股",
         "tool_calls": [],
     }
-    merged, _, _, _, _ = aniu_service._enforce_trade_consistency(
+    merged, _, _, _, actions = aniu_service._enforce_trade_consistency(
         settings=_trade_enforce_settings("trade"),
         client=None,
         decision=dict(decision),
@@ -130,8 +113,12 @@ def test_enforce_trade_consistency_runs_for_trade_runs(monkeypatch) -> None:
         llm_response={},
         runtime_trace={},
     )
-    assert captured.get("called") is True
+    # runtime_trace 无 messages：不进入 followup，直接 finalize 追加警告
+    assert merged.get("consistency_gap") is True
+    assert merged.get("consistency_autofill_applied") is None
+    assert actions == []
     assert merged["final_answer"] != decision["final_answer"]
+    assert "系统一致性提示" in merged["final_answer"]
 
 
 # ---------------------------------------------------------------------------

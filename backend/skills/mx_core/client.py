@@ -56,6 +56,9 @@ class MXClient:
         url = f"{self.base_url}{endpoint}"
         # 工具调用日志：记录每次妙想接口调用的状态/耗时/响应规模，
         # 写入失败不影响调用主路径（移植自原版 Aniu stock_api_logs）。
+        # 业务错误检查必须在日志上下文内完成：HTTP 200 + 业务失败
+        # （status!=0 / code!=0）的调用要落成 failed 日志，否则排障时
+        # 会被 success 日志误导（2026-10 外部审计发现的日志缺陷）。
         from app.services.tool_invocation_log_service import instrument_invocation
 
         with instrument_invocation(endpoint, payload) as invocation:
@@ -71,7 +74,15 @@ class MXClient:
                 status_code=response.status_code,
                 response_size=len(response.content),
             )
-        self._raise_on_business_error(data)
+            try:
+                self._raise_on_business_error(data)
+            except RuntimeError as exc:
+                invocation.observe(
+                    status_code=response.status_code,
+                    response_size=len(response.content),
+                    error_summary=str(exc),
+                )
+                raise
         return data
 
     @staticmethod

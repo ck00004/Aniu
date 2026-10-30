@@ -48,6 +48,28 @@ def reset_db_state() -> None:
     get_settings.cache_clear()
 
 
+def _required_read_tool_calls(run_type: str) -> list[dict]:
+    """生成补丁 E 必需读取工具的 tool_calls 条目（result.ok=True）。"""
+    names = {
+        "analysis": ["mx_get_self_selects", "mx_search_news", "mx_screen_stocks"],
+        "trade": [
+            "mx_get_balance",
+            "mx_get_positions",
+            "mx_get_orders",
+            "mx_get_self_selects",
+        ],
+    }.get(run_type, [])
+    return [
+        {
+            "id": f"required-{name}",
+            "name": name,
+            "arguments": {},
+            "result": {"ok": True, "tool_name": name, "summary": "已读取。", "result": {}},
+        }
+        for name in names
+    ]
+
+
 def _prepare_schedule(db, *, name: str, run_type: str = "analysis") -> StrategySchedule:
     schedule = StrategySchedule(
         name=name,
@@ -301,12 +323,14 @@ def test_execute_run_persists_planned_actions_and_execution_results(
             {
                 "final_answer": "本轮计划买入东方财富 100股。",
                 "tool_calls": [
+                    # 手动运行 + task_prompt → analysis 类型，必需工具按 analysis 清单
+                    *_required_read_tool_calls("analysis"),
                     {
                         "id": "call-1",
                         "name": "mx_moni_trade",
                         "arguments": arguments,
                         "result": tool_result,
-                    }
+                    },
                 ],
             },
             {"messages": []},
@@ -390,12 +414,13 @@ def test_execute_run_marks_failed_when_planned_action_execution_fails(
             {
                 "final_answer": "已将杰瑞股份加入自选。",
                 "tool_calls": [
+                    *_required_read_tool_calls("analysis"),
                     {
                         "id": "call-2",
                         "name": "mx_manage_self_select",
                         "arguments": arguments,
                         "result": tool_result,
-                    }
+                    },
                 ],
             },
             {"messages": []},
@@ -436,7 +461,9 @@ def test_execute_run_marks_failed_when_planned_action_execution_fails(
         assert run.executed_actions == []
         assert len(run.actions) == 1
         assert run.actions[0].status == "failed_terminal"
-        assert len(run.actions[0].results) == 2
+        # 写操作（自选股变更）只允许一次自动尝试（2026-10 外部审计
+        # 补丁 F：原为 2 次重试，状态不明时重复发送写请求有风险）
+        assert len(run.actions[0].results) == 1
         assert all(result.status == "failed" for result in run.actions[0].results)
         assert "实际新增自选股" not in str(run.final_answer or "")
 
@@ -605,13 +632,16 @@ def test_execute_run_does_not_fail_on_invalid_multi_target_self_select_plan(
     reset_db_state()
 
 
-def test_analysis_schedule_consistency_autofills_missing_self_select_actions(
+def test_analysis_schedule_consistency_marks_gap_without_self_select_writes(
     monkeypatch,
     tmp_path,
 ) -> None:
+    """E2E（补丁 A）：模型只在文字里声明自选股变更时，系统标记缺口并
+    请求模型纠正，不得自动执行任何自选股写操作。"""
     from app.services import aniu_service as aniu_service_module
 
     captured_messages: list[list[dict[str, object]]] = []
+    executed_tools: list[str] = []
 
     class StubClient:
         def __init__(self, *args, **kwargs) -> None:
@@ -623,33 +653,35 @@ def test_analysis_schedule_consistency_autofills_missing_self_select_actions(
     def fake_run_agent_with_messages(*, messages, **kwargs):
         del kwargs
         captured_messages.append(messages)
+        if len(captured_messages) == 1:
+            return (
+                {
+                    "final_answer": "本轮自选股变更结果\n新增自选股：仕佳光子\n移除自选股：无",
+                    "tool_calls": [
+                        {"name": "mx_get_self_selects", "result": {"ok": True, "summary": "已查询自选股列表。"}},
+                        {"name": "mx_search_news", "result": {"ok": True, "summary": "已查询资讯。"}},
+                        {"name": "mx_screen_stocks", "result": {"ok": True, "summary": "已执行选股。"}},
+                    ],
+                },
+                {"messages": []},
+                {"responses": [], "final_message": {"content": "first"}},
+                {"messages": messages},
+            )
+        # followup：模型重写表述（也可以自己补调工具——这里验证重写路径）
         return (
             {
-                "final_answer": "本轮自选股变更结果\n新增自选股：仕佳光子\n移除自选股：无",
-                "tool_calls": [
-                    {"name": "mx_get_self_selects", "result": {"ok": True, "summary": "已查询自选股列表。"}},
-                    {"name": "mx_search_news", "result": {"ok": True, "summary": "已查询资讯。"}},
-                    {"name": "mx_screen_stocks", "result": {"ok": True, "summary": "已执行选股。"}},
-                ],
+                "final_answer": "本轮没有实际新增或移除任何自选股。",
+                "tool_calls": [],
             },
             {"messages": []},
-            {"responses": [], "final_message": {"content": "first"}},
+            {"responses": [], "final_message": {"content": "revised"}},
             {"messages": messages},
         )
 
     def fake_execute_tool(*, client, app_settings, tool_name, arguments):
-        del client, app_settings
-        assert tool_name == "mx_manage_self_select"
-        return {
-            "ok": True,
-            "tool_name": tool_name,
-            "summary": f"已执行自选股操作：{arguments['query']}",
-            "result": {"ok": True},
-            "executed_action": {
-                "action": "MANAGE_SELF_SELECT",
-                "query": str(arguments.get("query") or ""),
-            },
-        }
+        del client, app_settings, arguments
+        executed_tools.append(tool_name)
+        raise AssertionError(f"一致性检查不得自动执行写操作：{tool_name}")
 
     monkeypatch.setattr(aniu_service_module, "MXClient", StubClient)
     monkeypatch.setattr(llm_service, "run_agent_with_messages", fake_run_agent_with_messages)
@@ -672,14 +704,16 @@ def test_analysis_schedule_consistency_autofills_missing_self_select_actions(
 
         run = aniu_service.execute_run(trigger_source="schedule", schedule_id=schedule_id)
 
-        assert len(captured_messages) == 1
-        assert run.executed_actions is not None
-        assert any(str(item.get("action") or "") == "MANAGE_SELF_SELECT" for item in run.executed_actions)
-        assert any("仕佳光子" in str(item.get("query") or "") for item in run.executed_actions)
+        # followup 发生（第一轮 + 纠正轮）
+        assert len(captured_messages) == 2
+        # 没有任何写操作被执行
+        assert executed_tools == []
+        assert run.executed_actions == [] or run.executed_actions is None
         assert run.decision_payload is not None
+        assert run.decision_payload.get("consistency_gap") is True
         assert run.decision_payload.get("original_final_answer")
-        assert run.decision_payload.get("consistency_autofill_applied") is True
-        assert "系统一致性提示" not in str(run.final_answer or "")
+        assert run.decision_payload.get("consistency_autofill_applied") is None
+        assert "本轮没有实际新增或移除任何自选股" in str(run.final_answer or "")
 
     reset_db_state()
 
@@ -707,6 +741,7 @@ def test_trade_schedule_followup_executes_trade_when_final_answer_claims_sell(
             {
                 "final_answer": "已实际提交卖出立讯精密 5000股委托。",
                 "tool_calls": [
+                    *_required_read_tool_calls("trade"),
                     {
                         "name": "mx_moni_trade",
                         "result": {
@@ -721,7 +756,7 @@ def test_trade_schedule_followup_executes_trade_when_final_answer_claims_sell(
                             },
                             "result": {"order_id": "SELL-1"},
                         },
-                    }
+                    },
                 ],
             },
             {"messages": []},
@@ -763,13 +798,16 @@ def test_trade_schedule_followup_executes_trade_when_final_answer_claims_sell(
     reset_db_state()
 
 
-def test_trade_schedule_consistency_autofills_missing_trade_when_code_and_quantity_are_explicit(
+def test_trade_schedule_consistency_marks_gap_without_auto_trades(
     monkeypatch,
     tmp_path,
 ) -> None:
+    """E2E（补丁 A）：模型只在文字里写"卖出X"时，系统标记缺口并请求
+    模型纠正，不得自动生成真实委托。"""
     from app.services import aniu_service as aniu_service_module
 
     captured_messages: list[list[dict[str, object]]] = []
+    executed_tools: list[str] = []
 
     class StubClient:
         def __init__(self, *args, **kwargs) -> None:
@@ -781,32 +819,30 @@ def test_trade_schedule_consistency_autofills_missing_trade_when_code_and_quanti
     def fake_run_agent_with_messages(*, messages, **kwargs):
         del kwargs
         captured_messages.append(messages)
+        if len(captured_messages) == 1:
+            return (
+                {
+                    "final_answer": "09:30这一轮直接结论：\n执行：卖出立讯精密（002475）5000股",
+                    "tool_calls": [],
+                },
+                {"messages": []},
+                {"responses": [], "final_message": {"content": "first"}},
+                {"messages": messages},
+            )
         return (
             {
-                "final_answer": "09:30这一轮直接结论：\n执行：卖出立讯精密（002475）5000股",
-                "tool_calls": [],
+                "final_answer": "本轮未实际交易：此前『执行卖出』为表述错误，未调用交易工具。",
+                "tool_calls": [*_required_read_tool_calls("trade")],
             },
             {"messages": []},
-            {"responses": [], "final_message": {"content": "first"}},
+            {"responses": [], "final_message": {"content": "revised"}},
             {"messages": messages},
         )
 
     def fake_execute_tool(*, client, app_settings, tool_name, arguments):
-        del client, app_settings
-        assert tool_name == "mx_moni_trade"
-        return {
-            "ok": True,
-            "tool_name": tool_name,
-            "summary": f"已提交{arguments['action']}委托：{arguments['symbol']} {arguments['quantity']} 股。",
-            "result": {"order_id": "SELL-AUTOFILL-1"},
-            "executed_action": {
-                "action": str(arguments.get("action") or ""),
-                "symbol": str(arguments.get("symbol") or ""),
-                "name": str(arguments.get("name") or ""),
-                "quantity": int(arguments.get("quantity") or 0),
-                "price_type": str(arguments.get("price_type") or "MARKET"),
-            },
-        }
+        del client, app_settings, arguments
+        executed_tools.append(tool_name)
+        raise AssertionError(f"一致性检查不得自动执行交易：{tool_name}")
 
     monkeypatch.setattr(aniu_service_module, "MXClient", StubClient)
     monkeypatch.setattr(llm_service, "run_agent_with_messages", fake_run_agent_with_messages)
@@ -829,24 +865,20 @@ def test_trade_schedule_consistency_autofills_missing_trade_when_code_and_quanti
 
         run = aniu_service.execute_run(trigger_source="schedule", schedule_id=schedule_id)
 
-        assert len(captured_messages) == 1
-        assert run.executed_actions is not None
-        assert any(str(item.get("action") or "") == "SELL" for item in run.executed_actions)
-        assert any(str(item.get("symbol") or "") == "002475" for item in run.executed_actions)
+        assert len(captured_messages) == 2
+        assert executed_tools == []
+        assert run.executed_actions == [] or run.executed_actions is None
         assert run.decision_payload is not None
-        assert run.decision_payload.get("consistency_autofill_applied") is True
-        consistency_analysis = (run.decision_payload.get("consistency_analysis") or {}).get(
-            "trade"
-        )
-        assert isinstance(consistency_analysis, dict)
-        assert consistency_analysis.get("schema") == "consistency_operation_v1"
-        assert len(consistency_analysis.get("materialized_operations") or []) == 1
+        assert run.decision_payload.get("consistency_gap") is True
+        assert run.decision_payload.get("original_final_answer")
+        assert run.decision_payload.get("consistency_autofill_applied") is None
+        assert "本轮未实际交易" in str(run.final_answer or "")
         with session_scope() as db:
             stored_run = db.get(StrategyRun, run.id)
             orders = db.query(TradeOrder).filter(TradeOrder.run_id == run.id).all()
             assert stored_run is not None
-            assert len(orders) == 1
-            assert orders[0].action == "SELL"
+            assert len(orders) == 0
+        assert "一致性检查修正说明" in str(run.final_answer or "")
 
     reset_db_state()
 
@@ -880,12 +912,13 @@ def test_trade_execution_does_not_retry_sell_after_first_failure(
             {
                 "final_answer": "执行：卖出立讯精密（002475）5000股",
                 "tool_calls": [
+                    *_required_read_tool_calls("trade"),
                     {
                         "id": "call-sell-1",
                         "name": "mx_moni_trade",
                         "arguments": arguments,
                         "result": tool_result,
-                    }
+                    },
                 ],
             },
             {"messages": []},
@@ -1489,5 +1522,95 @@ def test_repeated_compaction_only_archives_new_history_and_preserves_previous_su
             assert [record.id for record in history_records] == [
                 record.id for record in new_records[2:]
             ]
+
+    reset_db_state()
+
+
+def test_trade_run_blocks_writes_when_required_tools_missing(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """补丁 E E2E：模型跳过必需读取工具却生成交易计划时，
+    写操作被数据门禁拦截，最终结论附带后端权威执行报告。"""
+    from app.services import aniu_service as aniu_service_module
+
+    captured_messages: list[list[dict[str, object]]] = []
+
+    class StubClient:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+        def close(self) -> None:
+            return None
+
+    def fake_run_agent_with_messages(
+        *, app_settings, client, messages, emit=None, tool_executor=None
+    ):
+        del app_settings, client, emit
+        captured_messages.append(messages)
+        arguments = {
+            "action": "BUY",
+            "symbol": "300059",
+            "name": "东方财富",
+            "quantity": 100,
+            "price_type": "MARKET",
+        }
+        # 只调用交易工具，不调用任何必需读取工具
+        tool_result = tool_executor("mx_moni_trade", arguments, "call-1")
+        return (
+            {
+                "final_answer": "本轮计划买入东方财富 100股。",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "name": "mx_moni_trade",
+                        "arguments": arguments,
+                        "result": tool_result,
+                    }
+                ],
+            },
+            {"messages": []},
+            {"responses": [], "final_message": {"content": "planned"}},
+            {"messages": list(messages)},
+        )
+
+    def fake_execute_tool(*, client, app_settings, tool_name, arguments):
+        del client, app_settings, arguments
+        raise AssertionError(f"必需数据缺失时不得执行写操作：{tool_name}")
+
+    monkeypatch.setattr(aniu_service_module, "MXClient", StubClient)
+    monkeypatch.setattr(llm_service, "run_agent_with_messages", fake_run_agent_with_messages)
+    monkeypatch.setattr(aniu_service_module.mx_skill_service, "execute_tool", fake_execute_tool)
+    monkeypatch.setattr(
+        aniu_service,
+        "_prefetch_analysis_context",
+        lambda **kwargs: (None, None),
+    )
+
+    with create_test_client(monkeypatch, tmp_path):
+        with session_scope() as db:
+            settings = aniu_service.get_or_create_settings(db)
+            settings.mx_api_key = "mx-key"
+            settings.llm_base_url = "https://example.com/v1"
+            settings.llm_api_key = "llm-key"
+            settings.llm_model = "demo-model"
+            schedule = _prepare_schedule(db, name="上午运行1号", run_type="trade")
+            schedule_id = schedule.id
+
+        run = aniu_service.execute_run(trigger_source="schedule", schedule_id=schedule_id)
+
+        # 初始轮 + 补充调用轮（补充后仍缺失）
+        assert len(captured_messages) == 2
+        # 写操作计划被拦截：没有任何动作进入执行器
+        assert run.actions == []
+        assert run.executed_actions == [] or run.executed_actions is None
+        decision = run.decision_payload or {}
+        assert decision.get("data_validation_passed") is False
+        assert "mx_get_balance" in (decision.get("missing_required_tools") or [])
+        blocked = decision.get("blocked_actions_missing_required_tools") or []
+        assert any(item.get("tool_name") == "mx_moni_trade" for item in blocked)
+        # 补丁 D：最终结论附带后端权威执行报告
+        assert "系统执行结果（后端权威记录）" in str(run.final_answer or "")
+        assert "BLOCKED_MISSING_DATA" in str(run.final_answer or "")
 
     reset_db_state()

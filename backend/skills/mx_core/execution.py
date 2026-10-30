@@ -3,9 +3,12 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 from datetime import datetime
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
+
+import httpx
 
 from skills.mx_core.client import MXClient
 from skills.mx_core.tool_specs import TOOL_PROFILES, TOOL_SPECS, build_tools
@@ -22,6 +25,19 @@ _MARKET_SESSIONS: tuple[tuple[int, int], ...] = (
 )
 # 委托仍占用资金/份额的状态（已报/未成交/处理中）
 _PENDING_ORDER_STATUSES = {"1", "2", "8", "100"}
+
+# 自选股操作互斥锁：读取 → 判断 → 写入 → 回查必须串行执行，防止两个
+# 并发任务同时读到"不存在"然后同时发送 ADD（2026-10 外部审计）。
+_SELF_SELECT_OP_LOCK = threading.Lock()
+
+# 自选股操作的目标片段提取模式（意图解析与单目标校验共用）
+_SELF_SELECT_TARGET_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?:把|将)(.+?)(?:加入|添加到?|放入|纳入)(?:我的)?自选(?:股|列表)?"),
+    re.compile(r"(?:把|将)(.+?)(?:从)?(?:我的)?自选(?:股|列表)?(?:中)?(?:删除|移除|移出|去掉)"),
+    re.compile(r"(?:把|将)(.+?)(?:删除|移除|移出|去掉)(?:出)?(?:我的)?自选(?:股|列表)?"),
+    re.compile(r"(.+?)(?:加入|添加到?|放入|纳入)(?:我的)?自选(?:股|列表)?"),
+    re.compile(r"(.+?)(?:从)?(?:我的)?自选(?:股|列表)?(?:中)?(?:删除|移除|移出|去掉)"),
+)
 
 
 def _normalize_symbol(value: Any) -> str:
@@ -112,12 +128,37 @@ def preflight_trade(
 ) -> None:
     """交易预检（移植自原版 Aniu mx_agent_tools.py `_preflight_trade`）。
 
-    买入（限价）：核对可用资金；卖出：核对可卖数量（持仓 - 在途卖出
-    委托占用）。市价买入因价格未知不做资金预检，由远端拒绝兜底。
+    买入（限价）：核对可用资金；买入（全部）：核对同标的是否存在
+    未完成买单——防止跨轮重复委托被动放大敞口（2026-10 外部审计
+    P0：同一标的已有在途买单时再次买入必须先撤单或等待成交）；
+    卖出：核对可卖数量（持仓 - 在途卖出委托占用）。市价买入因价格
+    未知不做资金预检，由远端拒绝兜底。
     """
     normalized_symbol = _normalize_symbol(symbol)
 
     if action.upper() == "BUY":
+        pending_buy = None
+        for row in _payload_rows(client.get_orders()):
+            if _normalize_symbol(
+                _row_str(row, "stockCode", "code", "SECURITY_CODE", "secCode")
+            ) != normalized_symbol:
+                continue
+            if _is_sell_side(row):
+                continue
+            status = _order_status(row)
+            remaining = max(
+                _row_int(row, "orderCount", "count", "quantity", "orderQty")
+                - _row_int(row, "dealCount", "tradeCount", "filledCount", "filledQty"),
+                0,
+            )
+            if status in _PENDING_ORDER_STATUSES and remaining > 0:
+                pending_buy = row
+                break
+        if pending_buy is not None:
+            raise RuntimeError(
+                f"{symbol} 已存在未完成买入委托（在途买入），禁止重复提交同方向"
+                "委托；如需调整仓位请先撤单或等待该委托成交后再评估"
+            )
         if price_type.upper() == "LIMIT" and price is not None:
             balance_payload = client.get_balance()
             balance = (
@@ -571,19 +612,147 @@ class MXExecutionService:
     def _handle_manage_self_select(
         self, *, client: MXClient, app_settings: Any, arguments: dict[str, Any]
     ) -> dict[str, Any]:
+        with _SELF_SELECT_OP_LOCK:
+            return self._handle_manage_self_select_unlocked(
+                client=client, app_settings=app_settings, arguments=arguments
+            )
+
+    def _handle_manage_self_select_unlocked(
+        self, *, client: MXClient, app_settings: Any, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
         query = self._resolve_query(arguments, app_settings)
         self._ensure_single_self_select_target(query)
+
+        # 补丁 B（2026-10 外部审计）：自选股操作必须解析出唯一意图
+        # （ADD/REMOVE + 代码或名称），并做操作前后状态核验——
+        # "接口返回成功"不等于"列表已变更"，未回查确认不得声称完成。
+        intent = self._parse_self_select_intent(query)
+        if intent is None:
+            # 无法唯一确定意图：拒绝执行，不得把模糊表述发给远端。
+            raise RuntimeError(
+                f"自选股操作指令无法唯一确定新增或移除意图：{query}。"
+                "请使用明确的表述（如\"将600519加入自选股\"或"
+                "\"将600519从自选股删除\"）重新调用。"
+            )
+        operation, code, name = intent
+
+        current = self._read_self_select_state(client)
+        if current is not None:
+            in_list = self._target_in_state(code, name, current)
+            if (operation == "ADD" and in_list) or (
+                operation == "REMOVE" and not in_list
+            ):
+                return {
+                    "ok": True,
+                    "tool_name": "mx_manage_self_select",
+                    "summary": (
+                        f"{name or code} 已处于目标状态"
+                        f"（{'已在' if operation == 'ADD' else '不在'}自选股列表），"
+                        "未发送写请求（NOOP_VERIFIED）。"
+                    ),
+                    "result": {"verified": True, "noop": True},
+                    "executed_action": {
+                        "action": "MANAGE_SELF_SELECT",
+                        "query": query,
+                        "verified": True,
+                        "noop": True,
+                    },
+                }
+
         result = client.manage_self_select(query)
+
+        verified = self._read_self_select_state(client)
+        if verified is None:
+            raise RuntimeError(
+                f"自选股操作已提交但回查失败，状态未知（UNKNOWN）：{query}。"
+                "请调用 mx_get_self_selects 核对当前列表，确认前不得重复提交。"
+            )
+        in_list = self._target_in_state(code, name, verified)
+        if (operation == "ADD" and not in_list) or (operation == "REMOVE" and in_list):
+            raise RuntimeError(
+                f"自选股操作已提交但回查未确认目标状态（UNKNOWN）：{query}。"
+                "请调用 mx_get_self_selects 核对当前列表，确认前不得重复提交。"
+            )
+
         return {
             "ok": True,
             "tool_name": "mx_manage_self_select",
-            "summary": f"已执行自选股操作：{query}",
+            "summary": f"已执行自选股操作并回查确认：{query}",
             "result": result,
             "executed_action": {
                 "action": "MANAGE_SELF_SELECT",
                 "query": query,
+                "verified": True,
             },
         }
+
+    @staticmethod
+    def _target_in_state(
+        code: str, name: str, state: tuple[set[str], list[str]]
+    ) -> bool:
+        codes, names = state
+        if code:
+            return code in codes
+        return bool(name) and any(name in row_name for row_name in names)
+
+    def _parse_self_select_intent(
+        self, query: str
+    ) -> tuple[str, str, str] | None:
+        """解析自选股操作意图 → (ADD/REMOVE, 六位代码或空, 名称或空)。
+
+        无法唯一确定方向时返回 None（由调用方拒绝执行）。
+        """
+        normalized = re.sub(r"\s+", "", str(query or ""))
+        has_add = any(
+            marker in normalized for marker in ("加入", "添加", "放入", "纳入")
+        )
+        has_remove = any(
+            marker in normalized for marker in ("删除", "移除", "移出", "去掉")
+        )
+        if has_add == has_remove:  # 两者都有（矛盾）或都没有（模糊）
+            return None
+
+        # 目标片段：与 _ensure_single_self_select_target 相同的模式提取，
+        # 避免对名称做逐字剔除（"中芯国际"的"中"不能被当结构词删掉）。
+        target_fragment = normalized
+        for pattern in _SELF_SELECT_TARGET_PATTERNS:
+            matched = pattern.search(normalized)
+            if matched:
+                target_fragment = matched.group(1)
+                break
+
+        codes = re.findall(r"\d{6}", target_fragment)
+        code = codes[0] if len(codes) == 1 else ""
+        name = re.sub(r"\d{6}", "", target_fragment).strip("，。,.;；:：()（）") or ""
+        if not code and not name:
+            return None
+        return ("ADD" if has_add else "REMOVE", code, name)
+
+    def _read_self_select_state(
+        self, client: MXClient
+    ) -> tuple[set[str], list[str]] | None:
+        """读取当前自选股列表 → (代码集合, 名称列表)；读取失败返回 None。"""
+        try:
+            payload = client.get_self_selects()
+        except Exception:  # noqa: BLE001
+            return None
+        rows = _payload_rows(payload)
+        if not isinstance(rows, list):
+            return None
+        codes: set[str] = set()
+        names: list[str] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            row_code = _normalize_symbol(
+                _row_str(row, "stockCode", "code", "SECURITY_CODE", "secCode")
+            )
+            if row_code:
+                codes.add(row_code)
+            row_name = _row_str(row, "stockName", "secName", "name", "stock_name")
+            if row_name:
+                names.append(row_name)
+        return codes, names
 
     def _handle_moni_trade(
         self, *, client: MXClient, app_settings: Any, arguments: dict[str, Any]
@@ -636,12 +805,50 @@ class MXExecutionService:
             price=price,
         )
 
-        result = client.trade(
-            action=action,
+        # 补丁 C：跨轮交易意图挡板（同信号去重 / 成交后冷却 / 分批上限 /
+        # UNKNOWN 核对）。被拦截时抛错，模型在工具结果中看到拦截原因。
+        from app.services.trade_intent_service import (
+            extract_order_id,
+            trade_intent_service,
+        )
+
+        intent = trade_intent_service.check_and_register_trade_intent(
+            client=client,
             symbol=symbol,
+            side=action,
             quantity=quantity,
-            price_type=price_type,
-            price=price,
+        )
+
+        try:
+            result = client.trade(
+                action=action,
+                symbol=symbol,
+                quantity=quantity,
+                price_type=price_type,
+                price=price,
+            )
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            # 超时/传输中断时远端可能已接受委托（状态未知）：绝不自动
+            # 重发。意图置为 UNKNOWN 阻塞同标的同方向的后续提交，直到
+            # 通过 mx_get_orders 核对收敛。
+            trade_intent_service.mark_intent_unknown(
+                intent.id, f"交易请求超时/传输中断：{exc}"
+            )
+            raise RuntimeError(
+                f"委托状态未知（{type(exc).__name__}）：{symbol} {action} "
+                f"{quantity} 股的请求已发出但未收到确认，可能已提交也可能"
+                "未提交。请先调用 mx_get_orders 核对该委托状态，确认前"
+                "不得重复提交同方向委托。"
+            ) from exc
+        except RuntimeError:
+            # 业务错误（远端明确拒绝）：意图确认未生效，不阻塞后续重试
+            trade_intent_service.mark_intent_failed(
+                intent.id, "远端拒绝该委托（业务错误）"
+            )
+            raise
+
+        trade_intent_service.mark_intent_submitted(
+            intent.id, extract_order_id(result)
         )
         return {
             "ok": True,
@@ -680,15 +887,47 @@ class MXExecutionService:
             )
         preflight_cancel(client=client, order_id=order_id, stock_code=stock_code)
 
-        result = client.cancel_order(
-            cancel_type=cancel_type,
-            order_id=order_id,
-            stock_code=stock_code,
+        # 补丁 C：撤单意图按委托单号全局唯一（一单最多一个撤单意图，
+        # 防止多个 15 分钟任务对同一委托重复撤单）。
+        from app.services.trade_intent_service import (
+            extract_order_id,
+            trade_intent_service,
         )
+
+        intent = trade_intent_service.check_and_register_cancel_intent(
+            order_id=order_id
+        )
+
+        try:
+            result = client.cancel_order(
+                cancel_type=cancel_type,
+                order_id=order_id,
+                stock_code=stock_code,
+            )
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            trade_intent_service.mark_intent_unknown(
+                intent.id, f"撤单请求超时/传输中断：{exc}"
+            )
+            raise RuntimeError(
+                f"撤单状态未知（{type(exc).__name__}）：委托 {order_id} 的撤单"
+                "请求已发出但未收到确认。请调用 mx_get_orders 核对该委托"
+                "状态，确认前不得重复提交撤单。"
+            ) from exc
+        except RuntimeError:
+            trade_intent_service.mark_intent_failed(
+                intent.id, "撤单请求被远端拒绝"
+            )
+            raise
+
+        trade_intent_service.mark_intent_submitted(
+            intent.id, extract_order_id(result)
+        )
+        # 撤单结果核验（尽力而为）：撤单请求 ≠ 撤单完成。
+        verify_note = self._verify_cancel_result(client, order_id)
         return {
             "ok": True,
             "tool_name": "mx_moni_cancel",
-            "summary": f"已提交撤单请求：{order_id}",
+            "summary": f"已提交撤单请求：{order_id}。{verify_note}",
             "result": result,
             "executed_action": {
                 "action": "CANCEL",
@@ -698,6 +937,24 @@ class MXExecutionService:
                 "reason": reason,
             },
         }
+
+    def _verify_cancel_result(self, client: MXClient, order_id: str) -> str:
+        """撤单后回查委托列表，尽力确认委托是否已离开可撤状态。"""
+        try:
+            orders_payload = client.get_orders()
+        except Exception:  # noqa: BLE001
+            return "（回查失败，请调用 mx_get_orders 自行核对该委托状态。）"
+        rows = _payload_rows(orders_payload)
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            row_order_id = _row_str(row, "orderID", "orderId", "order_id", "entrustNo")
+            if row_order_id and row_order_id == str(order_id).strip():
+                status = _order_status(row)
+                if status in _PENDING_ORDER_STATUSES:
+                    return "（回查：该委托仍处于待撤状态，请稍后通过 mx_get_orders 核对。）"
+                return "（回查：该委托已离开可撤状态——已撤单或已成交。）"
+        return "（回查：委托列表中已找不到该委托，通常表示撤单已生效。）"
 
     def _resolve_query(self, arguments: dict[str, Any], app_settings: Any) -> str:
         query = str(arguments.get("query") or "").strip()
@@ -713,16 +970,8 @@ class MXExecutionService:
         if not normalized:
             raise RuntimeError("自选股操作缺少目标股票。")
 
-        patterns = [
-            re.compile(r"(?:把|将)(.+?)(?:加入|添加到?|放入|纳入)(?:我的)?自选(?:股|列表)?"),
-            re.compile(r"(?:把|将)(.+?)(?:从)?(?:我的)?自选(?:股|列表)?(?:中)?(?:删除|移除|移出|去掉)"),
-            re.compile(r"(?:把|将)(.+?)(?:删除|移除|移出|去掉)(?:出)?(?:我的)?自选(?:股|列表)?"),
-            re.compile(r"(.+?)(?:加入|添加到?|放入|纳入)(?:我的)?自选(?:股|列表)?"),
-            re.compile(r"(.+?)(?:从)?(?:我的)?自选(?:股|列表)?(?:中)?(?:删除|移除|移出|去掉)"),
-        ]
-
         target_fragment = normalized
-        for pattern in patterns:
+        for pattern in _SELF_SELECT_TARGET_PATTERNS:
             matched = pattern.search(normalized)
             if matched:
                 target_fragment = matched.group(1)

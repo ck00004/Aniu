@@ -1,0 +1,210 @@
+# 工具调用审计修复报告（2026-10-30，外部审计六补丁实施）
+
+## 背景
+
+用户提供了一份针对工具调用模块的外部审计（基于公开 main 分支源码的静态审计），
+指出"模型表达意图、工具计划、实际外部操作和结果确认"之间缺少统一、不可绕过的
+状态约束。本次先逐条对照代码验证审计判断（全部属实），然后按其优先级实施修复。
+提示词部分（审计第九节）由用户自行处理，本次不改动。
+
+## 审计判断验证结果（全部属实）
+
+| 审计判断 | 验证 |
+|---|---|
+| BUY 预检不查同标的未完成买单 | 属实：`preflight_trade` BUY 分支只查资金 |
+| 交易超时后状态不明，下一轮可重复提交 | 属实：`client.trade` 无幂等键，超时按失败处理 |
+| 一致性 autofill 可由自然语言自动补出真实委托/自选股变更 | 属实（含一个审计未发现的更隐蔽问题，见补丁 A） |
+| 自选股操作不回查远端列表，接口成功≠变更完成 | 属实：`_handle_manage_self_select` 直接 `ok=True` |
+| 撤单/自选股写操作允许 2 次自动尝试 | 属实：只有 BUY/SELL 限 1 次 |
+| `_mark_action_executing` 非原子（读-判-写） | 属实 |
+| `replace_plan` 无条件删除已有动作 | 属实 |
+| `execute_tool` 执行时不复检 run_type 权限 | 属实：分析任务幻觉调用交易工具会被真实执行 |
+| HTTP 200 + 业务失败被记成 success 日志 | 属实：`_raise_on_business_error` 在日志上下文外调用 |
+| 聊天入口绕过计划执行层 | 属实但按补丁 F 第三项方式修复（见下） |
+
+## 已实施修复
+
+### 补丁 A：禁用自然语言自动补写（P0，审计第一优先级）
+
+`aniu_service.py`：
+- `_enforce_trade_consistency` / `_enforce_self_select_consistency` 的 autofill
+  分支整体移除：检测到声明与计划不一致时只标记 `consistency_gap`、保留
+  `original_final_answer` 审计、请求模型 followup 纠正（模型可自己补调工具，
+  走全部挡板）——**后端不再由文字生成任何写操作**。
+- **额外发现并修复**：自选股一致性分支开头"只要分析"的调用实际通过
+  `_build_self_select_consistency_autofill_tool_calls` 内部的
+  `_materialize_consistency_operations` **执行真实操作**——比 autofill 分支
+  更隐蔽的写路径。已替换为纯分析 dict。
+- 删除三个死函数：`_materialize_consistency_operations`、两个 autofill builder。
+- `_extract_claimed_self_select_changes` 不再把"新增候选/新增关注/新增重点跟踪"
+  等研究性表述解释为自选股新增声明（审计第四节要求）。
+- followup 合并处补 `consistency_gap` 标记（原先丢失）。
+
+### 补丁 B：自选股操作意图解析 + 前后状态核验（P0）
+
+`skills/mx_core/execution.py`：
+- 新增 `_parse_self_select_intent`：query 必须唯一解析出
+  ADD/REMOVE + 六位代码或名称，否则**拒绝执行且不发送任何写请求**
+  （审计："无法唯一确定就拒绝，不能回退使用整段 task_prompt"）。
+  目标片段提取与单目标校验共用 `_SELF_SELECT_TARGET_PATTERNS`。
+- 操作前读取 `mx_get_self_selects`：目标已处于期望状态 → NOOP_VERIFIED，
+  不发送写请求（幂等，防重复 ADD/REMOVE）。
+- 操作后回查：目标状态确认 → `verified=True`；回查失败或未确认 →
+  UNKNOWN 错误（指引模型调用 mx_get_self_selects 核对，禁止自动重发）。
+- 名称与代码两种写法解析为同一意图（审计清单 #8）。
+
+### 补丁 C（预检层）：BUY 未完成买单拦截 + 超时状态未知
+
+`skills/mx_core/execution.py`：
+- `preflight_trade` BUY 分���新增：同标的存在未完成买单（pending 状态且
+  remaining>0）时拒绝再次买入——跨轮重复买入的持久化挡板（审计第三节 1）。
+  卖单/已成交买单不影响。
+- `_handle_moni_trade` 捕获 `httpx.TimeoutException/TransportError`：
+  报"委托状态未知（UNKNOWN）"并指引先查 `mx_get_orders` 核对，**绝不自动
+  重发**（审计第三节 2）。下一轮同标的同方向买入由未完成买单预检拦截。
+- 注：审计建议的独立交易意图表（intent_key 唯一约束）未实施——预检层
+  挡板已覆盖其主要目标（同标的同方向重复委托），意图表需要稳定的
+  signal_id/tranche_id 语义设计，建议后续单独评审。
+
+### 补丁 D：replace_plan 保护已发送动作
+
+`execution_runner_service.py`：`replace_plan` 只删除仍处于 `planned` 的
+动作；executing/completed/failed 动作是不可变的审计记录，跳过删除并告警。
+
+### 补丁 F：写操作单次尝试 + 原子抢占 + 执行时权限复检 + 日志修复
+
+- `_resolve_action_max_attempts`：CANCEL/MANAGE_SELF_SELECT 与 BUY/SELL
+  一样只允许 **1 次**自动尝试（原 2 次）；读取类动作仍可重试。
+- `_mark_action_executing` 改为**原子条件更新**（`UPDATE ... WHERE status IN
+  (planned, failed_retryable)` + rowcount 校验），消除并发抢占窗口。
+- `skill_stack_service.execute_tool` 新增**执行时权限复检**：按 context 的
+  run_type 重新过滤工具，分析任务中幻觉调用 `mx_moni_trade` 等写工具直接
+  拒绝（此前只过滤工具列表、不过滤执行）。
+- 聊天入口统一：审计建议路由到计划层，但那会让聊天写工具只生成计划不
+  执行、破坏聊天语义；实际采用"执行时权限复检"（补丁 F 第三项原文），
+  聊天（chat profile 含交易工具）保持即时执行但受全部执行层挡板约束。
+- `MXClient._post`：业务错误检查移入日志上下文内，HTTP 200 + 业务失败
+  （status!=0）现在落成 **failed** 日志（`instrument_invocation.observe`
+  新增 error_summary 参数）。
+
+## 测试
+
+新增 `tests/test_tool_audit_fixes.py`（20 个）：
+- BUY 预检：同标的未完成买单拦截 / 卖单不拦 / 已成交不拦 / 他标的不拦
+- 交易超时：状态未知提示 + 只发送一次不重发（审计清单 #4）
+- 原子抢占：planned 可抢占、completed 不可、executing 不可重入（#11 单进程）
+- replace_plan：planned 可替换、executing/completed 保留（#10 部分）
+- 写操作单次尝试：CANCEL/MANAGE_SELF_SELECT/BUY/SELL 均 1 次（#9 部分）
+- 执行时权限：分析任务调用交易工具被拒、交易任务通过权限层（#14 部分）
+- 日志：HTTP 200 + status=100 落成 failed 日志
+- 自选股回查：ADD 回查确认 / 已在列表 NOOP / 不在列表 REMOVE NOOP /
+  接口成功但未生效 → UNKNOWN / 回查失败 → UNKNOWN / 模糊意图拒绝且零写请求 /
+  名称与代码同意图（#8）/ ADD-REMOVE-ADD 合法序列（#7）
+
+重写旧行为测试 7 个（autofill 单元 4 + E2E 2 + 重试次数 1）为断言新行为。
+
+**全量回归：后端 371 passed**（351 + 20 新增）。前端无改动。
+
+## 第二轮：补丁 C / D / E 全部实施（2026-10-30 复审后）
+
+用户复审认为 C/E/D 三项分别处理"操作重复 / 工具完整性 / 结果真实性"三个
+层面、不可互相替代且均为必须实施。本轮全部落地：
+
+### 补丁 C：独立交易意图表（trade_intents）
+
+- **模型**：`TradeIntent`（signal_date/symbol/side/tranche_id 唯一约束 +
+  intent_key 唯一索引 + provider_order_id + 状态机）。
+- **signal_id 语义**：后端按（上海交易日, 标的, 方向）派生——同一天同一
+  标的同一方向视为同一信号，15 分钟任务反复触发不产生新键；**不由模型生成**。
+- **tranche_id**：前一档 FILLED 且 45 分钟冷却期已过才允许新档；每日每标的
+  每方向上限 3 档（含失败重试档）——防重复挡板不会变成禁止合理加仓的死规则。
+- **覆盖 BUY/SELL/CANCEL**：撤单意图按委托单号全局唯一（一单一个撤单意图，
+  失败意图复用原行重试）。
+- **UNKNOWN 处理**：超时/传输中断 → 意图置 UNKNOWN 阻塞同标的同方向；下次
+  注册前自动 `reconcile_unknown_intents`——委托列表有痕迹（按单号/方向唯一
+  匹配）→ 收敛 submitted/filled/partially_filled；无痕迹 → failed 解除阻塞；
+  无法判断 → 保持阻塞。at-most-once 发送 + 状态核验，绝不盲目重发。
+- **启动恢复**：`app.main` 启动时把遗留 EXECUTING 意图收敛为 UNKNOWN
+  （阻塞直到核对），不会因重启把未完成操作当作新操作重新执行。
+- **接线**：`_handle_moni_trade` 在 preflight 后注册意图（成功→submitted、
+  超时→UNKNOWN、业务拒绝→failed）；`_handle_moni_cancel` 注册撤单意图并
+  在撤单后回查委托状态（撤单请求 ≠ 撤单完成）。
+
+### 补丁 D：后端权威执行结果
+
+`_build_backend_execution_report`：后端根据工具计划、执行记录、回查状态
+生成权威报告，追加到最终结论之后并落库（decision.backend_execution_report）。
+状态口径：SUBMITTED（交易/撤单）、VERIFIED / NOOP / UNKNOWN（自选股回查）、
+NOT_CALLED（声明未获执行确认）、BLOCKED_MISSING_DATA（数据门禁拦截）、
+FAILED/UNKNOWN（未落地动作）。模型负责解释为什么操作，后端负责证明操作
+究竟有没有发生。前端结构化展示（执行卡片）按用户意见后置。
+
+### 补丁 E：必需工具调用检查
+
+- 代码级清单（不依赖提示词）：analysis 必需 mx_get_self_selects /
+  mx_search_news / mx_screen_stocks；trade 必需 mx_get_balance /
+  mx_get_positions / mx_get_orders / mx_get_self_selects。写工具是条件性的，
+  不强制。
+- **覆盖全部轮次**：检查基于合并后的 tool_calls（含一致性 followup 与
+  补充调用的结果），不只看最后一次响应。
+- 缺失时给模型**一次补充调用机会**（补充调用的工具结果真正进入后续
+  计划执行流程）；仍缺失 → `data_validation_passed=False`，本轮**全部
+  写操作计划被拦截**（不进入执行器），拦截原因记录在
+  decision.blocked_actions_missing_required_tools。
+- 动态技能（tdx-stock-api 等）工具名由部署环境决定，暂未纳入强制清单。
+
+### 补充防护（用户复审指出）
+
+- **自选股并发锁**：读取→判断→写入→回查全程模块级互斥，防止两个并发
+  任务同时读到"不存在"然后同时发送 ADD。
+- **SELL 信号重复**：意图表对 SELL 与 BUY 对称生效（同一退出信号反复
+  出现只允许一笔在途）。
+- **run_type 缺失**：执行时权限复检对缺失 run_type 默认按 analysis 处理
+  （交易工具被拒），不会因缺失而放行写操作。
+
+### 第二轮测试
+
+- `tests/test_write_operation_safety.py`（15 个）：意图去重/冷却/分批上限/
+  SELL 对称/次日新信号/撤单唯一/崩溃恢复/并发唯一约束/UNKNOWN 两种收敛/
+  失败重试 + 补丁 D 报告全状态与空运行。
+- E2E：必需工具缺失时交易计划被拦截、零动作执行、最终结论附带
+  BLOCKED_MISSING_DATA 报告（`test_automation_session.py`）。
+- 既有 E2E 的假 agent 全部补上必需读取工具调用（补丁 E 上线后的正确
+  测试形态——不调用必需工具的运行本来就该被拦截）。
+
+**全量回归：后端 387 passed**（371 + 16 新增）。
+
+### 第三轮：补丁 D 前端执行卡片（2026-10-30）
+
+- **后端补充**：`_build_execution_report_payload` 产出机器可读的结构化
+  报告（schema=backend_execution_report_v1），与文本报告同源同口径，存入
+  decision_payload.execution_report——前端卡片不再解析自然语言。
+  字段：overall_status（NO_ACTION/SUBMITTED/VERIFIED/UNKNOWN/NOT_CALLED）、
+  trades/cancels/self_selects（含逐条状态）、not_called_claims、
+  blocked_actions、unresolved_count、missing_required_tools、
+  data_validation_passed。
+- **前端 composable**（useAnalysisRuns.ts）：`BackendExecutionReportViewModel`
+  解析 + 状态枚举中文映射（已提交/已回查确认/已满足（未发送）/状态未确认/
+  声明未执行/已拦截/本轮无写操作），空值与畸形字段全部防御。
+- **TasksView**：新增"执行结果（后端权威记录）"卡片，与执行概览/动作
+  时间线并列——顶部总体状态徽章 + 权威口径提示，分组渲染交易执行、撤单
+  请求、自选股变更（逐条状态）、声明未获执行确认（NOT_CALLED）、数据门禁
+  拦截（BLOCKED_MISSING_DATA），尾部提示未落地动作数与必需工具缺失。
+  显示条件：detail 加载且存在 execution_report（不依赖动作记录）。
+- **验收**：浏览器 E2E——种子运行（含全部状态类型）渲染出完整卡片，
+  各状态徽章/分组/提示与后端 payload 一一对应；截图留档。
+- 测试：后端 payload 结构 2 个（全状态/空运行）；前端 2 个
+  （卡片渲染断言 + composable 解析断言）。
+  **全量回归：后端 389 passed，前端 86 passed，vue-tsc/build 通过。**
+
+### 遗留（按用户复审意见）
+
+- 拦截原因统计与监控（P2 阶段）。
+- 动态技能的必需工具映射（待部署环境确认工具名）。
+
+## 部署提醒
+
+- 所有改动在本地，待用户推送。
+- 推送后生效的行为变化：模型只在文字里写"买入/卖出/新增自选/移除自选"
+  **不会再被自动执行**——会触发 followup 让模型自己补调工具或改口；
+  同标的有未完成买单时买入会被预检拒绝（需先撤单或等成交）。

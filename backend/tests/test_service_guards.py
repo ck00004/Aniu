@@ -648,7 +648,10 @@ def test_extract_claimed_self_select_changes_detects_added_stock_from_final_answ
     assert any(item["target"] == "002281" for item in changes)
 
 
-def test_extract_claimed_self_select_changes_treats_new_candidates_as_additions() -> None:
+def test_extract_claimed_self_select_changes_ignores_research_candidate_lines() -> None:
+    """研究性表述（"新增候选/新增关注/新增重点跟踪"）属于分析结论，
+    不是自选股写操作声明——不得据此触发一致性缺口或补写（2026-10
+    外部审计补丁 A）。"""
     final_answer = """
 五、条件选股筛选后的新增候选结论
 其中，我认为今天最值得重点跟踪的新增候选只有3个：
@@ -659,9 +662,7 @@ def test_extract_claimed_self_select_changes_treats_new_candidates_as_additions(
 
     changes = aniu_service._extract_claimed_self_select_changes(final_answer)
 
-    assert any(item["action"] == "add" and item["target"] == "亨通光电" for item in changes)
-    assert any(item["action"] == "add" and item["target"] == "三环集团" for item in changes)
-    assert any(item["action"] == "add" and item["target"] == "中船防务" for item in changes)
+    assert changes == []
 
 
 def test_extract_claimed_self_select_changes_ignores_reason_lines_in_non_trading_day_summary() -> None:
@@ -802,14 +803,26 @@ def test_enforce_self_select_consistency_corrects_followup_text_when_actions_exi
     assert "实际移除自选股：工业富联" in str(merged_decision.get("final_answer") or "")
 
 
-def test_enforce_self_select_consistency_auto_fills_missing_actions(
+def test_enforce_self_select_consistency_marks_gap_without_auto_writes(
     monkeypatch,
 ) -> None:
-    def fail_run_agent_with_messages(*, messages, **kwargs):
-        del messages, kwargs
-        raise AssertionError("不应进入二次 LLM 一致性改写")
+    """声明与计划不一致时只标记缺口并请求模型纠正，
+    不得由自然语言自动生成自选股写操作（补丁 A）。"""
+    followup_calls: list[list[dict]] = []
 
-    monkeypatch.setattr(llm_service, "run_agent_with_messages", fail_run_agent_with_messages)
+    def fake_run_agent_with_messages(*, messages, **kwargs):
+        followup_calls.append(messages)
+        return (
+            {
+                "final_answer": "本轮没有实际新增或移除任何自选股。",
+                "tool_calls": [],
+            },
+            {},
+            {},
+            {"messages": messages},
+        )
+
+    monkeypatch.setattr(llm_service, "run_agent_with_messages", fake_run_agent_with_messages)
 
     decision = {
         "final_answer": "新增自选股：杰瑞股份\n移除自选股：工业富联",
@@ -826,23 +839,16 @@ def test_enforce_self_select_consistency_auto_fills_missing_actions(
         runtime_trace={"messages": [{"role": "assistant", "content": decision["final_answer"]}]},
     )
 
-    assert merged_decision.get("consistency_autofill_applied") is True
-    consistency_analysis = (merged_decision.get("consistency_analysis") or {}).get(
-        "self_select"
-    )
-    assert isinstance(consistency_analysis, dict)
-    assert consistency_analysis.get("schema") == "consistency_operation_v1"
-    assert consistency_analysis.get("autofill_applied") is True
-    assert len(consistency_analysis.get("operations") or []) == 2
-    assert len(executed_actions) == 2
-    assert {
-        str(item.get("query") or "") for item in executed_actions
-    } == {"将杰瑞股份加入自选股", "将工业富联从自选股删除"}
-    assert "系统一致性提示" not in str(merged_decision.get("final_answer") or "")
-    assert len(merged_decision.get("tool_calls") or []) == 2
-    assert all(
-        str(item.get("name") or "") == "mx_manage_self_select"
-        for item in (merged_decision.get("tool_calls") or [])
+    # 不自动补写：无新增工具调用、无执行动作
+    assert merged_decision.get("consistency_autofill_applied") is None
+    assert merged_decision.get("consistency_gap") is True
+    assert merged_decision.get("original_final_answer") == decision["final_answer"]
+    assert executed_actions == []
+    assert merged_decision.get("tool_calls") == []
+    # 走 followup 纠正：模型重写表述
+    assert len(followup_calls) == 1
+    assert "本轮没有实际新增或移除任何自选股" in str(
+        merged_decision.get("final_answer") or ""
     )
 
 
@@ -969,14 +975,26 @@ def test_enforce_trade_consistency_corrects_followup_text_when_actions_exist(
     assert "实际卖出：立讯精密(002475) 5000股" in str(merged_decision.get("final_answer") or "")
 
 
-def test_enforce_trade_consistency_auto_fills_missing_actions_when_code_and_quantity_are_explicit(
+def test_enforce_trade_consistency_marks_gap_without_auto_trades(
     monkeypatch,
 ) -> None:
-    def fail_run_agent_with_messages(*, messages, **kwargs):
-        del messages, kwargs
-        raise AssertionError("不应进入二次 LLM 交易一致性改写")
+    """交易声明与计划不一致时只标记缺口并请求模型纠正，
+    不得由自然语言自动生成真实委托（补丁 A：文字不能成为下单来源）。"""
+    followup_calls: list[list[dict]] = []
 
-    monkeypatch.setattr(llm_service, "run_agent_with_messages", fail_run_agent_with_messages)
+    def fake_run_agent_with_messages(*, messages, **kwargs):
+        followup_calls.append(messages)
+        return (
+            {
+                "final_answer": "本轮未实际交易，此前表述有误。",
+                "tool_calls": [],
+            },
+            {},
+            {},
+            {"messages": messages},
+        )
+
+    monkeypatch.setattr(llm_service, "run_agent_with_messages", fake_run_agent_with_messages)
 
     decision = {
         "final_answer": "执行：卖出立讯精密（002475）5000股",
@@ -993,21 +1011,13 @@ def test_enforce_trade_consistency_auto_fills_missing_actions_when_code_and_quan
         runtime_trace={"messages": [{"role": "assistant", "content": decision["final_answer"]}]},
     )
 
-    assert merged_decision.get("consistency_autofill_applied") is True
-    consistency_analysis = (merged_decision.get("consistency_analysis") or {}).get(
-        "trade"
-    )
-    assert isinstance(consistency_analysis, dict)
-    assert consistency_analysis.get("schema") == "consistency_operation_v1"
-    assert consistency_analysis.get("autofill_applied") is True
-    assert len(consistency_analysis.get("operations") or []) == 1
-    assert len(executed_actions) == 1
-    assert executed_actions[0]["action"] == "SELL"
-    assert executed_actions[0]["symbol"] == "002475"
-    assert executed_actions[0]["quantity"] == 5000
-    assert "系统一致性提示" not in str(merged_decision.get("final_answer") or "")
-    assert len(merged_decision.get("tool_calls") or []) == 1
-    assert str(merged_decision["tool_calls"][0].get("name") or "") == "mx_moni_trade"
+    assert merged_decision.get("consistency_autofill_applied") is None
+    assert merged_decision.get("consistency_gap") is True
+    assert merged_decision.get("original_final_answer") == decision["final_answer"]
+    assert executed_actions == []
+    assert merged_decision.get("tool_calls") == []
+    assert len(followup_calls) == 1
+    assert "本轮未实际交易" in str(merged_decision.get("final_answer") or "")
 
 
 def test_jin10_news_service_fetches_raw_news_items(monkeypatch) -> None:

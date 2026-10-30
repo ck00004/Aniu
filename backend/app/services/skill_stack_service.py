@@ -246,10 +246,27 @@ class SkillRuntimeProvider:
         arguments: dict[str, Any],
         context: dict[str, Any],
     ) -> dict[str, Any]:
+        # 执行时权限复检（2026-10 外部审计补丁 F）：工具列表构建时按
+        # run_type 筛选，但执行入口此前不复检——模型幻觉调用未授权的
+        # 工具名（如分析任务里调用交易工具）仍会被真实执行。
+        run_type = str(context.get("run_type") or "analysis").strip() or "analysis"
         for pkg in skill_registry.enabled_packages():
             if pkg.skill is None:
                 continue
             if tool_name in pkg.skill.tool_names():
+                allowed_names = {
+                    spec.get("function", {}).get("name", "")
+                    for spec in pkg.skill.tools_for(run_type)
+                }
+                if tool_name not in allowed_names:
+                    return {
+                        "ok": False,
+                        "tool_name": tool_name,
+                        "error": (
+                            f"工具 {tool_name} 不允许在 {run_type} 任务中执行，"
+                            "该调用已被运行时权限检查拒绝。"
+                        ),
+                    }
                 try:
                     return pkg.skill.handle(
                         tool_name=tool_name,

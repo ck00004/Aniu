@@ -70,6 +70,19 @@ NON_TRADING_ANALYSIS_MAX_TASKS = 2
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 ANALYSIS_TASK_NAMES = {"盘前分析", "午间复盘", "收盘分析", "夜间分析"}
+
+# 补丁 E（2026-10 外部审计）：任务完成前的必需读取工具清单（代码级
+# 强制，不依赖提示词自觉）。写工具是条件性的（本轮不写就不调用），
+# 不在此列。动态技能（tdx-stock-api 等）的工具名由部署环境决定，
+# 暂不纳入强制清单，后续可通过设置扩展。
+_REQUIRED_TOOLS_BY_RUN_TYPE: dict[str, frozenset[str]] = {
+    "analysis": frozenset(
+        {"mx_get_self_selects", "mx_search_news", "mx_screen_stocks"}
+    ),
+    "trade": frozenset(
+        {"mx_get_balance", "mx_get_positions", "mx_get_orders", "mx_get_self_selects"}
+    ),
+}
 SCHEDULE_RETRY_DELAY = timedelta(minutes=5)
 SCHEDULE_MAX_RETRIES = 3
 ACCOUNT_PREFETCH_TOOL_NAMES = (
@@ -2789,10 +2802,55 @@ class AniuService:
                     tool_executor=_planning_tool_executor,
                 )
 
+                # 补丁 E：必需读取工具检查（覆盖全部轮次的合并 tool_calls，
+                # 含一致性 followup 的调用）。缺失时先给模型一次补充调用
+                # 机会，仍缺失则禁止依赖缺失数据的写操作。
+                (
+                    decision,
+                    llm_request,
+                    llm_response,
+                    runtime_trace,
+                ) = self._enforce_required_tools(
+                    settings=settings,
+                    client=client,
+                    decision=decision,
+                    llm_request=llm_request,
+                    llm_response=llm_response,
+                    runtime_trace=runtime_trace,
+                    emit=_emit,
+                    tool_executor=_planning_tool_executor,
+                )
+
                 tool_calls = decision.get("tool_calls")
                 planned_actions = self._extract_planned_actions(tool_calls)
                 planned_action_drafts = self._extract_planned_action_drafts(tool_calls)
                 legacy_executed_actions = self._extract_executed_actions(tool_calls)
+
+                # 补丁 E 写操作门禁：必需数据缺失时，本轮的全部写操作
+                # 计划被拦截（不进入执行器），并记录拦截原因供审计。
+                blocked_write_drafts: list[dict[str, Any]] = []
+                if (
+                    not bool(decision.get("data_validation_passed", True))
+                    and planned_action_drafts
+                ):
+                    blocked_write_drafts = list(planned_action_drafts)
+                    planned_action_drafts = []
+                    decision["blocked_actions_missing_required_tools"] = [
+                        {
+                            "tool_name": item.get("tool_name"),
+                            "action_type": item.get("action_type"),
+                            "reason": "必需数据工具未成功调用，写操作被拦截",
+                        }
+                        for item in blocked_write_drafts
+                    ]
+                    _emit(
+                        "stage",
+                        stage="execution",
+                        message=(
+                            f"必需数据缺失，已拦截 {len(blocked_write_drafts)} 条"
+                            "写操作计划"
+                        ),
+                    )
 
                 execution_summary = None
                 executed_actions: list[dict[str, Any]] = []
@@ -2851,6 +2909,23 @@ class AniuService:
                     finalized_answer,
                     executed_actions,
                 )
+                # 补丁 D：后端权威执行结果追加到最终结论——模型负责解释
+                # 为什么操作，后端负责证明操作究竟有没有发生。
+                backend_execution_report = self._build_backend_execution_report(
+                    decision=decision,
+                    executed_actions=executed_actions,
+                    blocked_write_drafts=blocked_write_drafts,
+                    execution_summary=execution_summary,
+                )
+                execution_report_payload = self._build_execution_report_payload(
+                    decision=decision,
+                    executed_actions=executed_actions,
+                    blocked_write_drafts=blocked_write_drafts,
+                    execution_summary=execution_summary,
+                )
+                finalized_answer = (
+                    f"{finalized_answer}\n\n{backend_execution_report}".strip()
+                )
                 decorated_final_answer = self._decorate_final_answer_with_sources(
                     finalized_answer,
                     prefetched_context_meta,
@@ -2858,6 +2933,8 @@ class AniuService:
                 decision = dict(decision)
                 decision["final_answer"] = decorated_final_answer
                 decision["execution_summary"] = execution_summary
+                decision["backend_execution_report"] = backend_execution_report
+                decision["execution_report"] = execution_report_payload
             finally:
                 client.close()
 
@@ -3562,83 +3639,6 @@ class AniuService:
             normalized_price,
         )
 
-    def _materialize_consistency_operations(
-        self,
-        *,
-        settings: Any,
-        client: MXClient,
-        analysis: dict[str, Any],
-    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-        operations = analysis.get("operations")
-        if not isinstance(operations, list) or not operations:
-            normalized_analysis = dict(analysis)
-            normalized_analysis.setdefault("materialized_operations", [])
-            normalized_analysis.setdefault("materialized_tool_calls", [])
-            normalized_analysis["autofill_applied"] = False
-            return normalized_analysis, []
-
-        normalized_analysis = dict(analysis)
-        materialized_operations: list[dict[str, Any]] = []
-        materialized_tool_calls: list[dict[str, Any]] = []
-        run_type = str(getattr(settings, "run_type", "analysis") or "analysis")
-
-        for raw_operation in operations:
-            if not isinstance(raw_operation, dict):
-                continue
-            tool_name = str(raw_operation.get("tool_name") or "").strip()
-            if not tool_name:
-                continue
-
-            arguments = (
-                dict(raw_operation.get("arguments"))
-                if isinstance(raw_operation.get("arguments"), dict)
-                else {}
-            )
-            tool_call_id = str(raw_operation.get("tool_call_id") or "").strip() or None
-            sequence_no = int(raw_operation.get("sequence_no") or 0)
-
-            try:
-                tool_result, _draft = execution_plan_service.execute_tool(
-                    tool_name=tool_name,
-                    arguments=arguments,
-                    tool_call_id=tool_call_id,
-                    context={
-                        "client": client,
-                        "app_settings": settings,
-                        "run_type": run_type,
-                    },
-                    sequence_no=sequence_no,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "consistency operation materialize failed: check=%s tool=%s error=%s",
-                    analysis.get("check_name"),
-                    tool_name,
-                    exc,
-                )
-                tool_result = {
-                    "ok": False,
-                    "tool_name": tool_name,
-                    "error": str(exc),
-                }
-
-            tool_call = {
-                "id": tool_call_id,
-                "name": tool_name,
-                "arguments": arguments,
-                "result": tool_result,
-            }
-            materialized_tool_calls.append(tool_call)
-
-            materialized_operation = dict(raw_operation)
-            materialized_operation["result"] = tool_result
-            materialized_operations.append(materialized_operation)
-
-        normalized_analysis["materialized_operations"] = materialized_operations
-        normalized_analysis["materialized_tool_calls"] = materialized_tool_calls
-        normalized_analysis["autofill_applied"] = bool(materialized_tool_calls)
-        return normalized_analysis, materialized_tool_calls
-
     def _clean_self_select_target(self, raw_target: Any) -> str:
         text = str(raw_target or "").strip()
         if not text:
@@ -3852,16 +3852,6 @@ class AniuService:
                 for target in mentions:
                     _push("remove", target, line)
                 continue
-            if any(
-                token in compact
-                for token in ("新增候选", "新增关注", "新增重点跟踪", "重点跟踪的新增候选")
-            ) and (line.endswith((":", "：")) or "只有" in line or "如下" in line):
-                current_action = "add"
-                mentions = self._extract_stock_mentions(_name_segment(line))
-                for target in mentions:
-                    _push("add", target, line)
-                continue
-
             if current_action and list_item_pattern.match(line):
                 normalized_item = list_item_pattern.sub("", line).strip()
                 prefix = re.split(r"[:：]", normalized_item, maxsplit=1)[0].strip()
@@ -3899,10 +3889,6 @@ class AniuService:
                 for target in self._extract_stock_mentions(segment):
                     _push(action, target, segment)
 
-        for matched in re.finditer(r"(?:新增候选|新增关注|新增重点跟踪对象?)[:：]?([^。；;\n]+)", text):
-            segment = matched.group(1)
-            for target in self._extract_stock_mentions(segment):
-                _push("add", target, segment)
 
         return changes
 
@@ -4171,27 +4157,6 @@ class AniuService:
             "autofill_ready": bool(operations),
         }
 
-    def _build_trade_consistency_autofill_tool_calls(
-        self,
-        *,
-        settings: Any,
-        client: MXClient,
-        final_answer: Any,
-        tool_calls: Any,
-        gap_detected: bool | None = None,
-    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-        analysis = self._analyze_trade_consistency(
-            final_answer=final_answer,
-            tool_calls=tool_calls,
-            run_type=str(getattr(settings, "run_type", "trade") or "trade"),
-            gap_detected=gap_detected,
-        )
-        return self._materialize_consistency_operations(
-            settings=settings,
-            client=client,
-            analysis=analysis,
-        )
-
     def _extract_actual_trade_changes(
         self, executed_actions: list[dict[str, Any]] | Any
     ) -> list[dict[str, str]]:
@@ -4368,86 +4333,6 @@ class AniuService:
             if parsed is not None:
                 changes.append(parsed)
         return changes
-
-    def _build_self_select_consistency_autofill_tool_calls(
-        self,
-        *,
-        settings: Any,
-        client: MXClient,
-        final_answer: Any,
-        tool_calls: Any,
-        gap_detected: bool | None = None,
-    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-        existing_tool_calls = tool_calls if isinstance(tool_calls, list) else []
-        existing_actions = self._extract_planned_actions(existing_tool_calls)
-        if not existing_actions:
-            existing_actions = self._extract_executed_actions(existing_tool_calls)
-
-        claimed_changes = self._extract_claimed_self_select_changes(final_answer)
-        actual_targets_by_action: dict[str, set[str]] = {
-            "add": set(),
-            "remove": set(),
-        }
-        for item in self._extract_actual_self_select_changes(existing_actions):
-            action = item.get("action")
-            target = self._clean_self_select_target(item.get("target"))
-            if action in actual_targets_by_action and target:
-                actual_targets_by_action[action].add(target)
-                actual_targets_by_action[action].update(
-                    self._extract_stock_mentions(target)
-                )
-
-        sequence_no = len(existing_actions)
-        operations: list[dict[str, Any]] = []
-        for item in claimed_changes:
-            action = str(item.get("action") or "").strip()
-            target = self._clean_self_select_target(item.get("target"))
-            if action not in actual_targets_by_action or not target:
-                continue
-
-            claimed_tokens = {target}
-            claimed_tokens.update(self._extract_stock_mentions(target))
-            if not claimed_tokens.isdisjoint(actual_targets_by_action[action]):
-                continue
-
-            query = (
-                f"将{target}加入自选股"
-                if action == "add"
-                else f"将{target}从自选股删除"
-            )
-            sequence_no += 1
-            operations.append(
-                {
-                    "sequence_no": sequence_no,
-                    "tool_call_id": f"consistency-self-select-{sequence_no}",
-                    "tool_name": "mx_manage_self_select",
-                    "action_type": "MANAGE_SELF_SELECT",
-                    "operation_key": f"self-select:{action}:{target}",
-                    "claim": item,
-                    "arguments": {"query": query},
-                }
-            )
-            actual_targets_by_action[action].update(claimed_tokens)
-
-        analysis = {
-            "schema": "consistency_operation_v1",
-            "check_name": "self_select",
-            "run_type": str(getattr(settings, "run_type", "analysis") or "analysis"),
-            "gap_detected": (
-                bool(gap_detected)
-                if gap_detected is not None
-                else self._has_self_select_consistency_gap(final_answer, existing_actions)
-            ),
-            "claimed_changes": claimed_changes,
-            "existing_actions": existing_actions,
-            "operations": operations,
-            "autofill_ready": bool(operations),
-        }
-        return self._materialize_consistency_operations(
-            settings=settings,
-            client=client,
-            analysis=analysis,
-        )
 
     def _has_self_select_consistency_gap(
         self, final_answer: Any, executed_actions: list[dict[str, Any]] | Any
@@ -4634,6 +4519,359 @@ class AniuService:
             merged["final_message"] = second.get("final_message")
         return merged
 
+    def _enforce_required_tools(
+        self,
+        *,
+        settings: Any,
+        client: MXClient,
+        decision: dict[str, Any],
+        llm_request: dict[str, Any],
+        llm_response: dict[str, Any],
+        runtime_trace: dict[str, Any],
+        emit: Any = None,
+        tool_executor: Any = None,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+        """补丁 E：必需读取工具调用检查（覆盖全部轮次的合并 tool_calls）。
+
+        缺失时给模型一次补充调用机会；仍缺失则标记
+        data_validation_passed=False，由调用方禁止依赖缺失数据的写操作。
+        """
+        run_type = str(getattr(settings, "run_type", "analysis") or "analysis")
+        required = _REQUIRED_TOOLS_BY_RUN_TYPE.get(run_type)
+        if not required:
+            return decision, llm_request, llm_response, runtime_trace
+        _emit = emit if callable(emit) else (lambda *_a, **_kw: None)
+
+        def _successful_tool_names(payload: dict[str, Any]) -> set[str]:
+            names: set[str] = set()
+            for call in (payload.get("tool_calls") or []):
+                if not isinstance(call, dict):
+                    continue
+                result = call.get("result")
+                if isinstance(result, dict) and bool(result.get("ok")):
+                    names.add(str(call.get("name") or ""))
+            return names
+
+        missing = set(required) - _successful_tool_names(decision)
+        if not missing:
+            decision["data_validation_passed"] = True
+            return decision, llm_request, llm_response, runtime_trace
+
+        messages = (
+            runtime_trace.get("messages")
+            if isinstance(runtime_trace, dict)
+            else None
+        )
+        if isinstance(messages, list) and messages:
+            _emit(
+                "stage",
+                stage="llm",
+                message=(
+                    f"检测到必需数据工具未成功调用（{', '.join(sorted(missing))}），"
+                    "正在请求模型补充调用"
+                ),
+            )
+            followup_messages = [dict(item) for item in messages]
+            followup_messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "本轮任务要求先完成以下数据读取工具调用，但当前尚未成功"
+                        f"调用：{', '.join(sorted(missing))}。请立即调用这些工具"
+                        "获取真实数据后再给出最终结论；不得凭记忆或推测替代，"
+                        "也不得在数据缺失的情况下声称已完成核验。"
+                    ),
+                }
+            )
+            (
+                followup_decision,
+                followup_request,
+                followup_response,
+                followup_runtime_trace,
+            ) = self._run_agent_with_optional_tool_executor(
+                app_settings=settings,
+                client=client,
+                messages=followup_messages,
+                emit=emit,
+                tool_executor=tool_executor,
+            )
+            # 补充调用的工具结果必须进入后续流程（合并 tool_calls）
+            merged_decision = dict(followup_decision)
+            combined_tool_calls = list(decision.get("tool_calls") or [])
+            if isinstance(followup_decision.get("tool_calls"), list):
+                combined_tool_calls.extend(followup_decision["tool_calls"])
+            merged_decision["tool_calls"] = combined_tool_calls
+            merged_llm_request = {
+                "initial_request": llm_request,
+                "required_tools_followup_request": followup_request,
+            }
+            merged_llm_response = self._merge_llm_response_payloads(
+                llm_response, followup_response
+            )
+            decision = merged_decision
+            llm_request = merged_llm_request
+            llm_response = merged_llm_response
+            runtime_trace = followup_runtime_trace
+            missing = set(required) - _successful_tool_names(decision)
+
+        if missing:
+            decision["missing_required_tools"] = sorted(missing)
+            decision["data_validation_passed"] = False
+            _emit(
+                "stage",
+                stage="llm",
+                message=(
+                    f"必需数据工具仍未成功调用：{', '.join(sorted(missing))}；"
+                    "本轮已禁止依赖缺失数据的写操作"
+                ),
+            )
+        else:
+            decision["data_validation_passed"] = True
+        return decision, llm_request, llm_response, runtime_trace
+
+    def _build_execution_report_payload(
+        self,
+        *,
+        decision: dict[str, Any],
+        executed_actions: list[dict[str, Any]],
+        blocked_write_drafts: list[dict[str, Any]],
+        execution_summary: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """补丁 D：结构化执行报告（机器可读，供前端执行卡片渲染）。
+
+        与 _build_backend_execution_report（文本版）同源同口径；状态枚举：
+        SUBMITTED / VERIFIED / NOOP / UNKNOWN / NOT_CALLED / BLOCKED_MISSING_DATA。
+        """
+        trades: list[dict[str, Any]] = []
+        cancels: list[dict[str, Any]] = []
+        self_selects: list[dict[str, Any]] = []
+        for item in executed_actions:
+            action = str(item.get("action") or "").upper()
+            if action in {"BUY", "SELL"}:
+                trades.append(
+                    {
+                        "symbol": str(item.get("symbol") or ""),
+                        "action": action,
+                        "quantity": int(item.get("quantity") or 0),
+                        "status": "SUBMITTED",
+                    }
+                )
+            elif action == "CANCEL":
+                cancels.append(
+                    {
+                        "order_id": str(item.get("order_id") or ""),
+                        "stock_code": item.get("stock_code"),
+                        "status": "SUBMITTED",
+                    }
+                )
+            elif action == "MANAGE_SELF_SELECT":
+                if bool(item.get("noop")):
+                    status = "NOOP"
+                elif bool(item.get("verified")):
+                    status = "VERIFIED"
+                else:
+                    status = "UNKNOWN"
+                self_selects.append(
+                    {
+                        "query": str(item.get("query") or ""),
+                        "status": status,
+                    }
+                )
+
+        not_called_claims: list[dict[str, Any]] = []
+        consistency = decision.get("consistency_analysis")
+        if isinstance(consistency, dict):
+            for check in ("trade", "self_select"):
+                payload = consistency.get(check)
+                if not isinstance(payload, dict) or not bool(
+                    payload.get("gap_detected")
+                ):
+                    continue
+                for item in payload.get("claimed_changes") or []:
+                    if isinstance(item, dict):
+                        not_called_claims.append(
+                            {
+                                "action": str(item.get("action") or ""),
+                                "target": str(item.get("target") or ""),
+                            }
+                        )
+
+        blocked_actions = [
+            {
+                "tool_name": str(item.get("tool_name") or ""),
+                "action_type": str(item.get("action_type") or ""),
+                "reason": str(item.get("reason") or "必需数据工具未成功调用，写操作被拦截"),
+            }
+            for item in blocked_write_drafts
+            if isinstance(item, dict)
+        ]
+
+        unresolved_count = int((execution_summary or {}).get("unresolved_count") or 0)
+        missing_tools = [
+            str(item) for item in (decision.get("missing_required_tools") or [])
+        ]
+        data_validation_passed = bool(decision.get("data_validation_passed", True))
+
+        # 总体状态（前端徽章）：按最严重的事实降序取值
+        if blocked_actions or not_called_claims:
+            overall = "NOT_CALLED"
+        elif unresolved_count > 0:
+            overall = "UNKNOWN"
+        elif any(item["status"] == "UNKNOWN" for item in self_selects):
+            overall = "UNKNOWN"
+        elif trades or cancels or self_selects:
+            overall = "SUBMITTED"
+        else:
+            overall = "NO_ACTION"
+        if trades or cancels or self_selects:
+            if not blocked_actions and not not_called_claims and unresolved_count == 0:
+                overall = "VERIFIED" if all(
+                    item["status"] in {"VERIFIED", "NOOP"} for item in self_selects
+                ) and not trades and not cancels else "SUBMITTED"
+
+        return {
+            "schema": "backend_execution_report_v1",
+            "overall_status": overall,
+            "verified": overall == "VERIFIED",
+            "trades": trades,
+            "cancels": cancels,
+            "self_selects": self_selects,
+            "not_called_claims": not_called_claims,
+            "blocked_actions": blocked_actions,
+            "unresolved_count": unresolved_count,
+            "missing_required_tools": missing_tools,
+            "data_validation_passed": data_validation_passed,
+        }
+
+    def _build_backend_execution_report(
+        self,
+        *,
+        decision: dict[str, Any],
+        executed_actions: list[dict[str, Any]],
+        blocked_write_drafts: list[dict[str, Any]],
+        execution_summary: dict[str, Any] | None,
+    ) -> str:
+        """补丁 D：后端权威执行结果报告（追加到最终结论之后）。
+
+        模型负责解释为什么操作，后端负责证明操作究竟有没有发生。
+        状态口径：NOT_CALLED / PLANNED / SUBMITTED / VERIFIED / NOOP /
+        FAILED / UNKNOWN / BLOCKED_MISSING_DATA。
+        """
+        lines: list[str] = [
+            "## 系统执行结果（后端权威记录）",
+            "以下内容由后端根据工具计划、执行记录与回查状态生成，"
+            "操作是否发生以后端记录为准。",
+        ]
+
+        trade_actions = [
+            item
+            for item in executed_actions
+            if str(item.get("action") or "") in {"BUY", "SELL"}
+        ]
+        cancel_actions = [
+            item
+            for item in executed_actions
+            if str(item.get("action") or "") == "CANCEL"
+        ]
+        self_select_actions = [
+            item
+            for item in executed_actions
+            if str(item.get("action") or "") == "MANAGE_SELF_SELECT"
+        ]
+
+        trade_desc = (
+            "、".join(
+                f"{item.get('action')} {item.get('symbol')} {item.get('quantity')}股"
+                for item in trade_actions
+            )
+            or "无"
+        )
+        lines.append(f"- 交易执行（SUBMITTED）：{trade_desc}")
+        cancel_desc = (
+            "、".join(
+                f"撤单 {item.get('order_id')}" for item in cancel_actions
+            )
+            or "无"
+        )
+        lines.append(f"- 撤单请求（SUBMITTED）：{cancel_desc}")
+
+        if self_select_actions:
+            verified = [
+                item for item in self_select_actions if item.get("verified")
+            ]
+            noop = [item for item in self_select_actions if item.get("noop")]
+            other = [
+                item
+                for item in self_select_actions
+                if not item.get("verified") and not item.get("noop")
+            ]
+            parts = []
+            if verified:
+                parts.append(
+                    "已回查确认（VERIFIED）："
+                    + "、".join(str(item.get("query") or "") for item in verified)
+                )
+            if noop:
+                parts.append(
+                    "目标状态已满足、未发送写请求（NOOP）："
+                    + "、".join(str(item.get("query") or "") for item in noop)
+                )
+            if other:
+                parts.append(
+                    "状态未确认（UNKNOWN）："
+                    + "、".join(str(item.get("query") or "") for item in other)
+                )
+            lines.append("- 自选股变更：" + "；".join(parts) if parts else "- 自选股变更：无")
+        else:
+            lines.append("- 自选股变更：无")
+
+        # 声明了但未获执行确认（NOT_CALLED）
+        consistency = decision.get("consistency_analysis")
+        claimed_not_executed: list[str] = []
+        if isinstance(consistency, dict):
+            for check in ("trade", "self_select"):
+                payload = consistency.get(check)
+                if not isinstance(payload, dict):
+                    continue
+                if not bool(payload.get("gap_detected")):
+                    continue
+                for item in payload.get("claimed_changes") or []:
+                    if isinstance(item, dict):
+                        claimed_not_executed.append(
+                            f"{check}:{item.get('action')} {item.get('target')}"
+                        )
+        if claimed_not_executed:
+            lines.append(
+                "- 声明未获执行确认（NOT_CALLED，最终结论中不得表述为已执行）："
+                + "；".join(claimed_not_executed)
+            )
+
+        if blocked_write_drafts:
+            lines.append(
+                "- 已拦截的写操作（BLOCKED_MISSING_DATA，必需数据工具未调用）："
+                + "、".join(
+                    str(item.get("tool_name") or "") for item in blocked_write_drafts
+                )
+            )
+
+        unresolved = int(
+            (execution_summary or {}).get("unresolved_count") or 0
+        )
+        if unresolved > 0:
+            lines.append(
+                f"- 未落地计划动作（FAILED/UNKNOWN）：{unresolved} 条，"
+                "相关操作不得表述为已执行。"
+            )
+
+        missing_tools = decision.get("missing_required_tools")
+        if missing_tools:
+            lines.append(
+                f"- 数据完整性：必需工具缺失（{', '.join(missing_tools)}），"
+                "本轮分析不完整。"
+            )
+
+        return "\n".join(lines)
+
     def _enforce_self_select_consistency(
         self,
         *,
@@ -4666,13 +4904,18 @@ class AniuService:
             planned_actions = self._extract_executed_actions(tool_calls)
         final_answer = decision.get("final_answer")
         has_gap = self._has_self_select_consistency_gap(final_answer, planned_actions)
-        consistency_analysis, _ = self._build_self_select_consistency_autofill_tool_calls(
-            settings=settings,
-            client=client,
-            final_answer=final_answer,
-            tool_calls=tool_calls,
-            gap_detected=has_gap,
-        )
+        # 纯分析（不执行任何操作）：一致性检查只允许发现问题，
+        # 不允许由自然语言声明生成真实自选股写操作。
+        consistency_analysis = {
+            "schema": "consistency_operation_v1",
+            "check_name": "self_select",
+            "run_type": str(getattr(settings, "run_type", "analysis") or "analysis"),
+            "gap_detected": has_gap,
+            "claimed_changes": self._extract_claimed_self_select_changes(final_answer),
+            "existing_actions": planned_actions,
+            "operations": [],
+            "autofill_ready": False,
+        }
         normalized_decision = self._merge_consistency_analysis(
             dict(decision),
             check_name="self_select",
@@ -4692,50 +4935,19 @@ class AniuService:
                 planned_actions,
             )
 
-        consistency_analysis, autofill_tool_calls = self._build_self_select_consistency_autofill_tool_calls(
-            settings=settings,
-            client=client,
-            final_answer=final_answer,
-            tool_calls=tool_calls,
-            gap_detected=has_gap,
+        # 检测到自选股声明与计划不一致时，不再由自然语言自动生成写操作
+        # （原 autofill 路径会让"文字里写移除X"被后端补成真实自选股变更，
+        # 且执行失败时原文仍保留"已移除"表述——2026-10 外部审计判定为
+        # 高风险）。修正只能由 followup 中模型自己重新调用工具完成。
+        normalized_decision["consistency_gap"] = True
+        normalized_decision["original_final_answer"] = (
+            str(final_answer or "").strip() or None
         )
-        if autofill_tool_calls:
-            _emit(
-                "stage",
-                stage="execution",
-                message="检测到自选股声明未执行，正在自动补齐缺失操作",
-            )
-            combined_tool_calls = list(tool_calls) if isinstance(tool_calls, list) else []
-            combined_tool_calls.extend(autofill_tool_calls)
-            merged_decision = self._merge_consistency_analysis(
-                normalized_decision,
-                check_name="self_select",
-                payload=consistency_analysis,
-            )
-            merged_decision["tool_calls"] = combined_tool_calls
-            merged_decision["original_final_answer"] = (
-                str(final_answer or "").strip() or None
-            )
-            merged_decision["consistency_autofill_applied"] = True
-            merged_planned_actions = self._extract_planned_actions(combined_tool_calls)
-            if not merged_planned_actions:
-                merged_planned_actions = self._extract_executed_actions(
-                    combined_tool_calls
-                )
-            merged_decision["final_answer"] = self._finalize_self_select_consistency(
-                final_answer,
-                merged_planned_actions,
-            )
-            merged_runtime_trace = (
-                dict(runtime_trace) if isinstance(runtime_trace, dict) else {}
-            )
-            return (
-                merged_decision,
-                llm_request,
-                llm_response,
-                merged_runtime_trace,
-                merged_planned_actions,
-            )
+        _emit(
+            "stage",
+            stage="llm",
+            message="检测到自选股声明与工具计划不一致，正在请求模型纠正表述或补齐工具调用",
+        )
 
         messages = runtime_trace.get("messages") if isinstance(runtime_trace, dict) else None
         if not isinstance(messages, list) or not messages:
@@ -4783,6 +4995,7 @@ class AniuService:
         if not merged_planned_actions:
             merged_planned_actions = self._extract_executed_actions(combined_tool_calls)
         merged_decision["original_final_answer"] = str(final_answer or "").strip() or None
+        merged_decision["consistency_gap"] = True
         revised_final_answer = self._finalize_self_select_consistency(
             followup_decision.get("final_answer"),
             merged_planned_actions,
@@ -4877,50 +5090,20 @@ class AniuService:
                 planned_actions,
             )
 
-        consistency_analysis, autofill_tool_calls = self._build_trade_consistency_autofill_tool_calls(
-            settings=settings,
-            client=client,
-            final_answer=final_answer,
-            tool_calls=tool_calls,
-            gap_detected=has_gap,
+        # 检测到声明与计划不一致时，不再由自然语言自动生成交易委托
+        # （原 autofill 路径：模型只在文字里写"买入X"也会被后端补成真实
+        # 委托——2026-10 外部审计判定为高风险，一致性检查只允许发现
+        # 问题与请求模型纠正，不允许代替模型发起写操作）。修正只能由
+        # followup 中模型自己重新调用工具完成，且走全部交易挡板。
+        normalized_decision["consistency_gap"] = True
+        normalized_decision["original_final_answer"] = (
+            str(final_answer or "").strip() or None
         )
-        if autofill_tool_calls:
-            _emit(
-                "stage",
-                stage="execution",
-                message="检测到交易声明未执行，正在自动补齐缺失委托",
-            )
-            combined_tool_calls = list(tool_calls) if isinstance(tool_calls, list) else []
-            combined_tool_calls.extend(autofill_tool_calls)
-            merged_decision = self._merge_consistency_analysis(
-                normalized_decision,
-                check_name="trade",
-                payload=consistency_analysis,
-            )
-            merged_decision["tool_calls"] = combined_tool_calls
-            merged_decision["original_final_answer"] = (
-                str(final_answer or "").strip() or None
-            )
-            merged_decision["consistency_autofill_applied"] = True
-            merged_planned_actions = self._extract_planned_actions(combined_tool_calls)
-            if not merged_planned_actions:
-                merged_planned_actions = self._extract_executed_actions(
-                    combined_tool_calls
-                )
-            merged_decision["final_answer"] = self._finalize_trade_consistency(
-                final_answer,
-                merged_planned_actions,
-            )
-            merged_runtime_trace = (
-                dict(runtime_trace) if isinstance(runtime_trace, dict) else {}
-            )
-            return (
-                merged_decision,
-                llm_request,
-                llm_response,
-                merged_runtime_trace,
-                merged_planned_actions,
-            )
+        _emit(
+            "stage",
+            stage="llm",
+            message="检测到交易声明与工具计划不一致，正在请求模型纠正表述或补齐工具调用",
+        )
 
         messages = runtime_trace.get("messages") if isinstance(runtime_trace, dict) else None
         if not isinstance(messages, list) or not messages:
@@ -4968,6 +5151,7 @@ class AniuService:
         if not merged_planned_actions:
             merged_planned_actions = self._extract_executed_actions(combined_tool_calls)
         merged_decision["original_final_answer"] = str(final_answer or "").strip() or None
+        merged_decision["consistency_gap"] = True
         revised_final_answer = self._finalize_trade_consistency(
             followup_decision.get("final_answer"),
             merged_planned_actions,

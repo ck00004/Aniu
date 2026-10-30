@@ -64,3 +64,34 @@ test('analysis summary builder keeps source labels in run detail mapping flow', 
   assert.match(composableSource, /const tradeSourceLabels = getTradeSourceLabels\(detail\)/)
   assert.match(composableSource, /mapTradeDetails\(detail\.trade_orders, detail\.executed_actions, tradeSourceLabels\)/)
 })
+
+test('tasks view renders the backend execution report card', () => {
+  const source = readFileSync(new URL('../src/views/TasksView.vue', import.meta.url), 'utf-8')
+
+  assert.ok(source.includes('执行结果（后端权威记录）'))
+  assert.ok(source.includes('displayBackendExecutionReport'))
+  assert.ok(source.includes('声明未获执行确认'))
+  assert.ok(source.includes('数据门禁拦截'))
+  assert.ok(source.includes('backendExecutionReport'))
+  // 权威口径提示
+  assert.ok(source.includes('以后端记录为准'))
+})
+
+test('analysis runs composable parses backend execution report payload', () => {
+  const source = readFileSync(
+    new URL('../src/composables/useAnalysisRuns.ts', import.meta.url),
+    'utf-8',
+  )
+
+  assert.ok(source.includes('interface BackendExecutionReportViewModel'))
+  assert.ok(source.includes('getBackendExecutionReport'))
+  assert.ok(source.includes("execution_report"))
+  assert.ok(source.includes('not_called_claims'))
+  assert.ok(source.includes('blocked_actions'))
+  assert.ok(source.includes('missing_required_tools'))
+  // 状态枚举映射
+  assert.ok(source.includes('SUBMITTED'))
+  assert.ok(source.includes('VERIFIED'))
+  assert.ok(source.includes('NOOP'))
+  assert.ok(source.includes('NOT_CALLED'))
+})

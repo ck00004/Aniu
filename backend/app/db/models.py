@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Any
 
-from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, func
+from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
 
@@ -377,3 +377,45 @@ class MemoryDream(Base):
     )
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class TradeIntent(Base):
+    """交易意图（补丁 C：跨轮/跨任务防重复交易的持久化挡板）。
+
+    signal_id 由后端按（交易日, 标的, 方向）派生——同一天同一标的同一
+    方向视为同一个交易信号，15 分钟任务反复触发同一信号不会产生新键。
+    tranche_id 区分同一信号下的合法分批：前一档已成交且冷却期已过才允
+    许建立新档，每日每标的每方向有分批上限。
+    """
+
+    __tablename__ = "trade_intents"
+    __table_args__ = (
+        UniqueConstraint(
+            "signal_date",
+            "symbol",
+            "side",
+            "tranche_id",
+            name="uq_trade_intent_signal_tranche",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    signal_date: Mapped[str] = mapped_column(String(10), index=True)
+    symbol: Mapped[str] = mapped_column(String(16), index=True)
+    side: Mapped[str] = mapped_column(String(8), index=True)
+    tranche_id: Mapped[int] = mapped_column(Integer, default=1)
+    intent_key: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    run_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    action_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    provider_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    quantity: Mapped[int] = mapped_column(Integer, default=0)
+    # PLANNED / EXECUTING / SUBMITTED / UNKNOWN / FILLED / PARTIALLY_FILLED
+    # / CANCELED / FAILED / CANCEL_UNKNOWN
+    status: Mapped[str] = mapped_column(String(20), default="planned", index=True)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )

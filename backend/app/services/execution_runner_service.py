@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.db.database import session_scope
 from app.db.models import StrategyRunAction, StrategyRunActionResult
 from app.services.mx_skill_service import mx_skill_service
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_ACTION_MAX_ATTEMPTS = 2
@@ -42,6 +45,19 @@ class ExecutionRunnerService:
                 select(StrategyRunAction).where(StrategyRunAction.run_id == run_id)
             ).all()
             for action in existing:
+                # 已发送（executing）或已出结果（completed/failed*）的动作
+                # 是审计记录，不得被新计划覆盖删除（2026-10 外部审计补丁 D：
+                # 删除后无法追溯真实发送过什么委托）。只允许替换仍处于
+                # planned 状态、尚未发送的动作。
+                if str(action.status or "planned") != "planned":
+                    logger.warning(
+                        "replace_plan kept non-planned action %s (status=%s) "
+                        "for run %s: sent actions are immutable audit records",
+                        action.id,
+                        action.status,
+                        run_id,
+                    )
+                    continue
                 db.delete(action)
 
             for item in planned_actions:
@@ -180,25 +196,32 @@ class ExecutionRunnerService:
         *,
         requested_max_attempts: int,
     ) -> int:
-        normalized_attempts = max(1, int(requested_max_attempts or 1))
+        # 写操作一律只允许一次自动尝试：撤单/自选股变更与买卖一样，
+        # 重试会在状态不明时重复发送写请求（2026-10 外部审计补丁 F）。
+        # 读取状态可以重试，写操作超时后必须先核对远端状态。
         action_type = str(action.action_type or "").upper()
-        if action_type in {"BUY", "SELL"}:
+        if action_type in {"BUY", "SELL", "CANCEL", "MANAGE_SELF_SELECT"}:
             return 1
+        normalized_attempts = max(1, int(requested_max_attempts or 1))
         return normalized_attempts
 
     def _mark_action_executing(self, action_id: int) -> StrategyRunAction | None:
         with session_scope() as db:
+            # 原子抢占：条件更新 + 受影响行数校验，防止两个执行者
+            # 同时把同一动作置为 executing（读-判-写在并发下存在窗口）。
+            claimed = db.execute(
+                update(StrategyRunAction)
+                .where(
+                    StrategyRunAction.id == action_id,
+                    StrategyRunAction.status.in_(_EXECUTABLE_ACTION_STATUSES),
+                )
+                .values(status="executing")
+            )
+            if claimed.rowcount != 1:
+                return None
             action = db.get(StrategyRunAction, action_id)
             if action is None:
                 return None
-            # 重入防护：仅允许从可执行状态进入 executing。已 completed/
-            # executing/terminal 的动作直接拒绝，防止并发或重复调用
-            # execute_plan 时重放真实交易。
-            if str(action.status or "planned") not in _EXECUTABLE_ACTION_STATUSES:
-                return None
-            action.status = "executing"
-            db.add(action)
-            db.flush()
             db.expunge(action)
             return action
 

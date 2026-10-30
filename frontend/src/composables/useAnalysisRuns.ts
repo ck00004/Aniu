@@ -46,7 +46,23 @@ export interface AnalysisRunViewModel {
   selfSelectAdditions: SelfSelectChange[]
   selfSelectRemovals: SelfSelectChange[]
   executionSummary: ExecutionSummaryViewModel | null
+  backendExecutionReport: BackendExecutionReportViewModel | null
   runActions: RunActionViewModel[]
+}
+
+export interface BackendExecutionReportViewModel {
+  overallStatus: string
+  overallStatusText: string
+  overallTone: ActionTone
+  verified: boolean
+  trades: Array<{ symbol: string, action: string, quantity: number, statusText: string, tone: ActionTone }>
+  cancels: Array<{ orderId: string, stockCode: string | null, statusText: string, tone: ActionTone }>
+  selfSelects: Array<{ query: string, statusText: string, tone: ActionTone }>
+  notCalledClaims: Array<{ action: string, target: string }>
+  blockedActions: Array<{ toolName: string, actionType: string, reason: string }>
+  unresolvedCount: number
+  missingRequiredTools: string[]
+  dataValidationPassed: boolean
 }
 
 export interface ExecutionSummaryViewModel {
@@ -549,6 +565,105 @@ function getExecutionSummary(detail: RunDetail): ExecutionSummaryViewModel | nul
   }
 }
 
+const EXECUTION_REPORT_STATUS_META: Record<string, { label: string, tone: ActionTone }> = {
+  SUBMITTED: { label: '已提交', tone: 'running' },
+  VERIFIED: { label: '已回查确认', tone: 'success' },
+  NOOP: { label: '已满足（未发送）', tone: 'neutral' },
+  UNKNOWN: { label: '状态未确认', tone: 'warning' },
+  NOT_CALLED: { label: '声明未执行', tone: 'error' },
+  BLOCKED_MISSING_DATA: { label: '已拦截', tone: 'error' },
+  NO_ACTION: { label: '本轮无写操作', tone: 'neutral' },
+}
+
+function getReportStatusMeta(status: string): { label: string, tone: ActionTone } {
+  return EXECUTION_REPORT_STATUS_META[status] ?? { label: status || '未知', tone: 'neutral' }
+}
+
+function getBackendExecutionReport(detail: RunDetail): BackendExecutionReportViewModel | null {
+  const decisionPayload = getObjectValue(detail.decision_payload)
+  const payload = getObjectValue(decisionPayload?.execution_report)
+  if (!payload) {
+    return null
+  }
+
+  const overallStatus = getStringValue(payload.overall_status) || 'NO_ACTION'
+  const overallMeta = getReportStatusMeta(overallStatus)
+
+  const trades = (Array.isArray(payload.trades) ? payload.trades : [])
+    .filter((item): item is Record<string, unknown> => !!item && typeof item === 'object')
+    .map((item) => {
+      const status = getStringValue(item.status) || 'SUBMITTED'
+      const meta = getReportStatusMeta(status)
+      return {
+        symbol: getStringValue(item.symbol) || '',
+        action: getStringValue(item.action) || '',
+        quantity: Number(item.quantity ?? 0),
+        statusText: meta.label,
+        tone: meta.tone,
+      }
+    })
+
+  const cancels = (Array.isArray(payload.cancels) ? payload.cancels : [])
+    .filter((item): item is Record<string, unknown> => !!item && typeof item === 'object')
+    .map((item) => {
+      const status = getStringValue(item.status) || 'SUBMITTED'
+      const meta = getReportStatusMeta(status)
+      return {
+        orderId: getStringValue(item.order_id) || '',
+        stockCode: getStringValue(item.stock_code) || null,
+        statusText: meta.label,
+        tone: meta.tone,
+      }
+    })
+
+  const selfSelects = (Array.isArray(payload.self_selects) ? payload.self_selects : [])
+    .filter((item): item is Record<string, unknown> => !!item && typeof item === 'object')
+    .map((item) => {
+      const status = getStringValue(item.status) || 'UNKNOWN'
+      const meta = getReportStatusMeta(status)
+      return {
+        query: getStringValue(item.query) || '',
+        statusText: meta.label,
+        tone: meta.tone,
+      }
+    })
+
+  const notCalledClaims = (Array.isArray(payload.not_called_claims) ? payload.not_called_claims : [])
+    .filter((item): item is Record<string, unknown> => !!item && typeof item === 'object')
+    .map((item) => ({
+      action: getStringValue(item.action) || '',
+      target: getStringValue(item.target) || '',
+    }))
+
+  const blockedActions = (Array.isArray(payload.blocked_actions) ? payload.blocked_actions : [])
+    .filter((item): item is Record<string, unknown> => !!item && typeof item === 'object')
+    .map((item) => ({
+      toolName: getStringValue(item.tool_name) || '',
+      actionType: getStringValue(item.action_type) || '',
+      reason: getStringValue(item.reason) || '',
+    }))
+
+  const missingRequiredTools = (Array.isArray(payload.missing_required_tools)
+    ? payload.missing_required_tools
+    : []
+  ).map((item) => String(item ?? '')).filter(Boolean)
+
+  return {
+    overallStatus,
+    overallStatusText: overallMeta.label,
+    overallTone: overallMeta.tone,
+    verified: payload.verified === true,
+    trades,
+    cancels,
+    selfSelects,
+    notCalledClaims,
+    blockedActions,
+    unresolvedCount: Number(payload.unresolved_count ?? 0),
+    missingRequiredTools,
+    dataValidationPassed: payload.data_validation_passed !== false,
+  }
+}
+
 function getRunActions(detail: RunDetail): RunActionViewModel[] {
   const actions = Array.isArray(detail.actions) ? detail.actions : []
 
@@ -868,6 +983,7 @@ function mapRunSummaryToViewModel(summary: RunSummary): AnalysisRunViewModel {
     selfSelectAdditions: [],
     selfSelectRemovals: [],
     executionSummary: null,
+    backendExecutionReport: null,
     runActions: [],
   }
 }
@@ -885,6 +1001,7 @@ function mapRunDetailToViewModel(detail: RunDetail): AnalysisRunViewModel {
   const jin10SourceInfo = getJin10SourceInfo(detail)
   const selfSelectChanges = getSelfSelectChanges(detail)
   const executionSummary = getExecutionSummary(detail)
+  const backendExecutionReport = getBackendExecutionReport(detail)
   const runActions = getRunActions(detail)
 
   return {
@@ -917,6 +1034,7 @@ function mapRunDetailToViewModel(detail: RunDetail): AnalysisRunViewModel {
     selfSelectAdditions: selfSelectChanges.additions,
     selfSelectRemovals: selfSelectChanges.removals,
     executionSummary,
+    backendExecutionReport,
     runActions,
   }
 }

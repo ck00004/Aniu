@@ -144,6 +144,7 @@ class instrument_invocation:
         self._started_at = time.monotonic()
         self._status_code: int | None = None
         self._response_size: int | None = None
+        self._error_summary: str | None = None
 
     def __enter__(self) -> "instrument_invocation":
         return self
@@ -153,13 +154,15 @@ class instrument_invocation:
         *,
         status_code: int | None = None,
         response_size: int | None = None,
+        error_summary: str | None = None,
     ) -> None:
         self._status_code = status_code
         self._response_size = response_size
+        self._error_summary = error_summary
 
     def __exit__(self, exc_type, exc, tb) -> bool:
         duration_ms = int((time.monotonic() - self._started_at) * 1000)
-        if exc is None:
+        if exc is None and not self._error_summary:
             record_invocation(
                 operation=self._operation,
                 request_payload=self._request_payload,
@@ -176,6 +179,6 @@ class instrument_invocation:
                 status_code=self._status_code,
                 duration_ms=duration_ms,
                 response_size=self._response_size,
-                error_summary=str(exc),
+                error_summary=str(exc) if exc is not None else self._error_summary,
             )
         return False
