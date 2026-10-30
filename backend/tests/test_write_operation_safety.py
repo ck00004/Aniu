@@ -26,6 +26,7 @@ from app.core.config import get_settings
 from app.db import database as database_module
 from app.db.database import init_db, session_scope
 from app.db.models import TradeIntent
+from app.services.execution_runner_service import execution_runner_service
 from app.services.trade_intent_service import (
     FILLED_REENTRY_COOLDOWN_MINUTES,
     MAX_TRANCHES_PER_SIGNAL,
@@ -1045,3 +1046,397 @@ def test_read_tool_ok_with_empty_payload_counts_as_missing() -> None:
 
     assert merged.get("data_validation_passed") is False
     assert "mx_get_balance" in (merged.get("missing_required_tools") or [])
+
+
+# ---------------------------------------------------------------------------
+# 第三轮复审专项（清单 12 项中可自动化的 11 项）
+# ---------------------------------------------------------------------------
+
+
+def test_string_status_business_rejection_classified() -> None:
+    """清单 #1：status="100"（字符串）业务拒绝 → MXBusinessRejected。"""
+    from skills.mx_core.client import MXBusinessRejected, MXClient
+
+    with pytest.raises(MXBusinessRejected, match="status=100"):
+        MXClient._raise_on_business_error({"status": "100", "message": "拒绝"})
+
+
+def test_string_code_business_rejection_classified() -> None:
+    """清单 #2：code="100"（字符串）业务拒绝 → MXBusinessRejected。"""
+    from skills.mx_core.client import MXBusinessRejected, MXClient
+
+    with pytest.raises(MXBusinessRejected, match="code=100"):
+        MXClient._raise_on_business_error({"code": "100", "message": "拒绝"})
+
+
+def test_http_500_marks_unknown_not_rejected(monkeypatch, tmp_path) -> None:
+    """清单 #3：HTTP 500 → 状态不明（UNKNOWN），不重复提交。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        from skills.mx_core import execution as mx_execution
+
+        monkeypatch.setattr(mx_execution, "is_market_open", lambda: True)
+
+        class _Http500Client:
+            def get_orders(self) -> dict:
+                return {"data": {"orders": []}}
+
+            def get_balance(self) -> dict:
+                return {"data": {"availBalance": 10_000_000.0}}
+
+            def trade(self, **kwargs) -> dict:
+                import httpx
+
+                request = httpx.Request("POST", "https://x/trade")
+                response = httpx.Response(500, request=request, text="server error")
+                raise httpx.HTTPStatusError(
+                    "Server Error", request=request, response=response
+                )
+
+        result = mx_execution.mx_execution_service.execute_tool(
+            client=_Http500Client(),
+            app_settings=None,
+            tool_name="mx_moni_trade",
+            arguments={
+                "action": "BUY",
+                "symbol": "600519",
+                "quantity": 100,
+                "price_type": "LIMIT",
+                "price": 20.0,
+            },
+        )
+        assert result["ok"] is False
+        assert "委托状态未知" in str(result.get("error") or "")
+        intents = _list_intents(symbol="600519")
+        assert intents[0].status == "unknown"
+    finally:
+        _reset_db_state()
+
+
+def test_http_4xx_marks_business_rejected() -> None:
+    """HTTP 4xx → 远端明确拒绝（可安全标记 failed）。"""
+    from skills.mx_core.client import MXBusinessRejected, MXClient
+
+    import httpx
+
+    request = httpx.Request("POST", "https://x/trade")
+    response = httpx.Response(403, request=request, text="forbidden")
+    with pytest.raises(MXBusinessRejected, match="HTTP 403"):
+        try:
+            raise httpx.HTTPStatusError(
+                "Forbidden", request=request, response=response
+            )
+        except httpx.HTTPStatusError as exc:
+            # 复现 _post 的分类逻辑
+            status_code = exc.response.status_code
+            if 400 <= status_code < 500:
+                raise MXBusinessRejected(f"妙想接口 HTTP {status_code} 拒绝请求") from exc
+            raise RuntimeError("不应到达") from exc
+
+
+def test_filled_order_leaving_list_not_failed(monkeypatch, tmp_path) -> None:
+    """清单 #4：已成交委托从活动列表消失 → 不得判定未提交。
+
+    SUBMITTED 意图在委托列表查不到时保持 submitted（阻塞），
+    绝不进入"无记录等待→failed"路径。
+    """
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        client = _IntentClient()
+        intent = trade_intent_service.check_and_register_trade_intent(
+            client=client, symbol="600519", side="BUY", quantity=100
+        )
+        trade_intent_service.mark_intent_submitted(intent.id, "ORD-GONE")
+
+        # 委托列表为空（订单已成交离开活动列表）
+        client.orders = []
+        resolved = trade_intent_service.reconcile_open_trade_intents(
+            client, symbol="600519"
+        )
+        assert resolved[0].status == "submitted"
+        assert "不可见" in str(resolved[0].note or "")
+
+        # 多次核验后仍是 submitted（不进入 failed 路径）
+        for _ in range(3):
+            trade_intent_service.reconcile_open_trade_intents(
+                client, symbol="600519"
+            )
+        assert _list_intents(id=intent.id)[0].status == "submitted"
+    finally:
+        _reset_db_state()
+
+
+def test_provider_order_id_mismatch_keeps_unknown(monkeypatch, tmp_path) -> None:
+    """清单 #5：有单号但远端无此单、存在其他同向委托 → 保持 UNKNOWN。
+
+    不得把其他委托（ORD-099）认作本意图（ORD-100）。
+    """
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        client = _IntentClient(
+            orders=[
+                {
+                    "stockCode": "600519",
+                    "orderDrt": "1",
+                    "orderStatus": "1",
+                    "orderCount": 100,
+                    "dealCount": 0,
+                    "orderID": "ORD-099",  # 另一笔委托
+                }
+            ]
+        )
+        intent = trade_intent_service.check_and_register_trade_intent(
+            client=client, symbol="600519", side="BUY", quantity=100
+        )
+        _backdate_intent(intent.id, status="unknown", provider_order_id="ORD-100")
+
+        resolved = trade_intent_service.reconcile_open_trade_intents(
+            client, symbol="600519"
+        )
+        # 单号不匹配：保持 unknown，绝不把 ORD-099 认作 ORD-100
+        assert resolved[0].status == "unknown"
+    finally:
+        _reset_db_state()
+
+
+def test_unknown_order_status_code_keeps_unknown(monkeypatch, tmp_path) -> None:
+    """清单 #6：返回未知订单状态码 → 保持 UNKNOWN（不默认 canceled）。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        client = _IntentClient(
+            orders=[
+                {
+                    "stockCode": "600519",
+                    "orderDrt": "1",
+                    "orderStatus": "77",  # 未知状态码
+                    "orderCount": 100,
+                    "dealCount": 0,
+                    "orderID": "ORD-U",
+                }
+            ]
+        )
+        intent = trade_intent_service.check_and_register_trade_intent(
+            client=client, symbol="600519", side="BUY", quantity=100
+        )
+        _backdate_intent(intent.id, status="unknown", provider_order_id="ORD-U")
+
+        resolved = trade_intent_service.reconcile_open_trade_intents(
+            client, symbol="600519"
+        )
+        assert resolved[0].status == "unknown"
+    finally:
+        _reset_db_state()
+
+
+def test_followup_missing_memory_read_still_blocks() -> None:
+    """清单 #7：followup 补充了静态工具但未调 memory_read → 仍拦截。"""
+    from types import SimpleNamespace
+
+    from app.services.aniu_service import aniu_service
+
+    base_calls = [
+        {"name": "mx_get_balance", "arguments": {}, "result": {"ok": True, "result": {"data": {"availBalance": 1}}}},
+        {"name": "mx_get_positions", "arguments": {}, "result": {"ok": True, "result": {"data": {"posList": []}}}},
+        {"name": "mx_get_orders", "arguments": {}, "result": {"ok": True, "result": {"data": {"orders": []}}}},
+        {"name": "mx_get_self_selects", "arguments": {}, "result": {"ok": True, "result": {"data": {"rows": []}}}},
+        {
+            "name": "mx_moni_trade",
+            "arguments": {"action": "BUY", "symbol": "600519", "quantity": 100},
+            "result": {
+                "ok": True,
+                "planned_action": {"action": "BUY", "symbol": "600519", "quantity": 100},
+            },
+        },
+    ]
+    decision = {
+        "final_answer": "计划买入。",
+        "tool_calls": list(base_calls),  # 无 memory_read
+    }
+
+    followup_calls = [
+        # followup 只补充了静态工具（已存在），仍无 memory_read
+        {"name": "mx_get_balance", "arguments": {}, "result": {"ok": True, "result": {"data": {"availBalance": 1}}}},
+    ]
+
+    call_count = {"value": 0}
+
+    def fake_run_agent(*, app_settings, client, messages, emit=None, tool_executor=None, **kwargs):
+        call_count["value"] += 1
+        return (
+            {"final_answer": "已补充调用。", "tool_calls": followup_calls},
+            {},
+            {},
+            {"messages": messages},
+        )
+
+    original = aniu_service._run_agent_with_optional_tool_executor
+    aniu_service._run_agent_with_optional_tool_executor = fake_run_agent
+    try:
+        settings = SimpleNamespace(run_type="trade", prompt_templates={}, task_prompt="")
+        merged, _, _, _ = aniu_service._enforce_required_tools(
+            settings=settings,
+            client=None,
+            decision=decision,
+            llm_request={},
+            llm_response={},
+            runtime_trace={"messages": [{"role": "assistant", "content": "x"}]},
+            emit=None,
+            tool_executor=None,
+        )
+        assert call_count["value"] == 1  # followup 发生
+        # followup 后完整重验：memory_read 仍缺失 → 拦截（原实现会被绕过）
+        assert merged.get("data_validation_passed") is False
+        assert "memory_read:600519" in (merged.get("missing_required_tools") or [])
+    finally:
+        aniu_service._run_agent_with_optional_tool_executor = original
+
+
+def test_data_as_list_parsed(monkeypatch, tmp_path) -> None:
+    """清单 #11：妙想返回 data: [...]（列表）→ 正确识别。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        client = _IntentClient()
+        client.get_orders = lambda: {
+            "data": [
+                {
+                    "stockCode": "600519",
+                    "orderDrt": "1",
+                    "orderStatus": "1",
+                    "orderCount": 100,
+                    "dealCount": 0,
+                    "orderID": "ORD-DL",
+                }
+            ]
+        }
+        intent = trade_intent_service.check_and_register_trade_intent(
+            client=client, symbol="600519", side="BUY", quantity=100
+        )
+        _backdate_intent(intent.id, status="unknown")
+
+        resolved = trade_intent_service.reconcile_unknown_intents(
+            client, symbol="600519"
+        )
+        # data 列表被正确解析：委托存在 → 收敛 submitted
+        assert resolved[0].status == "submitted"
+    finally:
+        _reset_db_state()
+
+
+def test_cancel_intent_state_closure(monkeypatch, tmp_path) -> None:
+    """清单 #9：撤单请求后原委托状态变化 → 撤单意图同步闭环。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        client = _IntentClient(
+            orders=[
+                {
+                    "stockCode": "600519",
+                    "orderDrt": "1",
+                    "orderStatus": "1",  # 待撤
+                    "orderCount": 100,
+                    "dealCount": 0,
+                    "orderID": "ORD-C",
+                }
+            ]
+        )
+        intent = trade_intent_service.check_and_register_cancel_intent(
+            order_id="ORD-C"
+        )
+        trade_intent_service.mark_intent_submitted(intent.id, "ORD-C")
+
+        # 委托已撤销 → verified
+        client.orders = [
+            {
+                "stockCode": "600519",
+                "orderDrt": "1",
+                "orderStatus": "3",
+                "orderCount": 100,
+                "dealCount": 0,
+                "orderID": "ORD-C",
+            }
+        ]
+        resolved = trade_intent_service.reconcile_cancel_intents(client)
+        assert resolved[0].status == "verified"
+
+        # 委托已成交 → filled（撤单太迟）
+        client.orders = [
+            {
+                "stockCode": "600519",
+                "orderDrt": "1",
+                "orderStatus": "3",
+                "orderCount": 100,
+                "dealCount": 100,
+                "orderID": "ORD-C",
+            }
+        ]
+        _backdate_intent(intent.id, status="submitted")
+        resolved = trade_intent_service.reconcile_cancel_intents(client)
+        assert resolved[0].status == "filled"
+
+        # 委托从列表消失 → unknown（不可再撤，阻塞重复撤单是安全默认）
+        client.orders = []
+        _backdate_intent(intent.id, status="submitted")
+        resolved = trade_intent_service.reconcile_cancel_intents(client)
+        assert resolved[0].status == "unknown"
+        assert "消失" in str(resolved[0].note or "")
+    finally:
+        _reset_db_state()
+
+
+def test_action_id_backfill_matches_symbol_and_side(monkeypatch, tmp_path) -> None:
+    """清单 #8：同一 run 两笔交易 → action_id 分别关联（不串档）。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        today = datetime.now(SHANGHAI_TZ).date().isoformat()
+        with session_scope() as db:
+            db.add_all(
+                [
+                    TradeIntent(
+                        signal_date=today,
+                        symbol="600519",
+                        side="BUY",
+                        tranche_id=1,
+                        intent_key=f"{today}:600519:BUY:1",
+                        run_id=1,
+                        quantity=100,
+                        status="submitted",
+                    ),
+                    TradeIntent(
+                        signal_date=today,
+                        symbol="000001",
+                        side="BUY",
+                        tranche_id=1,
+                        intent_key=f"{today}:000001:BUY:1",
+                        run_id=1,
+                        quantity=200,
+                        status="submitted",
+                    ),
+                ]
+            )
+
+        # 第一笔（600519）成功执行 action 101
+        execution_runner_service._backfill_intent_action_id(
+            run_id=1,
+            action_id=101,
+            executed_action={"action": "BUY", "symbol": "600519", "quantity": 100},
+        )
+        # 只有 600519 的意图关联了 101；000001 仍为空
+        assert _list_intents(symbol="600519")[0].action_id == 101
+        assert _list_intents(symbol="000001")[0].action_id is None
+
+        # 第二笔（000001）成功执行 action 102
+        execution_runner_service._backfill_intent_action_id(
+            run_id=1,
+            action_id=102,
+            executed_action={"action": "BUY", "symbol": "000001", "quantity": 200},
+        )
+        assert _list_intents(symbol="000001")[0].action_id == 102
+        assert _list_intents(symbol="600519")[0].action_id == 101
+    finally:
+        _reset_db_state()

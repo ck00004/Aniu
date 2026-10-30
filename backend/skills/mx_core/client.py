@@ -71,7 +71,21 @@ class MXClient:
 
         with instrument_invocation(endpoint, payload) as invocation:
             response = self._client.post(url, json=payload)
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                status_code = exc.response.status_code
+                if 400 <= status_code < 500:
+                    # 4xx：远端明确拒绝该请求（可认定未生效）
+                    raise MXBusinessRejected(
+                        f"妙想接口 HTTP {status_code} 拒绝请求: "
+                        f"{exc.response.text[:200]}"
+                    ) from exc
+                # 5xx：请求已送达但处理结果未知（可能已执行）
+                raise MXResponseUnknown(
+                    f"妙想接口 HTTP {status_code}，处理结果未知: "
+                    f"{exc.response.text[:200]}"
+                ) from exc
             try:
                 data = response.json()
             except ValueError as exc:
@@ -118,7 +132,7 @@ class MXClient:
         if isinstance(status, str) and status.strip().lstrip("-").isdigit():
             normalized_status = int(status.strip())
             if normalized_status != 0:
-                raise RuntimeError(
+                raise MXBusinessRejected(
                     f"妙想接口业务错误 status={normalized_status}: "
                     f"{MXClient._extract_error_text(data)}"
                 )
@@ -134,7 +148,7 @@ class MXClient:
         if isinstance(code, str) and code.strip().lstrip("-").isdigit():
             normalized = int(code.strip())
             if normalized not in _SUCCESS_CODES:
-                raise RuntimeError(
+                raise MXBusinessRejected(
                     f"妙想接口业务错误 code={normalized}: "
                     f"{MXClient._extract_error_text(data)}"
                 )

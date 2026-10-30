@@ -878,6 +878,18 @@ class MXExecutionService:
                 "请先调用 mx_get_orders 核对该委托状态，确认前"
                 "不得重复提交同方向委托。"
             ) from exc
+        except Exception as exc:
+            # 未分类异常（请求已发出之后）：不能证明远端拒绝——
+            # 一律按状态未知处理，绝不放行重试（第三轮复审 P0）。
+            trade_intent_service.mark_intent_unknown(
+                intent.id, f"交易请求未分类异常，状态不确定：{exc}"
+            )
+            raise RuntimeError(
+                f"委托状态未知（未分类异常 {type(exc).__name__}）：{symbol} "
+                f"{action} {quantity} 股的请求已发出但结果无法确认。"
+                "请先调用 mx_get_orders 核对该委托状态，确认前"
+                "不得重复提交同方向委托。"
+            ) from exc
 
         trade_intent_service.mark_intent_submitted(
             intent.id, extract_order_id(result)
@@ -964,6 +976,16 @@ class MXExecutionService:
                 f"撤单状态未知（响应无法解析）：委托 {order_id} 的撤单请求"
                 "已发出但响应体无法确认结果。请调用 mx_get_orders 核对该"
                 "委托状态，确认前不得重复提交撤单。"
+            ) from exc
+        except Exception as exc:
+            # 未分类异常（请求已发出之后）：一律按状态未知处理
+            trade_intent_service.mark_intent_unknown(
+                intent.id, f"撤单请求未分类异常，状态不确定：{exc}"
+            )
+            raise RuntimeError(
+                f"撤单状态未知（未分类异常 {type(exc).__name__}）：委托 "
+                f"{order_id} 的撤单请求已发出但结果无法确认。请调用 "
+                "mx_get_orders 核对该委托状态，确认前不得重复提交撤单。"
             ) from exc
 
         trade_intent_service.mark_intent_submitted(

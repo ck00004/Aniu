@@ -242,7 +242,12 @@ class ExecutionRunnerService:
     def _backfill_intent_action_id(
         *, run_id: int, action_id: int, executed_action: dict[str, Any] | None
     ) -> None:
-        """把成功的计划动作 id 回填到对应的交易意图（追溯链）。"""
+        """把成功的计划动作 id 回填到对应的交易意图（追溯链）。
+
+        第三轮复审 P1：必须按 run_id + 标的 + 方向 联合匹配——
+        原实现只按 run_id 批量回填，同一轮多笔交易会被错误关联到
+        同一个 action_id，破坏事故追溯。
+        """
         if not isinstance(executed_action, dict):
             return
         action_name = str(executed_action.get("action") or "").upper()
@@ -252,17 +257,41 @@ class ExecutionRunnerService:
 
         from app.db.models import TradeIntent
 
+        symbol = str(
+            executed_action.get("symbol")
+            or executed_action.get("order_id")
+            or ""
+        ).strip()
+
         with session_scope() as db:
-            stmt = (
-                sa_update(TradeIntent)
-                .where(
-                    and_(
-                        TradeIntent.run_id == run_id,
-                        TradeIntent.action_id.is_(None),
+            if action_name == "CANCEL":
+                # 撤单意图：按 run_id + 委托单号（symbol 字段存单号）匹配
+                stmt = (
+                    sa_update(TradeIntent)
+                    .where(
+                        and_(
+                            TradeIntent.run_id == run_id,
+                            TradeIntent.symbol == symbol,
+                            TradeIntent.side == "CANCEL",
+                            TradeIntent.action_id.is_(None),
+                        )
                     )
+                    .values(action_id=action_id)
                 )
-                .values(action_id=action_id)
-            )
+            else:
+                # 交易意图：按 run_id + 标的 + 方向匹配
+                stmt = (
+                    sa_update(TradeIntent)
+                    .where(
+                        and_(
+                            TradeIntent.run_id == run_id,
+                            TradeIntent.symbol == symbol,
+                            TradeIntent.side == action_name,
+                            TradeIntent.action_id.is_(None),
+                        )
+                    )
+                    .values(action_id=action_id)
+                )
             db.execute(stmt)
 
     def _record_attempt(

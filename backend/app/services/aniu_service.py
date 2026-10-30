@@ -4643,7 +4643,32 @@ class AniuService:
             return decision, llm_request, llm_response, runtime_trace
         _emit = emit if callable(emit) else (lambda *_a, **_kw: None)
 
-        def _successful_tool_names(payload: dict[str, Any]) -> set[str]:
+        def _validate_required_tool_coverage(payload: dict[str, Any]) -> set[str]:
+            """完整覆盖校验：静态必需工具 + 逐标的 memory_read。
+
+            第三轮复审 P0：followup 合并后必须重新执行**全部**检查，
+            不能只重查静态工具——否则模型补充了静态工具却仍跳过
+            memory_read 时，门禁会被绕过。
+            """
+            missing = set(required) - _successful_tool_names_static(payload)
+
+            # P1（2026-10 复审）：交易任务对每个拟操作标的做逐标的记忆
+            # 检索检查——拟买入/卖出的标的必须在 memory_read 的关键词
+            # 里出现过（检索结果为空是有效结果，但完全没检索不算完成）。
+            if run_type == "trade":
+                planned_symbols = self._extract_planned_trade_symbols(payload)
+                if planned_symbols:
+                    searched_targets = self._extract_memory_read_targets(payload)
+                    for symbol, name in planned_symbols:
+                        covered = (
+                            symbol in searched_targets
+                            or (bool(name) and name in searched_targets)
+                        )
+                        if not covered:
+                            missing.add(f"memory_read:{symbol}")
+            return missing
+
+        def _successful_tool_names_static(payload: dict[str, Any]) -> set[str]:
             names: set[str] = set()
             for call in (payload.get("tool_calls") or []):
                 if not isinstance(call, dict):
@@ -4652,22 +4677,7 @@ class AniuService:
                     names.add(str(call.get("name") or ""))
             return names
 
-        missing = set(required) - _successful_tool_names(decision)
-
-        # P1（2026-10 复审）：交易任务对每个拟操作标的做逐标的记忆检索
-        # 检查——拟买入/卖出的标的必须在 memory_read 的关键词里出现过
-        #（检索结果为空是有效结果，但完全没检索不算完成数据验证）。
-        if run_type == "trade" and not missing:
-            planned_symbols = self._extract_planned_trade_symbols(decision)
-            if planned_symbols:
-                searched_targets = self._extract_memory_read_targets(decision)
-                for symbol, name in planned_symbols:
-                    covered = (
-                        symbol in searched_targets
-                        or (bool(name) and name in searched_targets)
-                    )
-                    if not covered:
-                        missing.add(f"memory_read:{symbol}")
+        missing = _validate_required_tool_coverage(decision)
 
         if not missing:
             decision["data_validation_passed"] = True
@@ -4728,7 +4738,9 @@ class AniuService:
             llm_request = merged_llm_request
             llm_response = merged_llm_response
             runtime_trace = followup_runtime_trace
-            missing = set(required) - _successful_tool_names(decision)
+            # 第三轮复审 P0：followup 后重新执行完整覆盖校验
+            # （含逐标的 memory_read），不得只重查静态工具。
+            missing = _validate_required_tool_coverage(decision)
 
         if missing:
             decision["missing_required_tools"] = sorted(missing)

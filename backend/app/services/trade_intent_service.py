@@ -81,11 +81,16 @@ def _extract_order_rows(payload: Any) -> list[dict[str, Any]] | None:
     """解析委托列表载荷 → 行列表；结构无法识别时返回 None（不可判定）。
 
     返回 None 表示"这不是一份可解析的完整委托快照"——调用方必须保持
-    阻塞，不得据此判定"没有委托痕迹"。
+    阻塞，不得据此判定"没有委托痕迹"。与 execution._payload_rows 同源：
+    data 可为 dict 或 list（第三轮复审 P1：data 为列表时原实现不识别）。
     """
     if not isinstance(payload, dict):
         return None
-    source = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    data_value = payload.get("data")
+    if isinstance(data_value, list):
+        # data 直接是行列表
+        return [row for row in data_value if isinstance(row, dict)]
+    source = data_value if isinstance(data_value, dict) else payload
     if isinstance(source, dict):
         for key in _ORDER_ROW_KEYS:
             rows = source.get(key)
@@ -122,8 +127,18 @@ def _order_side(row: dict[str, Any]) -> str:
     return {"1": "BUY", "2": "SELL"}.get(side, side.upper())
 
 
+# 已知的委托终局状态码白名单（撤单/废单/已结）。远端返回不在白名单
+# 的状态码时一律视为不可判定（unknown），不得默认放行——2026-10 第三轮
+# 复审 P0：未知状态默认 canceled 会错误解除阻塞。
+_ORDER_CANCELED_STATUS_VALUES = {"3", "4", "5", "6", "9", "-1"}
+
+
 def _order_terminal_status(row: dict[str, Any]) -> str:
-    """按委托行计算意图终态：filled / partially_filled / canceled / submitted。"""
+    """按委托行计算意图终态。
+
+    filled / partially_filled / submitted / canceled / unknown：
+    未知状态码返回 unknown（保持阻塞），不默认视为已撤。
+    """
     ordered = _row_int(row, "orderCount", "count", "quantity", "orderQty")
     dealt = _row_int(
         row, "dealCount", "tradeCount", "filledCount", "filledQty"
@@ -135,8 +150,10 @@ def _order_terminal_status(row: dict[str, Any]) -> str:
         return "partially_filled"
     if status in _PENDING_ORDER_STATUS_VALUES:
         return "submitted"
-    # 非待撤状态且无成交：委托已终局（撤单或废单）
-    return "canceled"
+    if status in _ORDER_CANCELED_STATUS_VALUES:
+        return "canceled"
+    # 未知状态码：不可判定，保持阻塞
+    return "unknown"
 
 
 def _now_utc() -> datetime:
@@ -462,21 +479,28 @@ class TradeIntentService:
             resolved: list[TradeIntent] = []
             now = _now_utc()
             for intent in open_intents:
-                matched_row = None
+                # P0-2（第三轮复审）：有单号时只做单号精确匹配——
+                # 单号找不到绝不退化为"标的+方向"匹配，防止把同标的的
+                # 其他委托认作本意图（错误收敛为 submitted/filled）。
                 if intent.provider_order_id:
-                    for row in symbol_rows:
-                        if _row_str(
-                            row, "orderID", "orderId", "order_id", "entrustNo"
-                        ) == str(intent.provider_order_id):
-                            matched_row = row
-                            break
-                if matched_row is None:
+                    matched_row = next(
+                        (
+                            row
+                            for row in symbol_rows
+                            if _row_str(
+                                row, "orderID", "orderId", "order_id", "entrustNo"
+                            )
+                            == str(intent.provider_order_id)
+                        ),
+                        None,
+                    )
+                else:
+                    # 无单号：标的+方向联合匹配，多候选不可自动选择
                     side_rows = [
                         row
                         for row in symbol_rows
                         if _order_side(row) == intent.side
                     ]
-                    # 无单号时仅当该标的该方向委托唯一才可对应
                     matched_row = side_rows[0] if len(side_rows) == 1 else None
 
                 if matched_row is not None:
@@ -484,31 +508,120 @@ class TradeIntentService:
                     intent.note = "已按远端委托列表同步状态"
                     intent.unknown_checks = 0
                     intent.first_unknown_at = None
+                    intent.updated_at = now
+                    db.add(intent)
+                    resolved.append(intent)
+                    continue
+
+                # ---- 查不到对应委托：按意图状态分别处理 ----
+                # P0-1b（第三轮复审）：委托从列表消失 ≠ 未提交。订单可能
+                # 已成交、已撤销或进入历史委托列表。
+                # - unknown：允许经可见性等待后判定"未提交"（该意图本来
+                #   就是因为发送状态不明才进入 UNKNOWN，无单号时这是
+                #   唯一可用证据）。
+                # - submitted/partially_filled：订单确认提交过——消失只
+                #   能说明"当前列表查不到"，绝不能判 failed 解除阻塞；
+                #   保持原状态，等待委托重新可见或人工核对。
+                if intent.status in ("submitted", "partially_filled"):
+                    intent.note = (
+                        "委托已确认提交但当前委托列表中不可见（可能已成交/"
+                        "撤销或转入历史列表），保持阻塞等待重新可见或人工核对"
+                    )
+                    intent.updated_at = now
+                    db.add(intent)
+                    resolved.append(intent)
+                    continue
+
+                # unknown：可见性等待
+                checks = int(intent.unknown_checks or 0) + 1
+                first_at = intent.first_unknown_at
+                if first_at is None:
+                    first_at = now
+                    intent.first_unknown_at = now
+                if first_at.tzinfo is None:
+                    first_at = first_at.replace(tzinfo=timezone.utc)
+                intent.unknown_checks = checks
+                waited = (now - first_at).total_seconds() >= UNKNOWN_WAIT_SECONDS
+                if checks >= UNKNOWN_MIN_CHECKS and waited:
+                    intent.status = "failed"
+                    intent.note = (
+                        f"连续 {checks} 次独立核验且超过等待期，委托列表"
+                        "均无该标的委托痕迹，判定未提交"
+                    )
+                    intent.unknown_checks = 0
+                    intent.first_unknown_at = None
                 else:
-                    # 查不到痕迹：可见性等待期内保持 UNKNOWN
-                    checks = int(intent.unknown_checks or 0) + 1
-                    first_at = intent.first_unknown_at
-                    if first_at is None:
-                        first_at = now
-                        intent.first_unknown_at = now
-                    if first_at.tzinfo is None:
-                        first_at = first_at.replace(tzinfo=timezone.utc)
-                    intent.unknown_checks = checks
-                    waited = (now - first_at).total_seconds() >= UNKNOWN_WAIT_SECONDS
-                    if checks >= UNKNOWN_MIN_CHECKS and waited:
-                        intent.status = "failed"
-                        intent.note = (
-                            f"连续 {checks} 次独立核验且超过等待期，委托列表"
-                            "均无该标的委托痕迹，判定未提交"
-                        )
-                        intent.unknown_checks = 0
-                        intent.first_unknown_at = None
+                    intent.note = (
+                        f"委托列表暂无痕迹（第 {checks} 次核验，"
+                        f"需 ≥{UNKNOWN_MIN_CHECKS} 次且超过 "
+                        f"{UNKNOWN_WAIT_SECONDS}s 等待期才可判定未提交）"
+                    )
+                intent.updated_at = now
+                db.add(intent)
+                resolved.append(intent)
+            return resolved
+
+    def reconcile_cancel_intents(self, client: Any) -> list[TradeIntent]:
+        """撤单意图状态同步（第三轮复审 P1：撤单需要独立闭环）。
+
+        按原委托单号核对：
+        - 原委托已撤销 → verified（撤单确认生效）
+        - 原委托已成交 → filled（撤单太迟，订单已执行）
+        - 原委托仍待撤 → submitted（撤单处理中，继续阻塞重复撤单）
+        - 原委托状态未知 → unknown（保持阻塞）
+        - 原委托从列表消失 → unknown（已撤销/成交/转历史，不可再撤，
+          阻塞重复撤单是安全默认）
+        """
+        try:
+            orders_payload = client.get_orders()
+        except Exception:  # noqa: BLE001
+            return []
+        rows = _extract_order_rows(orders_payload)
+        if rows is None:
+            return []
+
+        def _row_order_id(row: dict[str, Any]) -> str:
+            return _row_str(row, "orderID", "orderId", "order_id", "entrustNo")
+
+        with session_scope() as db:
+            open_cancels = list(
+                db.scalars(
+                    select(TradeIntent).where(
+                        TradeIntent.side == "CANCEL",
+                        TradeIntent.status.in_(
+                            ["executing", "submitted", "unknown"]
+                        ),
+                    )
+                ).all()
+            )
+            resolved: list[TradeIntent] = []
+            now = _now_utc()
+            for intent in open_cancels:
+                order_id = str(intent.symbol or "")
+                matched = next(
+                    (row for row in rows if _row_order_id(row) == order_id),
+                    None,
+                )
+                if matched is None:
+                    intent.status = "unknown"
+                    intent.note = (
+                        f"原委托 {order_id} 已从委托列表消失（已撤销/成交/"
+                        "转历史），不可再撤；保持阻塞防止重复撤单"
+                    )
+                else:
+                    terminal = _order_terminal_status(matched)
+                    if terminal == "canceled":
+                        intent.status = "verified"
+                        intent.note = f"原委托 {order_id} 已撤销，撤单确认生效"
+                    elif terminal in ("filled", "partially_filled"):
+                        intent.status = "filled"
+                        intent.note = f"原委托 {order_id} 已成交，撤单未生效"
+                    elif terminal == "submitted":
+                        intent.status = "submitted"
+                        intent.note = f"原委托 {order_id} 仍待撤，撤单处理中"
                     else:
-                        intent.note = (
-                            f"委托列表暂无痕迹（第 {checks} 次核验，"
-                            f"需 ≥{UNKNOWN_MIN_CHECKS} 次且超过 "
-                            f"{UNKNOWN_WAIT_SECONDS}s 等待期才可判定未提交）"
-                        )
+                        intent.status = "unknown"
+                        intent.note = f"原委托 {order_id} 状态不可判定"
                 intent.updated_at = now
                 db.add(intent)
                 resolved.append(intent)
@@ -542,6 +655,11 @@ class TradeIntentService:
                 status_counts[intent.status] = (
                     status_counts.get(intent.status, 0) + 1
                 )
+        # 撤单意图独立同步（按单号，不按标的）
+        for intent in self.reconcile_cancel_intents(client):
+            status_counts[f"cancel:{intent.status}"] = (
+                status_counts.get(f"cancel:{intent.status}", 0) + 1
+            )
         if status_counts:
             logger.info("open trade intents reconciled: %s", status_counts)
         return status_counts

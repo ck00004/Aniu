@@ -249,6 +249,53 @@ SUBMITTED→FILLED 同步（#4）、部分成交后撤销终态（#5）、启动
 
 **全量回归：后端 399 passed，前端 86 passed，vue-tsc/build 通过。**
 
+### 第五轮：第三轮复审 P0×5 + P1×3 修复（2026-10-30 第三次外部复审）
+
+**P0-1 分状态核验 + 终态白名单**：
+- SUBMITTED/PARTIALLY_FILLED 意图在委托列表查不到时**保持原状态阻塞**
+  （委托消失 ≠ 未提交——可能已成交/撤销/转历史），绝不进入"无记录
+  等待→failed"路径；只有 UNKNOWN（发送状态不明、无单号）才允许经
+  可见性等待判定未提交。
+- `_order_terminal_status` 改为**终态白名单**：未知状态码返回
+  unknown（保持阻塞），不默认 canceled。
+
+**P0-2 单号精确匹配**：有 provider_order_id 时只做单号精确匹配，
+找不到**绝不退化为标的+方向匹配**——防止把同标的的其他委托
+（ORD-099）认作本意图（ORD-100）而错误收敛。无单号时才允许
+标的+方向联合匹配，多候选不自动选择。
+
+**P0-3 异常分类补全**：
+- 字符串业务状态（status="100" / code="100"）→ MXBusinessRejected
+  （原为普通 RuntimeError，意图会卡在 executing）。
+- HTTP 4xx → MXBusinessRejected（远端明确拒绝）；HTTP 5xx →
+  MXResponseUnknown（请求已送达但处理结果未知，不放行重试）。
+- 交易/撤单 handler 增加**未分类异常兜底**：请求发出后的一切未分类
+  异常一律按状态未知处理（意图 UNKNOWN），绝不放行。
+
+**P0-4 followup 后完整重验**：提取 `_validate_required_tool_coverage`
+（静态工具 + 逐标的 memory_read 完整校验），followup 合并后**重新执行
+全部检查**——修复"模型补充静态工具却仍跳过 memory_read 时门禁被绕过"
+的漏洞。
+
+**P1 三项**：
+- **撤单意图状态闭环**：`reconcile_cancel_intents` 按原委托单号同步
+  （已撤销→verified、已成交→filled、仍待撤→submitted、消失/不可判定
+  →unknown 阻塞重复撤单），并入 `reconcile_all_open_intents` 每轮同步。
+- **action_id 精确关联**：回填按 run_id + 标的 + 方向联合匹配——
+  同一轮多笔交易分别关联各自动作，不再串档。
+- **data-list 兼容**：`_extract_order_rows` 支持 data 为列表
+  （与 execution._payload_rows 完全同源）。
+
+**第三轮专项测试**（清单 12 项中可自动化的 11 项，新增 11 个）：
+字符串 status/code 拒绝（#1/#2）、HTTP 500 → UNKNOWN（#3）、
+已成交委托消失不判 failed（#4）、单号不匹配保持 UNKNOWN（#5）、
+未知状态码保持 UNKNOWN（#6）、followup 缺 memory_read 仍拦截（#7）、
+同 run 两笔交易 action_id 分别关联（#8）、撤单状态闭环（#9）、
+data 列表解析（#11）、HTTP 4xx 拒绝。清单 #10（进程崩溃租约）与
+#12（45 分钟新信号条件）属租约架构与策略语义设计，见已知边界。
+
+**全量回归：后端 410 passed，前端 86 passed，vue-tsc/build 通过。**
+
 ### 已知边界（如实记录）
 
 - signal_id 是日级标识（交易日+标的+方向），45 分钟冷却放行第二档
@@ -259,8 +306,13 @@ SUBMITTED→FILLED 同步（#4）、部分成交后撤销终态（#5）、启动
   数据库级互斥（当前以单 worker 部署为约束）。
 - tdx-stock-api 等动态技能的必需工具映射待部署环境确认工具名后
   纳入（本地未部署该技能，无法验证）。
-- 委托状态码语义（撤单/废单的远端编码）基于常见约定推断，需真实
-  接口验证后修正 `_order_terminal_status`。
+- 委托状态码语义：终态白名单（撤单/废单编码）基于常见约定推断，
+  未知码一律 UNKNOWN 保持阻塞（安全默认），需真实接口验证后修正。
+- 进程租约（worker_id/heartbeat/lease_expires）未实现：当前以
+  单 worker 部署为约束；run 状态守卫覆盖正常启动竞争，强杀进程
+  （run 停留 running）的意图需等 run 状态收敛后才会恢复。
+- 45 分钟冷却是时间规则而非新信号验证（复审第八节）：第二/三档
+  放行前可增加行情确认等后端条件，属策略语义设计，未在本轮实施。
 - 真实妙想接口集成、多进程压测、跨日长跑尚未证明（复审清单第
   八节），建议灰度验证。
 
