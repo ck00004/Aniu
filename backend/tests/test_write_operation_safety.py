@@ -415,13 +415,15 @@ def test_unknown_intent_reconciles_to_filled_via_orders(monkeypatch, tmp_path) -
         _reset_db_state()
 
 
-def test_unknown_intent_visibility_wait_before_failed(
+def test_unknown_intent_never_auto_fails(
     monkeypatch, tmp_path
 ) -> None:
-    """P0-1 可见性等待：委托列表查不到痕迹 ≠ 未提交。
+    """P0-3（第五轮复审重设计）：UNKNOWN 一律不自动解除。
 
-    第一次核验保持 UNKNOWN（阻塞）；连续 ≥2 次核验且超过等待期后才
-    判定 failed（解除阻塞允许重试）。"""
+    活动委托列表查不到不能证明未提交；一条历史订单也不能证明完整
+    历史视图。在妙想提供可验证的完整历史委托视图前，UNKNOWN 保持
+    阻塞等待人工核验——无论核验次数与等待时间如何。
+    """
     _use_temp_db(monkeypatch, tmp_path)
     init_db()
     try:
@@ -431,40 +433,25 @@ def test_unknown_intent_visibility_wait_before_failed(
         )
         _backdate_intent(intent.id, status="unknown")
 
-        # 第 1 次核验：无痕迹 → 保持 UNKNOWN（订单可能已提交但暂不可见）
-        resolved = trade_intent_service.reconcile_unknown_intents(
-            client, symbol="600519"
-        )
-        assert resolved[0].status == "unknown"
-        assert resolved[0].unknown_checks == 1
-        # UNKNOWN 仍阻塞同向注册
-        with pytest.raises(RuntimeError, match="未完成/未确认"):
-            trade_intent_service.check_and_register_trade_intent(
-                client=client, symbol="600519", side="BUY", quantity=100
+        # 多次核验 + 等待期远超 → 仍保持 UNKNOWN
+        for _ in range(5):
+            trade_intent_service.reconcile_unknown_intents(
+                client, symbol="600519"
             )
-
-        # 第 2 次核验（未过等待期）：仍保持 UNKNOWN
-        # （中间被拦截的注册尝试本身也会触发一次核验，次数 ≥2 即可）
-        resolved = trade_intent_service.reconcile_unknown_intents(
-            client, symbol="600519"
-        )
-        assert resolved[0].status == "unknown"
-        assert resolved[0].unknown_checks >= 2
-
-        # 等待期已过 + 次数达标，但委托列表无历史委托视图（只有空列表，
-        # 不能证明查询覆盖当日全量委托）→ 仍保持 UNKNOWN 阻塞
         _backdate_intent(
             intent.id,
+            unknown_checks=99,
             first_unknown_at=datetime.now(timezone.utc)
-            - timedelta(seconds=UNKNOWN_WAIT_SECONDS + 10),
+            - timedelta(seconds=UNKNOWN_WAIT_SECONDS * 100),
         )
         resolved = trade_intent_service.reconcile_unknown_intents(
             client, symbol="600519"
         )
         assert resolved[0].status == "unknown"
+        assert "不能证明未提交" in str(resolved[0].note or "")
 
-        # 委托列表包含历史委托（已成交的其他标的）→ 证明是当日全量视图，
-        # 此时"无痕迹"才构成未提交的充分证据 → failed 解除阻塞
+        # 即使列表包含已终局委托（历史痕迹）也不解除——一条历史订单
+        # ≠ 完整历史视图（可能分页/过滤/延迟）
         client.orders = [
             {
                 "stockCode": "000001",
@@ -478,13 +465,29 @@ def test_unknown_intent_visibility_wait_before_failed(
         resolved = trade_intent_service.reconcile_unknown_intents(
             client, symbol="600519"
         )
-        assert resolved[0].status == "failed"
+        assert resolved[0].status == "unknown"
 
-        # failed 不阻塞：允许重试（技术重试档，不消耗真实分批）
-        retry = trade_intent_service.check_and_register_trade_intent(
-            client=client, symbol="600519", side="BUY", quantity=100
+        # UNKNOWN 持续阻塞同向注册
+        with pytest.raises(RuntimeError, match="未完成/未确认"):
+            trade_intent_service.check_and_register_trade_intent(
+                client=client, symbol="600519", side="BUY", quantity=100
+            )
+
+        # 人工核验路径：订单重新可见（远端确认接受）→ 收敛 submitted
+        client.orders = [
+            {
+                "stockCode": "600519",
+                "orderDrt": "1",
+                "orderStatus": "1",
+                "orderCount": 100,
+                "dealCount": 0,
+                "orderID": "ORD-VISIBLE",
+            }
+        ]
+        resolved = trade_intent_service.reconcile_unknown_intents(
+            client, symbol="600519"
         )
-        assert retry.tranche_id == 2
+        assert resolved[0].status == "submitted"
     finally:
         _reset_db_state()
 
@@ -1660,8 +1663,8 @@ def test_cancel_partial_fill_keeps_cancel_pending(monkeypatch, tmp_path) -> None
         trade_intent_service.mark_intent_submitted(intent.id, "ORD-PF")
 
         resolved = trade_intent_service.reconcile_cancel_intents(client)
-        # 部分成交 → 撤单处理中（submitted/CANCEL_PENDING），不是 filled
-        assert resolved[0].status == "submitted"
+        # 部分成交 → 独立 cancel_pending 状态（不是 filled，不锁死剩余撤单）
+        assert resolved[0].status == "cancel_pending"
         assert "部分成交" in str(resolved[0].note or "")
     finally:
         _reset_db_state()
@@ -1689,21 +1692,203 @@ def test_http_408_is_unknown_not_rejected() -> None:
             raise RuntimeError("不应到达") from exc
 
 
-def test_unknown_never_fails_without_history_view(monkeypatch, tmp_path) -> None:
-    """清单 #10：远端历史订单查询不可用（列表无历史委托）→ UNKNOWN 保持阻塞。"""
+
+
+
+# ---------------------------------------------------------------------------
+# 第五轮复审专项
+# ---------------------------------------------------------------------------
+
+
+def _assert_order_rows_invalid(payload: dict) -> None:
+    from skills.mx_core.execution import _require_parseable_order_rows
+
+    with pytest.raises(RuntimeError, match="无法解析|字段不完整"):
+        _require_parseable_order_rows(payload, what="委托列表")
+
+
+def test_data_list_with_null_elements_is_invalid() -> None:
+    """清单 #1：data: [null, "invalid", 123] → INVALID，阻断交易。"""
+    from skills.mx_core.execution import _payload_rows_with_state
+    from skills.mx_core.execution import _ROWS_INVALID
+
+    rows, state = _payload_rows_with_state({"data": [None, "invalid", 123]})
+    assert state == _ROWS_INVALID
+    assert rows == []
+
+
+def test_pending_order_missing_order_count_is_invalid_row() -> None:
+    """清单 #2：待处理状态但缺 orderCount → 行级校验失败 → INVALID。"""
+    from skills.mx_core.execution import (
+        _ROWS_INVALID,
+        _payload_rows_with_state,
+    )
+
+    _assert_order_rows_invalid(
+        {
+            "data": {
+                "orders": [
+                    {
+                        "stockCode": "600519",
+                        "orderStatus": "1",
+                        # 缺 orderCount / dealCount
+                    }
+                ]
+            }
+        }
+    )
+
+
+def test_pending_order_missing_deal_count_is_invalid_row() -> None:
+    """清单 #3：待处理状态但缺 dealCount → INVALID。"""
+    from skills.mx_core.execution import (
+        _ROWS_INVALID,
+        _payload_rows_with_state,
+    )
+
+    _assert_order_rows_invalid(
+        {
+            "data": {
+                "orders": [
+                    {
+                        "stockCode": "600519",
+                        "orderStatus": "1",
+                        "orderCount": 100,
+                        # 缺 dealCount
+                    }
+                ]
+            }
+        }
+    )
+
+
+def test_missing_status_code_is_invalid_row() -> None:
+    """清单 #4：缺 orderStatus → INVALID。"""
+    from skills.mx_core.execution import (
+        _ROWS_INVALID,
+        _payload_rows_with_state,
+    )
+
+    _assert_order_rows_invalid(
+        {
+            "data": {
+                "orders": [
+                    {"stockCode": "600519", "orderCount": 100, "dealCount": 0}
+                ]
+            }
+        }
+    )
+
+
+def test_missing_symbol_is_invalid_row() -> None:
+    """缺股票代码 → INVALID。"""
+    from skills.mx_core.execution import (
+        _ROWS_INVALID,
+        _payload_rows_with_state,
+    )
+
+    _assert_order_rows_invalid(
+        {
+            "data": {
+                "orders": [
+                    {"orderStatus": "1", "orderCount": 100, "dealCount": 0}
+                ]
+            }
+        }
+    )
+
+
+def test_pending_buy_missing_quantity_blocks_preflight() -> None:
+    """清单 #2（预检层）：待处理买单缺数量字段 → BUY 阻断。"""
+    from skills.mx_core.execution import preflight_trade
+
+    class _MissingQtyClient:
+        def get_orders(self) -> dict:
+            return {
+                "data": {
+                    "orders": [
+                        {
+                            "stockCode": "600519",
+                            "orderDrt": "1",
+                            "orderStatus": "1",
+                            "orderID": "ORD-MQ",
+                            # 缺 orderCount / dealCount
+                        }
+                    ]
+                }
+            }
+
+        def get_balance(self) -> dict:
+            return {"data": {"availBalance": 10_000_000.0}}
+
+    # 行级 Schema 校验在列表解析层即拦截（INVALID）——同样是安全阻断
+    with pytest.raises(RuntimeError, match="无法解析|字段不完整|数量缺失"):
+        preflight_trade(
+            client=_MissingQtyClient(),
+            action="BUY",
+            symbol="600519",
+            quantity=100,
+            price_type="LIMIT",
+            price=20.0,
+        )
+
+
+def test_pending_sell_missing_quantity_blocks_preflight() -> None:
+    """清单 #9（SELL）：在途卖单数量缺失 → 阻断新卖出。"""
+    from skills.mx_core.execution import preflight_trade
+
+    class _MissingQtySellClient:
+        def get_positions(self) -> dict:
+            # 不带 availCount：迫使预检走"持仓 - 在途卖出占用"推算路径
+            return {
+                "data": {
+                    "posList": [
+                        {"stockCode": "600519", "count": 1000}
+                    ]
+                }
+            }
+
+        def get_orders(self) -> dict:
+            return {
+                "data": {
+                    "orders": [
+                        {
+                            "stockCode": "600519",
+                            "orderDrt": "2",
+                            "orderStatus": "1",
+                            "orderID": "ORD-MQS",
+                            # 缺 orderCount / dealCount
+                        }
+                    ]
+                }
+            }
+
+    with pytest.raises(RuntimeError, match="无法解析|字段不完整|数量缺失"):
+        preflight_trade(
+            client=_MissingQtySellClient(),
+            action="SELL",
+            symbol="600519",
+            quantity=100,
+            price_type="MARKET",
+            price=None,
+        )
+
+
+def test_partially_filled_alone_not_history_evidence(monkeypatch, tmp_path) -> None:
+    """清单 #5：仅一条 partially_filled 订单 → 不证明完整历史视图
+    （新设计下 UNKNOWN 一律不自动解除，此测试锁定该行为）。"""
     _use_temp_db(monkeypatch, tmp_path)
     init_db()
     try:
-        # 委托列表只有活动委托（无历史视图）
         client = _IntentClient(
             orders=[
                 {
                     "stockCode": "000001",
                     "orderDrt": "1",
                     "orderStatus": "1",
-                    "orderCount": 100,
-                    "dealCount": 0,
-                    "orderID": "ORD-ACTIVE",
+                    "orderCount": 1000,
+                    "dealCount": 400,  # partially_filled，可能仍在活动列表
+                    "orderID": "ORD-PF2",
                 }
             ]
         )
@@ -1715,14 +1900,50 @@ def test_unknown_never_fails_without_history_view(monkeypatch, tmp_path) -> None
             status="unknown",
             unknown_checks=99,
             first_unknown_at=datetime.now(timezone.utc)
-            - timedelta(seconds=UNKNOWN_WAIT_SECONDS + 100),
+            - timedelta(seconds=UNKNOWN_WAIT_SECONDS * 100),
         )
-
         resolved = trade_intent_service.reconcile_unknown_intents(
             client, symbol="600519"
         )
-        # 无历史委托视图：即使次数和等待都满足，也保持 UNKNOWN
         assert resolved[0].status == "unknown"
-        assert "历史委托视图" in str(resolved[0].note or "")
     finally:
         _reset_db_state()
+
+
+def test_cancel_verify_unparseable_reports_unknown() -> None:
+    """清单 #7：撤单后回查数据结构异常 → UNKNOWN（不假成功）。"""
+    from skills.mx_core.execution import mx_execution_service
+
+    class _BadOrdersClient:
+        def get_orders(self) -> dict:
+            return {"weird": "shape"}
+
+    note = mx_execution_service._verify_cancel_result(
+        _BadOrdersClient(), "ORD-1"
+    )
+    assert "UNKNOWN" in note
+    assert "不可识别" in note
+
+
+def test_cancel_verify_missing_order_reports_unknown() -> None:
+    """找不到委托 → UNKNOWN（不再"通常表示撤单已生效"）。"""
+    from skills.mx_core.execution import mx_execution_service
+
+    class _EmptyOrdersClient:
+        def get_orders(self) -> dict:
+            return {"data": {"orders": []}}
+
+    note = mx_execution_service._verify_cancel_result(
+        _EmptyOrdersClient(), "ORD-1"
+    )
+    assert "UNKNOWN" in note
+    assert "不能据此认定撤单已生效" in note
+
+
+def test_row_int_optional_distinguishes_missing_from_zero() -> None:
+    """_row_int_optional：缺失返回 None，真实 0 返回 0。"""
+    from skills.mx_core.execution import _row_int_optional
+
+    assert _row_int_optional({"orderCount": 0}, "orderCount") == 0
+    assert _row_int_optional({}, "orderCount") is None
+    assert _row_int_optional({"orderCount": "abc"}, "orderCount") is None

@@ -336,6 +336,51 @@ HTTP 408→unknown（#8）、无历史视图 UNKNOWN 保持阻塞（#10）。
 
 **全量回归：后端 419 passed，前端 86 passed。**
 
+### 第七轮：第五轮复审 P0×4 + P1×3 修复（2026-10-30 第五次外部复审）
+
+**核实项：intent_id 执行器链路**——回填代码实际存在（复审读到旧快照），
+本轮补齐 `_normalize_executed_action` 保留 intent_id + UPDATE rowcount
+校验（≠1 记录告警）。
+
+**P0-1 订单行级 Schema 校验**（结构校验 → 字段级校验）：
+- `_row_int_optional`：数量字段缺失/格式异常返回 None——缺失值不再与
+  真实 0 混淆（待处理委托数量缺失 = 剩余不可判定）。
+- `_validate_order_row`：缺股票代码 / 缺状态码（显式原始字段检查，
+  `_order_status` 缺省 "0" 不算有效值）/ 待处理但缺 orderCount 或
+  dealCount → 该行无效。
+- `_require_parseable_order_rows`（委托列表专用）：结构级 + 行级校验，
+  任一行无效 → 整个列表按 INVALID 拒绝。持仓/自选列表用通用
+  `_require_parseable_rows`（仅结构级）——订单字段语义不适用于持仓行。
+- `data: [null, "invalid", 123]` → INVALID（列表含非 dict 元素）。
+
+**P0-2 待处理但数量缺失 → 阻断**：BUY/SELL 预检中待处理状态 +
+orderCount/dealCount 缺失 → 直接阻断（原实现 remaining=0 被放行）；
+SELL 在途占用推算路径同样处理。
+
+**P0-3 UNKNOWN 一律不自动解除**（证据标准重设计）：采纳复审"一条
+历史订单 ≠ 完整历史视图"的判断——活动委托列表查不到不能证明未提交，
+partially_filled 可能仍在活动列表，分页/过滤/延迟均无法排除。在妙想
+提供可验证的完整历史委托视图（明确交易日期、分页总数、has_more、
+查询成功状态）之前，UNKNOWN 保持阻塞等待人工核验或订单重新可见。
+原"历史视图可解除"逻辑整体移除。
+
+**P1 三项**：
+- **撤单回查四态**：`_verify_cancel_result` 改用 Fail-Closed 解析，
+  查询失败/结构异常/找不到订单一律 UNKNOWN——"找不到"不再描述为
+  "通常表示撤单已生效"。
+- **preflight_cancel 统一 Fail-Closed**：委托列表解析与 BUY/SELL 同源。
+- **cancel_pending 独立状态**：原委托部分成交、剩余在途 → 撤单意图
+  进入独立 `cancel_pending` 状态（区别于 submitted），不锁死剩余部分
+  的后续处理。
+
+**第五轮专项测试**（新增 11 个）：data 含非法元素 → INVALID（#1）、
+待处理缺 orderCount/dealCount → 行级 INVALID（#2/#3）、缺状态码 →
+INVALID（#4）、缺代码 → INVALID、预检层待处理缺数量阻断 BUY/SELL（#2/#9）、
+仅 partially_filled 不证明历史视图（#5）、撤单回查结构异常/找不到 →
+UNKNOWN（#7）、`_row_int_optional` 区分缺失与 0。
+
+**全量回归：后端 429 passed，前端 86 passed，vue-tsc/build 通过。**
+
 ### 已知边界（如实记录）
 
 - signal_id 是日级标识（交易日+标的+方向），45 分钟冷却放行第二档
@@ -355,9 +400,10 @@ HTTP 408→unknown（#8）、无历史视图 UNKNOWN 保持阻塞（#10）。
   前的行情确认等后端条件属策略语义设计，需你定义"独立新信号"的
   可验证标准后实施；未实现前建议将每日分批上限降为 1（改一个常量）
   或由你明确批准后再开放分批。
-- 必需工具的深度 Schema 校验（余额字段/持仓字段/委托字段逐项校验）
-  未实施：当前为载荷结构级校验，字段级校验需真实接口的字段语义
-  确认后建立。
+- 委托列表已实现行级 Schema 校验（第五轮）；持仓/自选/余额的字段级
+  Schema 校验未实施——需真实接口字段语义确认后建立。
+- UNKNOWN 不自动解除意味着需要人工核验路径（管理界面/历史委托查询），
+  当前可通过 mx_get_orders 人工核对；P2 的 UNKNOWN 处理界面待做。
 - tdx-stock-api 动态技能映射仍未纳入（本地未部署该技能）。
 - 真实妙想接口集成、多进程压测、跨日长跑尚未证明（复审清单第
   八节），建议灰度验证。

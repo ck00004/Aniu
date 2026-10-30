@@ -268,7 +268,7 @@ class ExecutionRunnerService:
         intent_id = executed_action.get("intent_id")
         if isinstance(intent_id, int) and intent_id > 0:
             with session_scope() as db:
-                db.execute(
+                result = db.execute(
                     sa_update(TradeIntent)
                     .where(
                         and_(
@@ -278,6 +278,15 @@ class ExecutionRunnerService:
                     )
                     .values(action_id=action_id)
                 )
+                if result.rowcount != 1:
+                    logger.warning(
+                        "intent %s action_id backfill rowcount=%s "
+                        "(expected 1): run_id=%s action_id=%s",
+                        intent_id,
+                        result.rowcount,
+                        run_id,
+                        action_id,
+                    )
             return
 
         with session_scope() as db:
@@ -375,6 +384,8 @@ class ExecutionRunnerService:
             "reason": str(executed_action.get("reason") or "").strip(),
             "status": "submitted",
             "response": result.get("result"),
+            # 保留意图 id：执行记录 → 意图的一对一追溯链
+            "intent_id": executed_action.get("intent_id"),
         }
         if action_name == "CANCEL":
             entry["price_type"] = "CANCEL"

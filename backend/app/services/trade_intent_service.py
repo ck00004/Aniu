@@ -539,16 +539,14 @@ class TradeIntentService:
                     resolved.append(intent)
                     continue
 
-                # unknown：可见性等待 + 完整订单视图证据（P0-3 第四轮复审）
-                # 活动委托列表查不到不能证明未提交——订单可能已成交离开
-                # 列表。只有当本次委托列表包含已终局委托（canceled/filled
-                # 状态的历史痕迹）时，才说明接口返回当日全量委托视图，
-                # "无痕迹"才可作为未提交证据；否则保持阻塞等待人工核验。
-                list_shows_history = any(
-                    _order_terminal_status(row)
-                    in ("canceled", "filled", "partially_filled")
-                    for row in rows
-                )
+                # unknown：不自动解除（第五轮复审 P0-3 重设计）
+                #
+                # 安全原则：找到订单 → 按精确匹配更新状态；没找到订单
+                # → 不代表没有提交。一条历史订单 ≠ 完整历史视图（接口
+                # 可能分页/过滤/延迟，partially_filled 也可能仍在活动
+                # 列表）。在妙想提供可验证的完整历史委托视图（明确指定
+                # 交易日期、分页总数、has_more、查询成功状态）之前，
+                # UNKNOWN 一律保持阻塞，等待人工核验或订单重新可见。
                 checks = int(intent.unknown_checks or 0) + 1
                 first_at = intent.first_unknown_at
                 if first_at is None:
@@ -557,30 +555,13 @@ class TradeIntentService:
                 if first_at.tzinfo is None:
                     first_at = first_at.replace(tzinfo=timezone.utc)
                 intent.unknown_checks = checks
-                waited = (now - first_at).total_seconds() >= UNKNOWN_WAIT_SECONDS
-                if (
-                    checks >= UNKNOWN_MIN_CHECKS
-                    and waited
-                    and list_shows_history
-                ):
-                    intent.status = "failed"
-                    intent.note = (
-                        f"连续 {checks} 次独立核验且超过等待期，委托列表"
-                        "（含历史委托视图）均无该标的委托痕迹，判定未提交"
-                    )
-                    intent.unknown_checks = 0
-                    intent.first_unknown_at = None
-                else:
-                    reason = (
-                        f"委托列表暂无痕迹（第 {checks} 次核验，需 ≥"
-                        f"{UNKNOWN_MIN_CHECKS} 次且超过 {UNKNOWN_WAIT_SECONDS}s"
-                    )
-                    if not list_shows_history:
-                        reason += (
-                            "，且需委托列表包含历史委托视图以证明查询完整"
-                        )
-                    reason += "）"
-                    intent.note = reason
+                intent.note = (
+                    f"委托列表暂无痕迹（第 {checks} 次核验）。活动委托列表"
+                    "查不到不能证明未提交（订单可能已成交离开列表）；"
+                    "在确认妙想委托查询返回完整历史视图前，本意图保持"
+                    "UNKNOWN 阻塞，请通过 mx_get_orders 人工核对或等待"
+                    "委托重新可见后重试。"
+                )
                 intent.updated_at = now
                 db.add(intent)
                 resolved.append(intent)
@@ -614,7 +595,7 @@ class TradeIntentService:
                     select(TradeIntent).where(
                         TradeIntent.side == "CANCEL",
                         TradeIntent.status.in_(
-                            ["executing", "submitted", "unknown"]
+                            ["executing", "submitted", "cancel_pending", "unknown"]
                         ),
                     )
                 ).all()
@@ -642,10 +623,12 @@ class TradeIntentService:
                         intent.status = "filled"
                         intent.note = f"原委托 {order_id} 已全部成交，撤单未生效"
                     elif terminal == "partially_filled":
-                        # P1（第四轮复审）：部分成交 ≠ 全部成交——剩余委托
-                        # 仍在途，撤单仍在处理中（CANCEL_PENDING），绝不能
-                        # 归为 filled（否则剩余部分被永久锁死无法再撤）。
-                        intent.status = "submitted"
+                        # P1（第四/五轮复审）：部分成交 ≠ 全部成交——剩余
+                        # 委托仍在途，撤单仍在处理中。使用独立
+                        # cancel_pending 状态（区别于"撤单请求已提交但
+                        # 原单仍待撤"的 submitted），不归 filled（否则剩余
+                        # 部分被永久锁死无法再撤）。
+                        intent.status = "cancel_pending"
                         intent.note = (
                             f"原委托 {order_id} 部分成交、剩余仍在途，"
                             "撤单处理中（CANCEL_PENDING）"
