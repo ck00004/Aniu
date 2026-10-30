@@ -148,8 +148,13 @@ def test_buy_intent_blocks_repeat_after_partial_fill(monkeypatch, tmp_path) -> N
 # ---------------------------------------------------------------------------
 
 
-def test_new_tranche_allowed_after_cooldown(monkeypatch, tmp_path) -> None:
-    """清单 #6/#12：前一档已成交且冷却期已过 → 允许建立第 2 档。"""
+def test_new_tranche_blocked_under_conservative_mode(monkeypatch, tmp_path) -> None:
+    """第六轮复审特别建议：MAX_TRANCHES_PER_SIGNAL=1（保守模式）。
+
+    45 分钟冷却是时间规则而非独立新信号验证——冷却期满后第二档
+    仍被分批上限拦截，防止"时间到了就允许二次进攻"。恢复分批需要
+    后端可验证的新行情确认条件。
+    """
     _use_temp_db(monkeypatch, tmp_path)
     init_db()
     try:
@@ -158,7 +163,7 @@ def test_new_tranche_allowed_after_cooldown(monkeypatch, tmp_path) -> None:
             client=client, symbol="600519", side="BUY", quantity=100
         )
         trade_intent_service.mark_intent_submitted(first.id, "ORD-1")
-        # 成交时间拨回冷却期之前
+        # 成交时间拨回冷却期之前（即使冷却期满）
         _backdate_intent(
             first.id,
             status="filled",
@@ -166,16 +171,9 @@ def test_new_tranche_allowed_after_cooldown(monkeypatch, tmp_path) -> None:
             - timedelta(minutes=FILLED_REENTRY_COOLDOWN_MINUTES + 10),
         )
 
-        second = trade_intent_service.check_and_register_trade_intent(
-            client=client, symbol="600519", side="BUY", quantity=200
-        )
-        assert second.tranche_id == 2
-        assert second.intent_key.endswith(":2")
-
-        # 第 2 档在途时第 3 档被拦截
-        with pytest.raises(RuntimeError, match="未完成/未确认"):
+        with pytest.raises(RuntimeError, match="分批上限"):
             trade_intent_service.check_and_register_trade_intent(
-                client=client, symbol="600519", side="BUY", quantity=100
+                client=client, symbol="600519", side="BUY", quantity=200
             )
     finally:
         _reset_db_state()
@@ -473,7 +471,8 @@ def test_unknown_intent_never_auto_fails(
                 client=client, symbol="600519", side="BUY", quantity=100
             )
 
-        # 人工核验路径：订单重新可见（远端确认接受）→ 收敛 submitted
+        # P0-5（第六轮复审）：无单号的 UNKNOWN 即使订单重新可见也不
+        # 模糊匹配（无法证明因果关联）——保持 UNKNOWN 等待人工核验。
         client.orders = [
             {
                 "stockCode": "600519",
@@ -484,6 +483,13 @@ def test_unknown_intent_never_auto_fails(
                 "orderID": "ORD-VISIBLE",
             }
         ]
+        resolved = trade_intent_service.reconcile_unknown_intents(
+            client, symbol="600519"
+        )
+        assert resolved[0].status == "unknown"
+
+        # 人工核验确认后（回填远端单号）→ 单号精确匹配收敛
+        _backdate_intent(intent.id, provider_order_id="ORD-VISIBLE")
         resolved = trade_intent_service.reconcile_unknown_intents(
             client, symbol="600519"
         )
@@ -509,7 +515,7 @@ def test_unknown_intent_first_hidden_then_visible(monkeypatch, tmp_path) -> None
         )
         assert first[0].status == "unknown"  # 不能误判 failed
 
-        # 第二次查询：委托出现（远端已接受）
+        # 第二次查询：委托出现（远端已接受）——无单号仍不模糊匹配
         client.orders = [
             {
                 "stockCode": "600519",
@@ -523,7 +529,14 @@ def test_unknown_intent_first_hidden_then_visible(monkeypatch, tmp_path) -> None
         second = trade_intent_service.reconcile_unknown_intents(
             client, symbol="600519"
         )
-        assert second[0].status == "submitted"  # 收敛为在途，继续阻塞
+        assert second[0].status == "unknown"  # P0-5：无单号不模糊匹配
+
+        # 人工核验回填单号后 → 精确匹配收敛
+        _backdate_intent(intent.id, provider_order_id="ORD-LATE")
+        third = trade_intent_service.reconcile_unknown_intents(
+            client, symbol="600519"
+        )
+        assert third[0].status == "submitted"
     finally:
         _reset_db_state()
 
@@ -551,12 +564,12 @@ def test_order_list_key_parsed_in_reconcile(monkeypatch, tmp_path) -> None:
         intent = trade_intent_service.check_and_register_trade_intent(
             client=client, symbol="600519", side="BUY", quantity=100
         )
-        _backdate_intent(intent.id, status="unknown")
+        _backdate_intent(intent.id, status="unknown", provider_order_id="ORD-OL")
 
         resolved = trade_intent_service.reconcile_unknown_intents(
             client, symbol="600519"
         )
-        # orderList 被正确解析：委托存在 → 收敛 submitted，而不是误判 failed
+        # orderList 被正确解析：单号精确匹配 → 收敛 submitted，而不是误判 failed
         assert resolved[0].status == "submitted"
     finally:
         _reset_db_state()
@@ -1337,12 +1350,12 @@ def test_data_as_list_parsed(monkeypatch, tmp_path) -> None:
         intent = trade_intent_service.check_and_register_trade_intent(
             client=client, symbol="600519", side="BUY", quantity=100
         )
-        _backdate_intent(intent.id, status="unknown")
+        _backdate_intent(intent.id, status="unknown", provider_order_id="ORD-DL")
 
         resolved = trade_intent_service.reconcile_unknown_intents(
             client, symbol="600519"
         )
-        # data 列表被正确解析：委托存在 → 收敛 submitted
+        # data 列表被正确解析：单号精确匹配 → 收敛 submitted
         assert resolved[0].status == "submitted"
     finally:
         _reset_db_state()
@@ -1409,56 +1422,33 @@ def test_cancel_intent_state_closure(monkeypatch, tmp_path) -> None:
         _reset_db_state()
 
 
-def test_action_id_backfill_matches_symbol_and_side(monkeypatch, tmp_path) -> None:
-    """清单 #8：同一 run 两笔交易 → action_id 分别关联（不串档）。"""
+def test_action_id_backfill_requires_intent_id(monkeypatch, tmp_path) -> None:
+    """第六轮复审：缺少 intent_id 不做模糊批量回填（防串档）。"""
     _use_temp_db(monkeypatch, tmp_path)
     init_db()
     try:
         today = datetime.now(SHANGHAI_TZ).date().isoformat()
         with session_scope() as db:
-            db.add_all(
-                [
-                    TradeIntent(
-                        signal_date=today,
-                        symbol="600519",
-                        side="BUY",
-                        tranche_id=1,
-                        intent_key=f"{today}:600519:BUY:1",
-                        run_id=1,
-                        quantity=100,
-                        status="submitted",
-                    ),
-                    TradeIntent(
-                        signal_date=today,
-                        symbol="000001",
-                        side="BUY",
-                        tranche_id=1,
-                        intent_key=f"{today}:000001:BUY:1",
-                        run_id=1,
-                        quantity=200,
-                        status="submitted",
-                    ),
-                ]
+            db.add(
+                TradeIntent(
+                    signal_date=today,
+                    symbol="600519",
+                    side="BUY",
+                    tranche_id=1,
+                    intent_key=f"{today}:600519:BUY:1",
+                    run_id=1,
+                    quantity=100,
+                    status="submitted",
+                )
             )
 
-        # 第一笔（600519）成功执行 action 101
+        # 无 intent_id：不回填（记录告警）
         execution_runner_service._backfill_intent_action_id(
             run_id=1,
             action_id=101,
             executed_action={"action": "BUY", "symbol": "600519", "quantity": 100},
         )
-        # 只有 600519 的意图关联了 101；000001 仍为空
-        assert _list_intents(symbol="600519")[0].action_id == 101
-        assert _list_intents(symbol="000001")[0].action_id is None
-
-        # 第二笔（000001）成功执行 action 102
-        execution_runner_service._backfill_intent_action_id(
-            run_id=1,
-            action_id=102,
-            executed_action={"action": "BUY", "symbol": "000001", "quantity": 200},
-        )
-        assert _list_intents(symbol="000001")[0].action_id == 102
-        assert _list_intents(symbol="600519")[0].action_id == 101
+        assert _list_intents(symbol="600519")[0].action_id is None
     finally:
         _reset_db_state()
 
@@ -1550,15 +1540,15 @@ def test_unknown_status_pending_buy_blocks_new_buy() -> None:
 
 def test_missing_order_quantity_with_deals_is_unknown() -> None:
     """清单 #3：委托数量缺失但成交数量>0 → UNKNOWN（不误判 filled）。"""
-    from app.services.trade_intent_service import _order_terminal_status
+    from skills.mx_core.order_schema import order_terminal_status
 
     row = {"orderID": "ORD-100", "orderStatus": "1", "dealCount": 100}
-    assert _order_terminal_status(row) == "unknown"
+    assert order_terminal_status(row) == "unknown"
 
 
 def test_dealt_exceeds_ordered_is_unknown() -> None:
     """成交数量超过委托数量（数据异常）→ UNKNOWN。"""
-    from app.services.trade_intent_service import _order_terminal_status
+    from skills.mx_core.order_schema import order_terminal_status
 
     row = {
         "orderID": "ORD-X",
@@ -1566,7 +1556,7 @@ def test_dealt_exceeds_ordered_is_unknown() -> None:
         "orderCount": 100,
         "dealCount": 200,
     }
-    assert _order_terminal_status(row) == "unknown"
+    assert order_terminal_status(row) == "unknown"
 
 
 def test_intent_id_precise_association(monkeypatch, tmp_path) -> None:
@@ -1947,3 +1937,313 @@ def test_row_int_optional_distinguishes_missing_from_zero() -> None:
     assert _row_int_optional({"orderCount": 0}, "orderCount") == 0
     assert _row_int_optional({}, "orderCount") is None
     assert _row_int_optional({"orderCount": "abc"}, "orderCount") is None
+
+
+# ---------------------------------------------------------------------------
+# 第六轮复审专项
+# ---------------------------------------------------------------------------
+
+
+def test_pending_order_missing_direction_is_invalid() -> None:
+    """清单 #1：待处理订单缺 orderDrt → INVALID。"""
+    _assert_order_rows_invalid(
+        {
+            "data": {
+                "orders": [
+                    {
+                        "stockCode": "600519",
+                        "orderStatus": "1",
+                        "orderCount": 100,
+                        "dealCount": 0,
+                        # 缺 orderDrt
+                    }
+                ]
+            }
+        }
+    )
+
+
+def test_pending_order_zero_count_is_invalid() -> None:
+    """清单 #4：orderCount = 0 → INVALID（数量必须为正）。"""
+    _assert_order_rows_invalid(
+        {
+            "data": {
+                "orders": [
+                    {
+                        "stockCode": "600519",
+                        "orderDrt": "1",
+                        "orderStatus": "1",
+                        "orderCount": 0,
+                        "dealCount": 0,
+                    }
+                ]
+            }
+        }
+    )
+
+
+def test_pending_order_negative_count_is_invalid() -> None:
+    """清单 #5：orderCount = -100 → INVALID。"""
+    _assert_order_rows_invalid(
+        {
+            "data": {
+                "orders": [
+                    {
+                        "stockCode": "600519",
+                        "orderDrt": "1",
+                        "orderStatus": "1",
+                        "orderCount": -100,
+                        "dealCount": 0,
+                    }
+                ]
+            }
+        }
+    )
+
+
+def test_pending_order_negative_dealt_is_invalid() -> None:
+    """清单 #6：dealCount = -1 → INVALID。"""
+    _assert_order_rows_invalid(
+        {
+            "data": {
+                "orders": [
+                    {
+                        "stockCode": "600519",
+                        "orderDrt": "1",
+                        "orderStatus": "1",
+                        "orderCount": 100,
+                        "dealCount": -1,
+                    }
+                ]
+            }
+        }
+    )
+
+
+def test_pending_order_dealt_exceeds_ordered_is_invalid() -> None:
+    """清单 #7：dealCount > orderCount → INVALID。"""
+    _assert_order_rows_invalid(
+        {
+            "data": {
+                "orders": [
+                    {
+                        "stockCode": "600519",
+                        "orderDrt": "1",
+                        "orderStatus": "1",
+                        "orderCount": 100,
+                        "dealCount": 150,
+                    }
+                ]
+            }
+        }
+    )
+
+
+def test_non_integer_quantity_is_invalid() -> None:
+    """非整数数量（100.9 股）→ 不可判定（不静默截断）。"""
+    from skills.mx_core.order_schema import row_int_optional
+
+    assert row_int_optional({"orderCount": 100.9}, "orderCount") is None
+    assert row_int_optional({"orderCount": "100.9"}, "orderCount") is None
+    assert row_int_optional({"orderCount": 100.0}, "orderCount") == 100
+
+
+def test_buy_status_zero_with_remaining_blocks() -> None:
+    """清单 #8：BUY 遇到显式 status=0 且剩余大于零 → 阻断。"""
+    from skills.mx_core.execution import preflight_trade
+
+    class _StatusZeroClient:
+        def get_orders(self) -> dict:
+            return {
+                "data": {
+                    "orders": [
+                        {
+                            "stockCode": "600519",
+                            "orderDrt": "1",
+                            "orderStatus": "0",
+                            "orderCount": 100,
+                            "dealCount": 0,
+                            "orderID": "ORD-Z0",
+                        }
+                    ]
+                }
+            }
+
+        def get_balance(self) -> dict:
+            return {"data": {"availBalance": 10_000_000.0}}
+
+    with pytest.raises(RuntimeError, match="无法识别状态"):
+        preflight_trade(
+            client=_StatusZeroClient(),
+            action="BUY",
+            symbol="600519",
+            quantity=100,
+            price_type="LIMIT",
+            price=20.0,
+        )
+
+
+def test_sell_direction_missing_blocks() -> None:
+    """清单 #9：SELL 遇到方向缺失的委托 → 行级 INVALID → 阻断。"""
+    from skills.mx_core.execution import preflight_trade
+
+    class _NoDirectionClient:
+        def get_positions(self) -> dict:
+            return {
+                "data": {
+                    "posList": [{"stockCode": "600519", "count": 1000}]
+                }
+            }
+
+        def get_orders(self) -> dict:
+            return {
+                "data": {
+                    "orders": [
+                        {
+                            "stockCode": "600519",
+                            "orderStatus": "1",
+                            "orderCount": 100,
+                            "dealCount": 0,
+                            # 缺 orderDrt
+                        }
+                    ]
+                }
+            }
+
+    with pytest.raises(RuntimeError, match="无法解析|字段不完整"):
+        preflight_trade(
+            client=_NoDirectionClient(),
+            action="SELL",
+            symbol="600519",
+            quantity=100,
+            price_type="MARKET",
+            price=None,
+        )
+
+
+def test_unknown_without_order_id_never_fuzzy_matches(monkeypatch, tmp_path) -> None:
+    """清单 #10/#11：无单号 UNKNOWN 不做标的+方向模糊匹配。
+
+    历史同向订单（无论一笔还是两笔）都不能被认作本次超时请求的
+    订单——无法证明因果关联，保持 UNKNOWN 等待人工核验。
+    """
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        # 一笔历史同向订单
+        client = _IntentClient(
+            orders=[
+                {
+                    "stockCode": "600519",
+                    "orderDrt": "1",
+                    "orderStatus": "3",
+                    "orderCount": 100,
+                    "dealCount": 100,
+                    "orderID": "ORD-HIST",
+                }
+            ]
+        )
+        intent = trade_intent_service.check_and_register_trade_intent(
+            client=client, symbol="600519", side="BUY", quantity=100
+        )
+        _backdate_intent(intent.id, status="unknown")
+
+        resolved = trade_intent_service.reconcile_unknown_intents(
+            client, symbol="600519"
+        )
+        assert resolved[0].status == "unknown"  # 不认领历史订单
+
+        # 两笔同向订单：同样保持 UNKNOWN
+        client.orders = [
+            {
+                "stockCode": "600519",
+                "orderDrt": "1",
+                "orderStatus": "3",
+                "orderCount": 100,
+                "dealCount": 100,
+                "orderID": "ORD-H1",
+            },
+            {
+                "stockCode": "600519",
+                "orderDrt": "1",
+                "orderStatus": "1",
+                "orderCount": 50,
+                "dealCount": 0,
+                "orderID": "ORD-H2",
+            },
+        ]
+        resolved = trade_intent_service.reconcile_unknown_intents(
+            client, symbol="600519"
+        )
+        assert resolved[0].status == "unknown"
+    finally:
+        _reset_db_state()
+
+
+def test_unknown_with_order_id_but_invalid_row_keeps_unknown(
+    monkeypatch, tmp_path
+) -> None:
+    """清单 #12：有精确单号但该行数量字段缺失 → 快照 INVALID → 保持 UNKNOWN。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        client = _IntentClient(
+            orders=[
+                {
+                    "stockCode": "600519",
+                    "orderDrt": "1",
+                    "orderStatus": "1",
+                    "orderID": "ORD-BAD",
+                    # 缺 orderCount / dealCount → 行级 INVALID → 整份快照不可用
+                }
+            ]
+        )
+        intent = trade_intent_service.check_and_register_trade_intent(
+            client=client, symbol="600519", side="BUY", quantity=100
+        )
+        _backdate_intent(intent.id, status="unknown", provider_order_id="ORD-BAD")
+
+        resolved = trade_intent_service.reconcile_unknown_intents(
+            client, symbol="600519"
+        )
+        # 快照 INVALID：不消费核验、保持 UNKNOWN
+        assert resolved == []
+        assert _list_intents(id=intent.id)[0].status == "unknown"
+    finally:
+        _reset_db_state()
+
+
+def test_action_id_rejects_cross_run_intent(monkeypatch, tmp_path) -> None:
+    """清单 #13：intent_id 属于其他 run → 拒绝关联。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        today = datetime.now(SHANGHAI_TZ).date().isoformat()
+        with session_scope() as db:
+            db.add(
+                TradeIntent(
+                    signal_date=today,
+                    symbol="600519",
+                    side="BUY",
+                    tranche_id=1,
+                    intent_key=f"{today}:600519:BUY:1",
+                    run_id=99,  # 属于另一个 run
+                    quantity=100,
+                    status="submitted",
+                )
+            )
+
+        execution_runner_service._backfill_intent_action_id(
+            run_id=1,  # 当前 run
+            action_id=101,
+            executed_action={
+                "action": "BUY",
+                "symbol": "600519",
+                "quantity": 100,
+                "intent_id": 1,  # 指向 run 99 的意图
+            },
+        )
+        # run 不匹配 → 不关联
+        assert _list_intents(id=1)[0].action_id is None
+    finally:
+        _reset_db_state()

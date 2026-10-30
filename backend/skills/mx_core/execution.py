@@ -15,6 +15,13 @@ from skills.mx_core.client import (
     MXClient,
     MXResponseUnknown,
 )
+from skills.mx_core.order_schema import (
+    PENDING_ORDER_STATUSES as _PENDING_ORDER_STATUSES,
+    parse_order_snapshot as _parse_order_snapshot,
+    row_int_optional as _row_int_optional,
+    row_str as _schema_row_str,
+    validate_order_row as _validate_order_row,
+)
 from skills.mx_core.tool_specs import TOOL_PROFILES, TOOL_SPECS, build_tools
 
 logger = logging.getLogger(__name__)
@@ -108,29 +115,6 @@ def _payload_rows_with_state(payload: Any) -> tuple[list[dict[str, Any]], str]:
     return parsed, state
 
 
-def _validate_order_row(row: dict[str, Any]) -> bool:
-    """订单行级 Schema 校验（第五轮复审 P0：结构校验 → 字段级校验）。
-
-    非法元素/缺失股票代码/缺失状态/待处理但数量缺失 → 该行无效，
-    整个列表按 INVALID 处理（不得当作有效空列表放行交易）。
-    """
-    symbol = _row_str(row, "stockCode", "code", "SECURITY_CODE", "secCode")
-    if not symbol:
-        return False
-    # 状态码必须显式存在（_order_status 缺省返回 "0"，不能作为有效值）
-    raw_status = _row_str(row, "orderStatus", "status", "dbStatus")
-    if not raw_status:
-        return False
-    status = _order_status(row)
-    if status in _PENDING_ORDER_STATUSES:
-        # 待处理委托必须有数量与成交字段（缺失 = 剩余不可判定）
-        ordered = _row_int_optional(row, "orderCount", "count", "quantity", "orderQty")
-        dealt = _row_int_optional(
-            row, "dealCount", "tradeCount", "filledCount", "filledQty"
-        )
-        if ordered is None or dealt is None:
-            return False
-    return True
 
 
 def _require_parseable_rows(payload: Any, *, what: str) -> list[dict[str, Any]]:
@@ -150,22 +134,16 @@ def _require_parseable_rows(payload: Any, *, what: str) -> list[dict[str, Any]]:
 
 
 def _require_parseable_order_rows(payload: Any, *, what: str) -> list[dict[str, Any]]:
-    """委托列表解析：结构级 + 订单行级 Schema 校验（第五轮复审 P0-1）。
+    """委托列表解析：公共 Schema（第六轮复审 P0-4：与意图服务同源）。
 
-    行级规则：缺股票代码/缺状态码/待处理但数量缺失 → 整个列表 INVALID
-    ——不得当作有效空列表放行交易。
+    结构级 + 行级（含方向字段、数量合法性）校验；任一不满足 → 拒绝。
     """
-    rows, state = _payload_rows_with_state(payload)
+    rows, state = _parse_order_snapshot(payload)
     if state in (_ROWS_INVALID, _ROWS_ERROR):
         raise RuntimeError(
-            f"无法解析{what}响应（结构不可识别），为防止重复委托"
-            "已阻断本次交易；请稍后重试或核对妙想接口状态。"
-        )
-    if rows and any(not _validate_order_row(row) for row in rows):
-        raise RuntimeError(
-            f"{what}存在字段不完整的委托记录（缺失股票代码/状态码，或"
-            "待处理委托缺少数量字段），无法确认在途委托情况，为防止"
-            "重复委托已阻断本次交易；请先调用 mx_get_orders 核对。"
+            f"无法解析{what}响应（结构不可识别或存在字段不完整的委托"
+            "记录），为防止重复委托已阻断本次交易；请稍后重试或核对"
+            "妙想接口状态。"
         )
     return rows
 
@@ -175,19 +153,6 @@ def _row_int(row: dict[str, Any], *keys: str) -> int:
     return value if value is not None else 0
 
 
-def _row_int_optional(row: dict[str, Any], *keys: str) -> int | None:
-    """数量字段解析：缺失/格式异常返回 None（第五轮复审 P0：
-    缺失值不得与真实数值 0 混为一谈——待处理委托数量缺失意味着
-    剩余数量不可判定，必须按未知处理）。"""
-    for key in keys:
-        value = row.get(key)
-        if value is None:
-            continue
-        try:
-            return int(float(value))
-        except (TypeError, ValueError):
-            return None
-    return None
 
 
 def _row_str(row: dict[str, Any], *keys: str) -> str:
@@ -284,15 +249,15 @@ def preflight_trade(
                         "成交后再评估"
                     )
                 continue
-            # P0-2（第四轮复审）：未知状态码 + 剩余数量不明/大于零 →
-            # 保守阻塞：不能因状态不认识就当作非在途订单放行。
-            if status != "0":
-                if ordered is None or dealt is None or max(ordered - dealt, 0) > 0:
-                    raise RuntimeError(
-                        f"{symbol} 存在无法识别状态的买入委托（状态码 {status}，"
-                        "剩余数量不明或大于零），为防止重复委托已阻断本次买入；"
-                        "请先调用 mx_get_orders 核对该委托状态。"
-                    )
+            # P0-2/P0-3（第六轮复审）：未知状态码（含 "0"——状态字段
+            # 缺失的缺省值）+ 剩余数量不明或大于零 → 保守阻塞。
+            # BUY 此前对 "0" 直接放行，与 SELL 不一致。
+            if ordered is None or dealt is None or max(ordered - dealt, 0) > 0:
+                raise RuntimeError(
+                    f"{symbol} 存在无法识别状态的买入委托（状态码 {status}，"
+                    "剩余数量不明或大于零），为防止重复委托已阻断本次买入；"
+                    "请先调用 mx_get_orders 核对该委托状态。"
+                )
         if price_type.upper() == "LIMIT" and price is not None:
             balance_payload = client.get_balance()
             balance = (
@@ -1177,10 +1142,16 @@ class MXExecutionService:
         for row in rows:
             row_order_id = _row_str(row, "orderID", "orderId", "order_id", "entrustNo")
             if row_order_id and row_order_id == str(order_id).strip():
-                status = _order_status(row)
-                if status in _PENDING_ORDER_STATUSES:
+                from skills.mx_core.order_schema import order_terminal_status
+
+                terminal = order_terminal_status(row)
+                if terminal == "canceled":
+                    return "（回查（VERIFIED）：该委托已撤销，撤单确认生效。）"
+                if terminal == "filled":
+                    return "（回查（FILLED）：该委托已全部成交，撤单未生效。）"
+                if terminal in ("submitted", "partially_filled"):
                     return "（回查（CANCEL_PENDING）：该委托仍处于待撤状态，请稍后通过 mx_get_orders 核对。）"
-                return "（回查：该委托已离开可撤状态——已撤单或已成交。）"
+                return "（回查（UNKNOWN）：该委托状态不可判定，请通过 mx_get_orders 核对。）"
         return (
             "（回查（UNKNOWN）：委托列表中未找到该委托——不能据此认定撤单"
             "已生效，请通过 mx_get_orders 或历史委托核对。）"

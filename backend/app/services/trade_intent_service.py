@@ -26,6 +26,19 @@ from sqlalchemy.exc import IntegrityError
 
 from app.db.database import session_scope
 from app.db.models import TradeIntent
+from skills.mx_core.order_schema import (
+    CANCELED_ORDER_STATUSES,
+    PENDING_ORDER_STATUSES,
+    ROWS_ERROR,
+    ROWS_INVALID,
+    get_order_side,
+    get_order_status,
+    get_order_symbol,
+    order_terminal_status,
+    parse_order_snapshot,
+    row_int_optional,
+    row_str,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +47,11 @@ SHANGHAI_TZ = timezone(timedelta(hours=8))
 # 同一信号前一档成交后，允许新分批的最短间隔（分钟）。跨多个 15 分钟
 # 决策轮次，机械区分"信号仍成立的重复触发"与"稍后的真实加仓"。
 FILLED_REENTRY_COOLDOWN_MINUTES = 45
-# 每日每标的每方向的分批上限（含失败重试档）。
-MAX_TRANCHES_PER_SIGNAL = 3
+# 每日每标的每方向的分批上限。
+# 第六轮复审特别建议：45 分钟冷却尚无独立新信号验证能力（时间规则
+# 而非行情确认），在信号生命周期机制落地前降为 1（保守模式），
+# 防止"时间到了就允许二次进攻"。恢复分批需后端可验证的新行情确认。
+MAX_TRANCHES_PER_SIGNAL = 1
 
 # 阻塞新意图的状态：在途/未确认
 _BLOCKING_STATUSES = {
@@ -77,90 +93,9 @@ _ORDER_ROW_KEYS = (
 _PENDING_ORDER_STATUS_VALUES = {"1", "2", "8", "100"}
 
 
-def _extract_order_rows(payload: Any) -> list[dict[str, Any]] | None:
-    """解析委托列表载荷 → 行列表；结构无法识别时返回 None（不可判定）。
-
-    返回 None 表示"这不是一份可解析的完整委托快照"——调用方必须保持
-    阻塞，不得据此判定"没有委托痕迹"。与 execution._payload_rows 同源：
-    data 可为 dict 或 list（第三轮复审 P1：data 为列表时原实现不识别）。
-    """
-    if not isinstance(payload, dict):
-        return None
-    data_value = payload.get("data")
-    if isinstance(data_value, list):
-        # data 直接是行列表
-        return [row for row in data_value if isinstance(row, dict)]
-    source = data_value if isinstance(data_value, dict) else payload
-    if isinstance(source, dict):
-        for key in _ORDER_ROW_KEYS:
-            rows = source.get(key)
-            if isinstance(rows, list):
-                return [row for row in rows if isinstance(row, dict)]
-        return None
-    if isinstance(source, list):
-        return [row for row in source if isinstance(row, dict)]
-    return None
 
 
-def _row_str(row: dict[str, Any], *keys: str) -> str:
-    for key in keys:
-        value = row.get(key)
-        if value is not None:
-            return str(value).strip()
-    return ""
 
-
-def _row_int(row: dict[str, Any], *keys: str) -> int:
-    for key in keys:
-        value = row.get(key)
-        if value is None:
-            continue
-        try:
-            return int(float(str(value)))
-        except (TypeError, ValueError):
-            continue
-    return 0
-
-
-def _order_side(row: dict[str, Any]) -> str:
-    side = _row_str(row, "orderDrt", "drt", "bsFlag", "side", "tradeType")
-    return {"1": "BUY", "2": "SELL"}.get(side, side.upper())
-
-
-# 已知的委托终局状态码白名单（撤单/废单/已结）。远端返回不在白名单
-# 的状态码时一律视为不可判定（unknown），不得默认放行——2026-10 第三轮
-# 复审 P0：未知状态默认 canceled 会错误解除阻塞。
-_ORDER_CANCELED_STATUS_VALUES = {"3", "4", "5", "6", "9", "-1"}
-
-
-def _order_terminal_status(row: dict[str, Any]) -> str:
-    """按委托行计算意图终态。
-
-    filled / partially_filled / submitted / canceled / unknown：
-    未知状态码返回 unknown（保持阻塞），不默认视为已撤。
-    """
-    ordered = _row_int(row, "orderCount", "count", "quantity", "orderQty")
-    dealt = _row_int(
-        row, "dealCount", "tradeCount", "filledCount", "filledQty"
-    )
-    status = _row_str(row, "orderStatus", "status", "dbStatus") or "0"
-    # P0-4（第四轮复审）：委托数量缺失时不得判定成交——
-    # ordered=0 时 dealt>=ordered 恒真，会把缺数量的委托误判为 filled。
-    if ordered <= 0:
-        return "unknown"
-    if dealt < 0 or dealt > ordered:
-        # 成交数量异常（超过委托量）：不可判定
-        return "unknown"
-    if dealt == ordered:
-        return "filled"
-    if dealt > 0:
-        return "partially_filled"
-    if status in _PENDING_ORDER_STATUS_VALUES:
-        return "submitted"
-    if status in _ORDER_CANCELED_STATUS_VALUES:
-        return "canceled"
-    # 未知状态码：不可判定，保持阻塞
-    return "unknown"
 
 
 def _now_utc() -> datetime:
@@ -453,8 +388,8 @@ class TradeIntentService:
             )
             return []
 
-        rows = _extract_order_rows(orders_payload)
-        if rows is None:
+        rows, rows_state = parse_order_snapshot(orders_payload)
+        if rows_state in (ROWS_INVALID, ROWS_ERROR):
             logger.warning(
                 "reconcile_open_trade_intents: unparseable orders payload for %s, "
                 "keeping intents blocking",
@@ -466,7 +401,7 @@ class TradeIntentService:
             row
             for row in rows
             if _normalize_symbol(
-                _row_str(row, "stockCode", "code", "SECURITY_CODE", "secCode")
+                get_order_symbol(row)
             )
             == normalized_symbol
         ]
@@ -489,12 +424,17 @@ class TradeIntentService:
                 # P0-2（第三轮复审）：有单号时只做单号精确匹配——
                 # 单号找不到绝不退化为"标的+方向"匹配，防止把同标的的
                 # 其他委托认作本意图（错误收敛为 submitted/filled）。
+                #
+                # P0-5（第六轮复审）：无单号时**禁止**标的+方向模糊匹配。
+                # 超时订单（UNKNOWN）没有单号，唯一候选也可能是历史订单
+                # 而非本次请求——无法证明因果关联，一律保持 UNKNOWN 等
+                # 待人工核验。只有单号精确匹配才允许同步状态。
                 if intent.provider_order_id:
                     matched_row = next(
                         (
                             row
                             for row in symbol_rows
-                            if _row_str(
+                            if row_str(
                                 row, "orderID", "orderId", "order_id", "entrustNo"
                             )
                             == str(intent.provider_order_id)
@@ -502,16 +442,10 @@ class TradeIntentService:
                         None,
                     )
                 else:
-                    # 无单号：标的+方向联合匹配，多候选不可自动选择
-                    side_rows = [
-                        row
-                        for row in symbol_rows
-                        if _order_side(row) == intent.side
-                    ]
-                    matched_row = side_rows[0] if len(side_rows) == 1 else None
+                    matched_row = None
 
                 if matched_row is not None:
-                    intent.status = _order_terminal_status(matched_row)
+                    intent.status = order_terminal_status(matched_row)
                     intent.note = "已按远端委托列表同步状态"
                     intent.unknown_checks = 0
                     intent.first_unknown_at = None
@@ -582,12 +516,12 @@ class TradeIntentService:
             orders_payload = client.get_orders()
         except Exception:  # noqa: BLE001
             return []
-        rows = _extract_order_rows(orders_payload)
-        if rows is None:
+        rows, rows_state = parse_order_snapshot(orders_payload)
+        if rows_state in (ROWS_INVALID, ROWS_ERROR):
             return []
 
         def _row_order_id(row: dict[str, Any]) -> str:
-            return _row_str(row, "orderID", "orderId", "order_id", "entrustNo")
+            return row_str(row, "orderID", "orderId", "order_id", "entrustNo")
 
         with session_scope() as db:
             open_cancels = list(
@@ -615,7 +549,7 @@ class TradeIntentService:
                         "转历史），不可再撤；保持阻塞防止重复撤单"
                     )
                 else:
-                    terminal = _order_terminal_status(matched)
+                    terminal = order_terminal_status(matched)
                     if terminal == "canceled":
                         intent.status = "verified"
                         intent.note = f"原委托 {order_id} 已撤销，撤单确认生效"

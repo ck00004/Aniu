@@ -573,6 +573,7 @@ def test_preflight_cancel_completed_order() -> None:
                     {
                         "orderId": "A1",
                         "stockCode": "600519",
+                        "orderDrt": "1",
                         "orderStatus": "4",
                         "orderCount": 100,
                         "dealCount": 100,
@@ -593,6 +594,7 @@ def test_preflight_cancel_pending_order_passes() -> None:
                     {
                         "orderId": "A1",
                         "stockCode": "600519",
+                        "orderDrt": "1",
                         "orderStatus": "1",
                         "orderCount": 100,
                         "dealCount": 0,

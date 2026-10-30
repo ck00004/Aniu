@@ -381,6 +381,50 @@ UNKNOWN（#7）、`_row_int_optional` 区分缺失与 0。
 
 **全量回归：后端 429 passed，前端 86 passed，vue-tsc/build 通过。**
 
+### 第八轮：第六轮复审 P0×5 + P1×4 修复（2026-10-30 第六次外部复审）
+
+**公共订单 Schema 模块**（`skills/mx_core/order_schema.py`，P0-4 核心）：
+execution.py 与 trade_intent_service.py 此前各持一套解析器（宽松过滤
+非法行、缺失数量默认 0）——同一份订单数据两处得出不同结论。现在统一
+提供 parse_order_snapshot / validate_order_row / get_order_quantities /
+get_order_status / get_order_side / order_terminal_status，两处同源。
+
+**P0-1 方向字段校验**：订单行必须含方向字段且在白名单
+（1/2/BUY/SELL/B/S）——缺 orderDrt 的在途委托此前会被 BUY 当非卖单、
+被 SELL 跳过，可能低估可卖占用。方向缺失 → 整份列表 INVALID。
+
+**P0-2 数量合法性**：待处理订单 ordered>0、0≤dealt≤ordered；
+row_int_optional 拒绝非整数（100.9 股不再静默截断为 100）。
+orderCount=0/-100、dealCount=-1、dealt>ordered → INVALID。
+
+**P0-3 BUY 对 status=0 统一未知处理**：BUY 此前对 "0" 直接放行
+（与 SELL 不一致）——现在与 SELL 一致：剩余不明或大于零即阻断。
+
+**P0-5 无单号 UNKNOWN 禁止模糊匹配**（本轮最重要的错误关联修复）：
+超时订单没有 provider_order_id，唯一同标的同方向候选也可能是**历史
+订单**（09:30 已成交的 ORD-001 会被认作 10:00 超时的新订单，错误收敛
+FILLED/CANCELED 解除阻塞）。现在无单号一律不匹配，保持 UNKNOWN 等
+待人工核验；只有单号精确匹配才同步状态。
+
+**P1 四项**：
+- intent_id 回填加 **run_id 校验**（防跨 run 错误关联）+ **移除批量
+  fallback**（缺 intent_id 不做标的+方向模糊回填，记录告警）。
+- 撤单回查终态化：用 order_terminal_status 区分 VERIFIED（已撤）/
+  FILLED（全部成交）/ CANCEL_PENDING（仍待撤/部分成交）/ UNKNOWN
+  （不可判定）——未知状态不再描述为"已撤单或已成交"。
+- **MAX_TRANCHES_PER_SIGNAL = 1**（复审特别建议）：45 分钟冷却无独立
+  新信号验证能力，保守模式防止"时间到了就允许二次进攻"；恢复分批
+  需后端可验证的新行情确认条件。
+- intent_id 精确关联的 E2E 语义测试（跨 run 拒绝、缺 intent_id 不回填）。
+
+**第六轮专项测试**（新增 11 个）：缺方向 → INVALID（#1）、
+orderCount=0/-100、dealCount=-1、dealt>ordered → INVALID（#4-#7）、
+非整数数量拒绝、BUY status=0 阻断（#8）、SELL 方向缺失阻断（#9）、
+无单号 UNKNOWN 不认领历史订单（一笔/两笔，#10/#11）、有单号但行
+INVALID → 保持 UNKNOWN（#12）、跨 run intent_id 拒绝关联（#13）。
+
+**全量回归：后端 440 passed，前端 86 passed，vue-tsc/build 通过。**
+
 ### 已知边界（如实记录）
 
 - signal_id 是日级标识（交易日+标的+方向），45 分钟冷却放行第二档
@@ -396,10 +440,9 @@ UNKNOWN（#7）、`_row_int_optional` 区分缺失与 0。
 - 进程租约（worker_id/heartbeat/lease_expires）未实现：当前以
   单 worker 部署为约束；run 状态守卫覆盖正常启动竞争，强杀进程
   （run 停留 running）的意图需等 run 状态收敛后才会恢复。
-- 45 分钟冷却是时间规则而非新信号验证（历轮复审）：第二/三档放行
-  前的行情确认等后端条件属策略语义设计，需你定义"独立新信号"的
-  可验证标准后实施；未实现前建议将每日分批上限降为 1（改一个常量）
-  或由你明确批准后再开放分批。
+- 45 分钟冷却无独立新信号验证：**已按第六轮复审建议将
+  MAX_TRANCHES_PER_SIGNAL 降为 1（保守模式）**。恢复分批（改回常量）
+  需后端可验证的新行情确认条件（策略语义设计）或你的明确批准。
 - 委托列表已实现行级 Schema 校验（第五轮）；持仓/自选/余额的字段级
   Schema 校验未实施——需真实接口字段语义确认后建立。
 - UNKNOWN 不自动解除意味着需要人工核验路径（管理界面/历史委托查询），

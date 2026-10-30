@@ -263,62 +263,42 @@ class ExecutionRunnerService:
             or ""
         ).strip()
 
-        # P1（第四轮复审）：优先按 intent_id 精确关联（一对一）；
-        # 仅当执行记录未携带 intent_id 时才退回 标的+方向 匹配。
+        # P1（第六轮复审）：只按 intent_id + run_id 精确关联（一对一）。
+        # - run_id 校验防止错误 intent_id 关联到其他运行的意图；
+        # - 缺少 intent_id 不做模糊批量回填（标的+方向会串档），
+        #   记录追溯告警即可。
         intent_id = executed_action.get("intent_id")
-        if isinstance(intent_id, int) and intent_id > 0:
-            with session_scope() as db:
-                result = db.execute(
-                    sa_update(TradeIntent)
-                    .where(
-                        and_(
-                            TradeIntent.id == intent_id,
-                            TradeIntent.action_id.is_(None),
-                        )
-                    )
-                    .values(action_id=action_id)
-                )
-                if result.rowcount != 1:
-                    logger.warning(
-                        "intent %s action_id backfill rowcount=%s "
-                        "(expected 1): run_id=%s action_id=%s",
-                        intent_id,
-                        result.rowcount,
-                        run_id,
-                        action_id,
-                    )
+        if not (isinstance(intent_id, int) and intent_id > 0):
+            logger.warning(
+                "executed action without intent_id, skipping backfill: "
+                "run_id=%s action_id=%s symbol=%s action=%s",
+                run_id,
+                action_id,
+                symbol,
+                action_name,
+            )
             return
-
         with session_scope() as db:
-            if action_name == "CANCEL":
-                # 撤单意图：按 run_id + 委托单号（symbol 字段存单号）匹配
-                stmt = (
-                    sa_update(TradeIntent)
-                    .where(
-                        and_(
-                            TradeIntent.run_id == run_id,
-                            TradeIntent.symbol == symbol,
-                            TradeIntent.side == "CANCEL",
-                            TradeIntent.action_id.is_(None),
-                        )
+            result = db.execute(
+                sa_update(TradeIntent)
+                .where(
+                    and_(
+                        TradeIntent.id == intent_id,
+                        TradeIntent.run_id == run_id,
+                        TradeIntent.action_id.is_(None),
                     )
-                    .values(action_id=action_id)
                 )
-            else:
-                # 交易意图：按 run_id + 标的 + 方向匹配
-                stmt = (
-                    sa_update(TradeIntent)
-                    .where(
-                        and_(
-                            TradeIntent.run_id == run_id,
-                            TradeIntent.symbol == symbol,
-                            TradeIntent.side == action_name,
-                            TradeIntent.action_id.is_(None),
-                        )
-                    )
-                    .values(action_id=action_id)
+                .values(action_id=action_id)
+            )
+            if result.rowcount != 1:
+                logger.warning(
+                    "intent %s action_id backfill rowcount=%s (expected 1): "
+                    "run_id=%s action_id=%s",
+                    intent_id,
+                    result.rowcount,
+                    run_id,
+                    action_id,
                 )
-            db.execute(stmt)
 
     def _record_attempt(
         self,
