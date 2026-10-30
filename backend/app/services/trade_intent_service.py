@@ -388,6 +388,39 @@ class TradeIntentService:
             intent.updated_at = _now_utc()
             db.add(intent)
 
+    def _mark_cancel_intent_status(
+        self, intent_id: int, status: str, note: str
+    ) -> None:
+        """撤单意图状态更新（仅 CANCEL 意图，第十一轮复审 P1）。"""
+        with session_scope() as db:
+            intent = db.get(TradeIntent, intent_id)
+            if intent is None:
+                raise RuntimeError(f"撤单意图不存在：{intent_id}")
+            if str(intent.side or "") != "CANCEL":
+                raise RuntimeError(
+                    f"意图 {intent_id} 不是撤单意图（side={intent.side}）"
+                )
+            intent.status = status
+            intent.note = note
+            intent.updated_at = _now_utc()
+            db.add(intent)
+
+    def mark_cancel_intent_verified(
+        self, intent_id: int, note: str
+    ) -> None:
+        """撤单即时核验确认生效（原委托已撤销/部分成交后剩余已撤）。"""
+        self._mark_cancel_intent_status(intent_id, "verified", note)
+
+    def mark_cancel_intent_filled(self, intent_id: int, note: str) -> None:
+        """撤单即时核验：原委托已全部成交，撤单未生效。"""
+        self._mark_cancel_intent_status(intent_id, "filled", note)
+
+    def mark_cancel_intent_pending(
+        self, intent_id: int, note: str
+    ) -> None:
+        """撤单即时核验：原委托仍待撤（撤单处理中）。"""
+        self._mark_cancel_intent_status(intent_id, "cancel_pending", note)
+
     def bind_provider_order_id(
         self,
         intent_id: int,

@@ -671,19 +671,29 @@ class MXExecutionService:
                 "error": f"未知工具调用: {tool_name}",
             }
 
+        # 第十一轮复审 P1：执行前用签名判断 handler 是否支持 run_id——
+        # 原实现捕获全部 TypeError 再重试整个 handler，会把"写请求已
+        # 发出后本地处理响应时的 TypeError"误判为签名不匹配而二次执行
+        # （重复写请求）。
+        import inspect as _inspect
+
+        handler_params = _inspect.signature(handler).parameters
+        supports_run_id = any(
+            param.kind == _inspect.Parameter.VAR_KEYWORD
+            or param.name == "run_id"
+            for param in handler_params.values()
+        )
         try:
-            try:
+            if supports_run_id:
                 return handler(
                     client=client,
                     app_settings=app_settings,
                     arguments=arguments,
                     run_id=run_id,
                 )
-            except TypeError:
-                # 其余 handler 不接受 run_id 参数
-                return handler(
-                    client=client, app_settings=app_settings, arguments=arguments
-                )
+            return handler(
+                client=client, app_settings=app_settings, arguments=arguments
+            )
         except Exception as exc:
             guidance = self._build_error_guidance(str(exc))
             return {
@@ -812,28 +822,37 @@ class MXExecutionService:
             )
         operation, code, name = intent
 
+        # 第十一轮复审 P0：预读取不可判定（失败/结构异常/行身份缺失）
+        # → 禁止发送写请求——否则"列表读不到"会被当成"列表为空"：
+        # 删除场景返回 NOOP_VERIFIED（实际没删也声称满足目标状态）、
+        # 添加场景对已在自选的股票重复发送 ADD。
         current = self._read_self_select_state(client)
-        if current is not None:
-            in_list = self._target_in_state(code, name, current)
-            if (operation == "ADD" and in_list) or (
-                operation == "REMOVE" and not in_list
-            ):
-                return {
-                    "ok": True,
-                    "tool_name": "mx_manage_self_select",
-                    "summary": (
-                        f"{name or code} 已处于目标状态"
-                        f"（{'已在' if operation == 'ADD' else '不在'}自选股列表），"
-                        "未发送写请求（NOOP_VERIFIED）。"
-                    ),
-                    "result": {"verified": True, "noop": True},
-                    "executed_action": {
-                        "action": "MANAGE_SELF_SELECT",
-                        "query": query,
-                        "verified": True,
-                        "noop": True,
-                    },
-                }
+        if current is None:
+            raise RuntimeError(
+                "无法读取当前自选股列表（接口失败或数据结构异常），"
+                "为防止基于错误状态的写操作，本次新增/删除请求已被拒绝；"
+                "请先调用 mx_get_self_selects 确认列表可正常读取后再操作。"
+            )
+        in_list = self._target_in_state(code, name, current)
+        if (operation == "ADD" and in_list) or (
+            operation == "REMOVE" and not in_list
+        ):
+            return {
+                "ok": True,
+                "tool_name": "mx_manage_self_select",
+                "summary": (
+                    f"{name or code} 已处于目标状态"
+                    f"（{'已在' if operation == 'ADD' else '不在'}自选股列表），"
+                    "未发送写请求（NOOP_VERIFIED）。"
+                ),
+                "result": {"verified": True, "noop": True},
+                "executed_action": {
+                    "action": "MANAGE_SELF_SELECT",
+                    "query": query,
+                    "verified": True,
+                    "noop": True,
+                },
+            }
 
         result = client.manage_self_select(query)
 
@@ -907,25 +926,35 @@ class MXExecutionService:
     def _read_self_select_state(
         self, client: MXClient
     ) -> tuple[set[str], list[str]] | None:
-        """读取当前自选股列表 → (代码集合, 名称列表)；读取失败返回 None。"""
+        """读取当前自选股列表 → (代码集合, 名称列表)；不可判定返回 None。
+
+        第十一轮复审 P0：读取失败/结构异常/行身份缺失一律返回 None
+        （不可判定）——原实现经 _payload_rows 兼容层把 INVALID 静默转成
+        空列表，导致"列表读不到"被当成"列表为空"：删除场景返回
+        NOOP_VERIFIED（实际没删也声称满足目标状态）、添加场景对已在
+        自选的股票重复发送 ADD。只有 VALID_EMPTY/VALID_DATA 才可作为
+        判断依据。
+        """
         try:
             payload = client.get_self_selects()
         except Exception:  # noqa: BLE001
             return None
-        rows = _payload_rows(payload)
-        if not isinstance(rows, list):
+        rows, state = _payload_rows_with_state(payload)
+        if state in (_ROWS_INVALID, _ROWS_ERROR):
             return None
         codes: set[str] = set()
         names: list[str] = []
         for row in rows:
-            if not isinstance(row, dict):
-                continue
             row_code = _normalize_symbol(
                 _row_str(row, "stockCode", "code", "SECURITY_CODE", "secCode")
             )
+            row_name = _row_str(row, "stockName", "secName", "name", "stock_name")
+            # 行级身份校验：既无代码也无名称的行不可判定（防止把
+            # 结构异常的行静默跳过后误判目标股票不在列表中）
+            if not row_code and not row_name:
+                return None
             if row_code:
                 codes.add(row_code)
-            row_name = _row_str(row, "stockName", "secName", "name", "stock_name")
             if row_name:
                 names.append(row_name)
         return codes, names
@@ -1158,7 +1187,31 @@ class MXExecutionService:
         # 意图冲突（唯一约束）。原委托编号已在 intent.symbol。
         trade_intent_service.mark_cancel_intent_submitted(intent.id)
         # 撤单结果核验（尽力而为）：撤单请求 ≠ 撤单完成。
-        verify_note = self._verify_cancel_result(client, order_id)
+        # 第十一轮复审 P1：即时核验结果立即持久化到意图——
+        # verified/filled/cancel_pending/unknown 与 reconcile 口径一致，
+        # 防止"即时已确认 VERIFIED、下一轮委托消失又退化 UNKNOWN"。
+        verify_status, verify_note = self._verify_cancel_result(
+            client, order_id
+        )
+        try:
+            if verify_status == "verified":
+                trade_intent_service.mark_cancel_intent_verified(
+                    intent.id, verify_note
+                )
+            elif verify_status == "filled":
+                trade_intent_service.mark_cancel_intent_filled(
+                    intent.id, verify_note
+                )
+            elif verify_status == "cancel_pending":
+                trade_intent_service.mark_cancel_intent_pending(
+                    intent.id, verify_note
+                )
+            elif verify_status == "unknown":
+                trade_intent_service.mark_intent_unknown(intent.id, verify_note)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "cancel intent immediate status persist failed: %s", exc
+            )
         return {
             "ok": True,
             "tool_name": "mx_moni_cancel",
@@ -1174,20 +1227,28 @@ class MXExecutionService:
             },
         }
 
-    def _verify_cancel_result(self, client: MXClient, order_id: str) -> str:
-        """撤单后回查（第五轮复审 P1：四态结果，不再假成功描述）。
+    def _verify_cancel_result(
+        self, client: MXClient, order_id: str
+    ) -> tuple[str, str]:
+        """撤单后回查 → (结构化状态, 说明文本)。
 
-        查询失败/结构异常/找不到订单一律 UNKNOWN——"找不到"不能推断
-        撤单已生效（可能是分页/延迟/过滤）。
+        第十一轮复审 P1：返回结构化状态（verified/filled/cancel_pending/
+        unknown）供调用方立即持久化到 TradeIntent——原实现只返回文本，
+        即时已确认的 VERIFIED 不会落库，下一轮 reconcile 若委托已从
+        列表消失会退化为 UNKNOWN（即时结果、数据库、前端三处不一致）。
+        查询失败/结构异常/找不到订单一律 unknown。
         """
         try:
             orders_payload = client.get_orders()
         except Exception:  # noqa: BLE001
-            return "（回查失败（UNKNOWN）：请调用 mx_get_orders 自行核对该委托状态。）"
+            return (
+                "unknown",
+                "（回查失败（UNKNOWN）：请调用 mx_get_orders 自行核对该委托状态。）",
+            )
         try:
             rows = _require_parseable_order_rows(orders_payload, what="委托列表")
         except RuntimeError as exc:
-            return f"（回查失败（UNKNOWN）：{exc}）"
+            return "unknown", f"（回查失败（UNKNOWN）：{exc}）"
         for row in rows:
             row_order_id = _row_str(row, "orderID", "orderId", "order_id", "entrustNo")
             if row_order_id and row_order_id == str(order_id).strip():
@@ -1195,22 +1256,37 @@ class MXExecutionService:
 
                 terminal = order_terminal_status(row)
                 if terminal == "canceled":
-                    return "（回查（VERIFIED）：该委托已撤销，撤单确认生效。）"
+                    return (
+                        "verified",
+                        "（回查（VERIFIED）：该委托已撤销，撤单确认生效。）",
+                    )
                 if terminal == "canceled_partial":
                     # 第八轮复审 P1：部分成交后剩余已撤——撤单确认生效，
                     # 已成交部分保留为实际持仓变化（与 reconcile 口径一致）。
                     return (
+                        "verified",
                         "（回查（VERIFIED）：未成交部分已撤销，撤单确认生效；"
-                        "已成交部分保留为实际持仓变化。）"
+                        "已成交部分保留为实际持仓变化。）",
                     )
                 if terminal == "filled":
-                    return "（回查（FILLED）：该委托已全部成交，撤单未生效。）"
+                    return (
+                        "filled",
+                        "（回查（FILLED）：该委托已全部成交，撤单未生效。）",
+                    )
                 if terminal in ("submitted", "partially_filled"):
-                    return "（回查（CANCEL_PENDING）：该委托仍处于待撤状态，请稍后通过 mx_get_orders 核对。）"
-                return "（回查（UNKNOWN）：该委托状态不可判定，请通过 mx_get_orders 核对。）"
+                    return (
+                        "cancel_pending",
+                        "（回查（CANCEL_PENDING）：该委托仍处于待撤状态，"
+                        "请稍后通过 mx_get_orders 核对。）",
+                    )
+                return (
+                    "unknown",
+                    "（回查（UNKNOWN）：该委托状态不可判定，请通过 mx_get_orders 核对。）",
+                )
         return (
+            "unknown",
             "（回查（UNKNOWN）：委托列表中未找到该委托——不能据此认定撤单"
-            "已生效，请通过 mx_get_orders 或历史委托核对。）"
+            "已生效，请通过 mx_get_orders 或历史委托核对。）",
         )
 
     def _resolve_query(self, arguments: dict[str, Any], app_settings: Any) -> str:

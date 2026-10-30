@@ -1911,9 +1911,10 @@ def test_cancel_verify_unparseable_reports_unknown() -> None:
         def get_orders(self) -> dict:
             return {"weird": "shape"}
 
-    note = mx_execution_service._verify_cancel_result(
+    status, note = mx_execution_service._verify_cancel_result(
         _BadOrdersClient(), "ORD-1"
     )
+    assert status == "unknown"
     assert "UNKNOWN" in note
     assert "不可识别" in note
 
@@ -1926,10 +1927,10 @@ def test_cancel_verify_missing_order_reports_unknown() -> None:
         def get_orders(self) -> dict:
             return {"data": {"orders": []}}
 
-    note = mx_execution_service._verify_cancel_result(
+    status, note = mx_execution_service._verify_cancel_result(
         _EmptyOrdersClient(), "ORD-1"
     )
-    assert "UNKNOWN" in note
+    assert status == "unknown"
     assert "不能据此认定撤单已生效" in note
 
 
@@ -2712,10 +2713,10 @@ def test_cancel_verify_reports_canceled_partial_verified() -> None:
                 }
             }
 
-    note = mx_execution_service._verify_cancel_result(
+    status, note = mx_execution_service._verify_cancel_result(
         _PartialCanceledClient(), "ORD-PC"
     )
-    assert "VERIFIED" in note
+    assert status == "verified"
     assert "未成交部分已撤销" in note
     assert "已成交部分保留为实际持仓变化" in note
 
@@ -2940,15 +2941,15 @@ def test_cancel_handler_uses_dedicated_intent_submit_method(
 
         # 5. BUY 意图的 provider_order_id 不变
         assert _list_intents(id=buy.id)[0].provider_order_id == "ORD-100"
-        # 6. handler 注册的 CANCEL 意图进入 SUBMITTED，
-        #    未写 provider_order_id（无唯一约束冲突）
+        # 6. handler 注册的 CANCEL 意图：即时核验已确认 VERIFIED 并
+        #    立即持久化（第十一轮复审 P1），未写 provider_order_id
         cancel_intents = [
             item for item in _list_intents() if item.side == "CANCEL"
         ]
         assert len(cancel_intents) == 1
         cancel_stored = cancel_intents[0]
         assert cancel_stored.symbol == "ORD-100"  # 原委托编号在 symbol
-        assert cancel_stored.status == "submitted"
+        assert cancel_stored.status == "verified"  # 即时核验已持久化
         assert cancel_stored.provider_order_id is None
     finally:
         _reset_db_state()
@@ -2976,5 +2977,132 @@ def test_mark_cancel_intent_rejects_missing_intent(monkeypatch, tmp_path) -> Non
     try:
         with pytest.raises(RuntimeError, match="撤单意图不存在"):
             trade_intent_service.mark_cancel_intent_submitted(99999)
+    finally:
+        _reset_db_state()
+
+
+# ---------------------------------------------------------------------------
+# 第十一轮复审专项
+# ---------------------------------------------------------------------------
+
+
+def test_handler_internal_typeerror_not_reexecuted() -> None:
+    """P1：handler 内部 TypeError 不得触发二次执行（重复写请求）。
+
+    原实现捕获全部 TypeError 后重试整个 handler——若写请求已发出、
+    本地处理响应时抛 TypeError，会被误判为签名不匹配而再次执行。
+    """
+    from skills.mx_core.execution import MXExecutionService
+
+    service = MXExecutionService()
+    call_count = {"value": 0}
+
+    def _flaky_handler(*, client, app_settings, arguments, run_id=None):
+        del client, app_settings, arguments, run_id
+        call_count["value"] += 1
+        # 模拟：远端写请求已发出（计数 +1），本地处理响应抛 TypeError
+        raise TypeError("响应处理内部异常")
+
+    service._handlers["mx_test_flaky"] = _flaky_handler
+    try:
+        result = service.execute_tool(
+            client=None,
+            app_settings=None,
+            tool_name="mx_test_flaky",
+            arguments={},
+            run_id=1,
+        )
+        # handler 只执行一次（无二次执行）
+        assert call_count["value"] == 1
+        # 异常被外层捕获为失败结果（不是成功）
+        assert result["ok"] is False
+        assert "响应处理内部异常" in str(result.get("error") or "")
+    finally:
+        service._handlers.pop("mx_test_flaky", None)
+
+
+def test_handler_without_run_id_param_still_works() -> None:
+    """签名判断兼容不接受 run_id 的 handler（正常执行一次）。"""
+    from skills.mx_core.execution import MXExecutionService
+
+    service = MXExecutionService()
+    call_count = {"value": 0}
+
+    def _legacy_handler(*, client, app_settings, arguments):
+        del client, app_settings
+        call_count["value"] += 1
+        return {
+            "ok": True,
+            "tool_name": arguments.get("name", ""),
+            "result": {"legacy": True},
+        }
+
+    service._handlers["mx_test_legacy"] = _legacy_handler
+    try:
+        result = service.execute_tool(
+            client=None,
+            app_settings=None,
+            tool_name="mx_test_legacy",
+            arguments={"name": "mx_test_legacy"},
+            run_id=1,
+        )
+        assert call_count["value"] == 1
+        assert result["ok"] is True
+    finally:
+        service._handlers.pop("mx_test_legacy", None)
+
+
+def test_cancel_immediate_verify_persists_intent_status(
+    monkeypatch, tmp_path
+) -> None:
+    """第十一轮复审 P1：即时核验结果立即持久化到意图。
+
+    撤单成功 → 即时核验 VERIFIED → 数据库立即 verified（不等下一轮
+    reconcile——防止后续委托从列表消失时退化 UNKNOWN）。
+    """
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        from skills.mx_core import execution as mx_execution
+
+        monkeypatch.setattr(mx_execution, "is_market_open", lambda: True)
+
+        remote_orders = [
+            {
+                "stockCode": "600519",
+                "orderDrt": "1",
+                "orderStatus": "1",
+                "orderCount": 100,
+                "dealCount": 0,
+                "orderID": "ORD-IV",
+            }
+        ]
+
+        class _IVClient:
+            def get_orders(self) -> dict:
+                return {"data": {"orders": remote_orders}}
+
+            def cancel_order(self, *, cancel_type, order_id, stock_code):
+                remote_orders[0]["orderStatus"] = "3"
+                return {"code": "200", "message": "成功", "data": {"orderID": order_id}}
+
+        result = mx_execution.mx_execution_service.execute_tool(
+            client=_IVClient(),
+            app_settings=None,
+            tool_name="mx_moni_cancel",
+            arguments={
+                "cancel_type": "order",
+                "order_id": "ORD-IV",
+                "stock_code": "600519",
+            },
+        )
+        assert result["ok"] is True
+
+        # 即时核验已持久化：CANCEL 意图为 verified（非 submitted）
+        cancel_intents = [
+            item for item in _list_intents() if item.side == "CANCEL"
+        ]
+        assert cancel_intents[0].status == "verified"
+        assert "已撤销" in str(cancel_intents[0].note or "")
     finally:
         _reset_db_state()

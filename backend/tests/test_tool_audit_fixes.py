@@ -575,7 +575,37 @@ def test_manage_self_select_unverified_state_reports_unknown() -> None:
 
 
 def test_manage_self_select_readback_failure_reports_unknown() -> None:
-    """写请求已发出但回查读取失败：UNKNOWN，不自动重试。"""
+    """写请求已发出但回查读取失败：UNKNOWN，不自动重试。
+
+    第十一轮复审后预读取失败会被直接拒绝（不发写请求），因此本测试
+    用有状态桩：预读取成功（空列表）→ 发送 ADD → 回查失败。
+    """
+    from skills.mx_core.execution import mx_execution_service
+
+    client = _SelfSelectClient(rows=[])
+    # 预读取成功；写请求发出后回查失败
+    original_read = client.get_self_selects
+
+    def _stateful_read():
+        if len(client.manage_calls) == 0:
+            return original_read()
+        raise RuntimeError("读取失败")
+
+    client.get_self_selects = _stateful_read
+    result = mx_execution_service.execute_tool(
+        client=client,
+        app_settings=None,
+        tool_name="mx_manage_self_select",
+        arguments={"query": "将600519加入自选股"},
+    )
+
+    assert result["ok"] is False
+    assert "回查失败" in str(result.get("error") or "")
+    assert len(client.manage_calls) == 1
+
+
+def test_manage_self_select_pre_read_failure_rejects_write() -> None:
+    """第十一轮复审 P0：预读取失败 → 拒绝写请求（不发 ADD/REMOVE）。"""
     from skills.mx_core.execution import mx_execution_service
 
     client = _SelfSelectClient(rows=[], read_fails=True)
@@ -587,8 +617,53 @@ def test_manage_self_select_readback_failure_reports_unknown() -> None:
     )
 
     assert result["ok"] is False
-    assert "回查失败" in str(result.get("error") or "")
-    assert len(client.manage_calls) == 1
+    assert "无法读取当前自选股列表" in str(result.get("error") or "")
+    # 写请求未发送
+    assert client.manage_calls == []
+
+
+def test_manage_self_select_unparseable_payload_rejects_write() -> None:
+    """结构异常载荷 → 不可判定 → 拒绝写请求（原实现被当作空列表）。"""
+    from skills.mx_core.execution import mx_execution_service
+
+    class _BadPayloadClient:
+        def get_self_selects(self) -> dict:
+            return {"data": {"unexpected": "invalid"}}
+
+        def manage_self_select(self, query: str) -> dict:
+            raise AssertionError("结构异常时不得发送写请求")
+
+    result = mx_execution_service.execute_tool(
+        client=_BadPayloadClient(),
+        app_settings=None,
+        tool_name="mx_manage_self_select",
+        arguments={"query": "将600519从自选股删除"},
+    )
+
+    assert result["ok"] is False
+    assert "无法读取当前自选股列表" in str(result.get("error") or "")
+
+
+def test_manage_self_select_row_without_identity_rejects_write() -> None:
+    """行级身份缺失（既无代码也无名称）→ 不可判定 → 拒绝写请求。"""
+    from skills.mx_core.execution import mx_execution_service
+
+    class _NoIdentityClient:
+        def get_self_selects(self) -> dict:
+            return {"data": {"rows": [{"unexpected": 1}]}}
+
+        def manage_self_select(self, query: str) -> dict:
+            raise AssertionError("行身份缺失时不得发送写请求")
+
+    result = mx_execution_service.execute_tool(
+        client=_NoIdentityClient(),
+        app_settings=None,
+        tool_name="mx_manage_self_select",
+        arguments={"query": "将600519加入自选股"},
+    )
+
+    assert result["ok"] is False
+    assert "无法读取当前自选股列表" in str(result.get("error") or "")
 
 
 def test_manage_self_select_ambiguous_intent_rejected_without_write() -> None:

@@ -561,6 +561,41 @@ handler 注册的 CANCEL 意图 SUBMITTED 且未写 provider_order_id
 
 **全量回归：后端 464 passed，前端 86 passed，vue-tsc/build 通过。**
 
+### 第十三轮：第十一轮复审 P0×1 + P1×2 修复（2026-10-30 第十一次外部复审）
+
+**P0 自选股读取四态解析**（复审指出的"与早期重复交易相同的设计缺陷"）：
+- `_read_self_select_state` 改用 `_payload_rows_with_state` 四态解析
+  ——原实现经 `_payload_rows` 兼容层把 INVALID 静默转成空列表，
+  "列表读不到"被当成"列表为空"：删除场景返回 NOOP_VERIFIED（实际
+  没删也声称满足目标状态）、添加场景对已在自选的股票重复发送 ADD。
+- 行级身份校验：既无代码也无名称的行 → 整体不可判定（防止把结构
+  异常的行静默跳过后误判目标股票不在列表中）。
+- **预读取不可判定即拒绝写请求**（复审场景 A/B 的根因修复）：
+  读取失败/结构异常/行身份缺失 → 不发送 ADD/REMOVE，指引先确认
+  mx_get_self_selects 可正常读取。只有 VALID_EMPTY/VALID_DATA 才
+  可作为 NOOP 判断依据。
+
+**P1-1 执行器 TypeError 二次执行消除**：`execute_tool` 改为
+`inspect.signature` **执行前**判断 handler 是否支持 run_id——原实现
+捕获全部 TypeError 后重试整个 handler，会把"写请求已发出后本地处理
+响应时的 TypeError"误判为签名不匹配而二次执行（重复写请求）。
+测试：flaky handler 计数验证只执行一次；legacy handler（无 run_id
+参数）兼容性保持。
+
+**P1-2 撤单即时核验持久化**：`_verify_cancel_result` 返回结构化
+`(status, note)`——verified / filled / cancel_pending / unknown，
+handler 立即通过专用方法（mark_cancel_intent_verified/filled/pending）
+持久化到 TradeIntent。修复"即时已确认 VERIFIED、下一轮委托从列表
+消失又退化 UNKNOWN"的三处不一致（即时结果 / 数据库 / 前端卡片）。
+后续 reconcile 只处理仍未终结的意图。
+
+**第十一轮专项测试**（新增 5 个）：预读取失败拒绝写请求、结构异常
+载荷拒绝、行身份缺失拒绝、handler 内部 TypeError 不二次执行、
+即时核验持久化 E2E；另修正 3 个 _verify_cancel_result 测试为结构化
+断言、1 个回查失败测试改为有状态桩（预读成功→写→回查失败）。
+
+**全量回归：后端 470 passed，前端 86 passed，vue-tsc/build 通过。**
+
 ### 已知边界（如实记录）
 
 - signal_id 是日级标识（交易日+标的+方向），45 分钟冷却放行第二档
