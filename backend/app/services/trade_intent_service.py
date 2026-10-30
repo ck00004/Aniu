@@ -361,6 +361,26 @@ class TradeIntentService:
             intent.updated_at = _now_utc()
             db.add(intent)
 
+    def mark_cancel_intent_submitted(
+        self, intent_id: int, note: str | None = None
+    ) -> None:
+        """撤单意图专用提交标记（第九轮复审 P0-2）。
+
+        撤单意图的原委托编号保存在 intent.symbol；**不写
+        provider_order_id**——妙想撤单响应可能返回原委托编号，写入会
+        与已绑定该编号的 BUY/SELL 意图冲突（provider_order_id 全局
+        唯一约束），导致"远端撤单已成功、本地状态更新失败"。
+        如需记录撤单请求编号，未来应使用独立字段 cancel_request_id。
+        """
+        with session_scope() as db:
+            intent = db.get(TradeIntent, intent_id)
+            if intent is None:
+                return
+            intent.status = "submitted"
+            intent.note = note or "撤单请求已提交，等待核验"
+            intent.updated_at = _now_utc()
+            db.add(intent)
+
     def bind_provider_order_id(
         self,
         intent_id: int,

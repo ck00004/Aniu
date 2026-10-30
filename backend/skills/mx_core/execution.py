@@ -18,6 +18,7 @@ from skills.mx_core.client import (
 from skills.mx_core.order_schema import (
     CANCELED_ORDER_STATUSES as _CANCELED_ORDER_STATUSES,
     PENDING_ORDER_STATUSES as _PENDING_ORDER_STATUSES,
+    get_order_side as _get_order_side,
     parse_order_snapshot as _parse_order_snapshot,
     row_int_optional as _row_int_optional,
     row_str as _schema_row_str,
@@ -165,8 +166,10 @@ def _row_str(row: dict[str, Any], *keys: str) -> str:
 
 
 def _is_sell_side(row: dict[str, Any]) -> bool:
-    side = _row_str(row, "orderDrt", "drt", "bsFlag", "side", "tradeType")
-    return side in {"2", "SELL", "sell", "S"}
+    # 第九轮复审 P0-1：统一使用公共 Schema 方向解析——原实现
+    # {"2","SELL","sell","S"} 不含小写 "s"/"b"，与 get_order_side 的
+    # 大小写归一不一致，在途卖单会被跳过（低估可卖占用）。
+    return _get_order_side(row) == "SELL"
 
 
 def _order_status(row: dict[str, Any]) -> str:
@@ -312,6 +315,22 @@ def preflight_trade(
     _avail_keys = ("availCount", "availableCount", "enableQty")
     _avail_present = any(key in position_row for key in _avail_keys)
     available = _row_int_optional(position_row, *_avail_keys)
+    # 第九轮复审 P1：多个别名同时存在但数值冲突 → 数据源内部矛盾，
+    # 明确拒绝（不静默采用第一个字段——如 availCount=0 +
+    # availableCount=500 可能掩盖真实可卖数量）。
+    if _avail_present and available is not None:
+        alias_values = set()
+        for key in _avail_keys:
+            if key in position_row:
+                value = _row_int_optional(position_row, key)
+                if value is not None:
+                    alias_values.add(value)
+        if len(alias_values) > 1:
+            raise RuntimeError(
+                f"{symbol} 可卖数量字段别名数值冲突"
+                f"（{sorted(alias_values)}），数据源内部矛盾，为防止违规"
+                "卖出已阻断本次交易；请核对持仓数据。"
+            )
     if _avail_present and available is None:
         raise RuntimeError(
             f"{symbol} 可卖数量字段存在但格式异常（无法解析为整数），"
@@ -1129,9 +1148,10 @@ class MXExecutionService:
                 "mx_get_orders 核对该委托状态，确认前不得重复提交撤单。"
             ) from exc
 
-        trade_intent_service.mark_intent_submitted(
-            intent.id, extract_order_id(result)
-        )
+        # 第九轮复审 P0-2：撤单意图不写 provider_order_id——妙想撤单
+        # 响应可能返回原委托编号，写入会与已绑定该编号的 BUY/SELL
+        # 意图冲突（唯一约束）。原委托编号已在 intent.symbol。
+        trade_intent_service.mark_cancel_intent_submitted(intent.id)
         # 撤单结果核验（尽力而为）：撤单请求 ≠ 撤单完成。
         verify_note = self._verify_cancel_result(client, order_id)
         return {

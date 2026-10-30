@@ -499,6 +499,30 @@ UNKNOWN。
 **全量回归：后端 457 passed（451 + 新增 6，含 P0-1 的 2 个形态测试），
 前端 86 passed。**
 
+### 第十一轮：第九轮复审 P0×2 + P1×1 修复（2026-10-30 第九次外部复审）
+
+**P0-1 统一方向解析**：`_is_sell_side` 改用公共 Schema 的
+`get_order_side`（大小写归一 + 白名单）——原实现 `{"2","SELL","sell","S"}`
+不含小写 `"s"`/`"b"`，与公共 Schema 不一致：orderDrt="s" 的在途卖单
+会被 SELL 预检跳过（低估可卖占用，重复卖出风险）。测试验证小写 s
+卖单正确计算占用。
+
+**P0-2 撤单意图独立提交方法**：新增 `mark_cancel_intent_submitted`
+——撤单意图**不写 provider_order_id**。复审场景：BUY 意图已绑定
+ORD-100 → 撤单接口返回 orderID=ORD-100（原委托编号）→ 写入会触发
+provider_order_id 全局唯一约束冲突 → "远端撤单已成功、本地状态更新
+失败"。原委托编号继续保存在 intent.symbol；未来如需记录撤单请求
+编号使用独立字段 cancel_request_id。测试验证冲突场景无异常。
+
+**P1 可卖数量别名冲突检测**：availCount / availableCount / enableQty
+多别名同时存在但数值冲突（如 availCount=0 + availableCount=500）→
+明确拒绝（数据源内部矛盾），不静默采用第一个字段。
+
+**第九轮专项测试**（新增 3 个）：小写 s 卖单占用计算（#1）、撤单返回
+原单号无唯一约束冲突（#2）、别名冲突拒绝（#3）。
+
+**全量回归：后端 460 passed，前端 86 passed，vue-tsc/build 通过。**
+
 ### 已知边界（如实记录）
 
 - signal_id 是日级标识（交易日+标的+方向），45 分钟冷却放行第二档

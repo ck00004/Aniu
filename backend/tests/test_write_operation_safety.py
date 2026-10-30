@@ -2718,3 +2718,118 @@ def test_cancel_verify_reports_canceled_partial_verified() -> None:
     assert "VERIFIED" in note
     assert "未成交部分已撤销" in note
     assert "已成交部分保留为实际持仓变化" in note
+
+
+# ---------------------------------------------------------------------------
+# 第九轮复审专项
+# ---------------------------------------------------------------------------
+
+
+def test_lowercase_s_sell_side_occupies() -> None:
+    """清单 #1：orderDrt="s"（小写）的在途卖单 → 正确计算占用。
+
+    原 _is_sell_side 白名单不含小写 s，该卖单会被跳过（低估可卖占用）。
+    """
+    from skills.mx_core.execution import preflight_trade
+
+    class _LowerSClient:
+        def get_positions(self) -> dict:
+            return {
+                "data": {"posList": [{"stockCode": "600519", "count": 1000}]}
+            }
+
+        def get_orders(self) -> dict:
+            return {
+                "data": {
+                    "orders": [
+                        {
+                            "stockCode": "600519",
+                            "orderDrt": "s",  # 小写方向
+                            "orderStatus": "1",
+                            "orderCount": 500,
+                            "dealCount": 0,
+                            "orderID": "ORD-LS",
+                        }
+                    ]
+                }
+            }
+
+    # 占用 500：可卖 1000-500=500，卖出 800 应被拒
+    with pytest.raises(RuntimeError, match="可卖数量 500"):
+        preflight_trade(
+            client=_LowerSClient(),
+            action="SELL",
+            symbol="600519",
+            quantity=800,
+            price_type="MARKET",
+            price=None,
+        )
+
+
+def test_cancel_returning_original_order_id_no_conflict(
+    monkeypatch, tmp_path
+) -> None:
+    """清单 #2：撤单返回原订单号（已绑定 BUY 意图）→ 不发生唯一约束冲突。
+
+    场景：BUY 意图绑定 ORD-100 → 撤单接口返回 orderID=ORD-100 →
+    撤单意图提交不得把 ORD-100 写入 provider_order_id（唯一约束冲突
+    会导致"远端撤单成功、本地状态更新失败"）。
+    """
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        client = _IntentClient()
+        buy = trade_intent_service.check_and_register_trade_intent(
+            client=client, symbol="600519", side="BUY", quantity=100
+        )
+        # BUY 意图绑定 ORD-100
+        trade_intent_service.mark_intent_submitted(buy.id, "ORD-100")
+
+        # 撤单意图（symbol 存原委托编号）
+        cancel = trade_intent_service.check_and_register_cancel_intent(
+            order_id="ORD-100"
+        )
+        # 撤单成功，响应返回原委托编号 ORD-100——专用方法不写
+        # provider_order_id，无唯一约束冲突
+        trade_intent_service.mark_cancel_intent_submitted(cancel.id)
+
+        stored = _list_intents(id=cancel.id)[0]
+        assert stored.status == "submitted"
+        assert stored.provider_order_id is None  # 未写入，无冲突
+        assert _list_intents(id=buy.id)[0].provider_order_id == "ORD-100"
+    finally:
+        _reset_db_state()
+
+
+def test_avail_alias_conflict_rejects_sell() -> None:
+    """清单 #3：可卖数量别名数值冲突（availCount=0 + availableCount=500）
+    → 明确拒绝，不静默选第一个。"""
+    from skills.mx_core.execution import preflight_trade
+
+    class _AliasConflictClient:
+        def get_positions(self) -> dict:
+            return {
+                "data": {
+                    "posList": [
+                        {
+                            "stockCode": "600519",
+                            "count": 1000,
+                            "availCount": 0,
+                            "availableCount": 500,
+                        }
+                    ]
+                }
+            }
+
+        def get_orders(self) -> dict:
+            return {"data": {"orders": []}}
+
+    with pytest.raises(RuntimeError, match="别名数值冲突"):
+        preflight_trade(
+            client=_AliasConflictClient(),
+            action="SELL",
+            symbol="600519",
+            quantity=100,
+            price_type="MARKET",
+            price=None,
+        )
