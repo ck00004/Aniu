@@ -30,6 +30,7 @@ from app.services.trade_intent_service import (
     FILLED_REENTRY_COOLDOWN_MINUTES,
     MAX_TRANCHES_PER_SIGNAL,
     SHANGHAI_TZ,
+    UNKNOWN_WAIT_SECONDS,
     trade_intent_service,
 )
 
@@ -413,10 +414,13 @@ def test_unknown_intent_reconciles_to_filled_via_orders(monkeypatch, tmp_path) -
         _reset_db_state()
 
 
-def test_unknown_intent_reconciles_to_failed_without_trace(
+def test_unknown_intent_visibility_wait_before_failed(
     monkeypatch, tmp_path
 ) -> None:
-    """UNKNOWN 意图核对：委托列表无痕迹 → 判定未提交（failed，允许重试）。"""
+    """P0-1 可见性等待：委托列表查不到痕迹 ≠ 未提交。
+
+    第一次核验保持 UNKNOWN（阻塞）；连续 ≥2 次核验且超过等待期后才
+    判定 failed（解除阻塞允许重试）。"""
     _use_temp_db(monkeypatch, tmp_path)
     init_db()
     try:
@@ -426,16 +430,137 @@ def test_unknown_intent_reconciles_to_failed_without_trace(
         )
         _backdate_intent(intent.id, status="unknown")
 
+        # 第 1 次核验：无痕迹 → 保持 UNKNOWN（订单可能已提交但暂不可见）
+        resolved = trade_intent_service.reconcile_unknown_intents(
+            client, symbol="600519"
+        )
+        assert resolved[0].status == "unknown"
+        assert resolved[0].unknown_checks == 1
+        # UNKNOWN 仍阻塞同向注册
+        with pytest.raises(RuntimeError, match="未完成/未确认"):
+            trade_intent_service.check_and_register_trade_intent(
+                client=client, symbol="600519", side="BUY", quantity=100
+            )
+
+        # 第 2 次核验（未过等待期）：仍保持 UNKNOWN
+        # （中间被拦截的注册尝试本身也会触发一次核验，次数 ≥2 即可）
+        resolved = trade_intent_service.reconcile_unknown_intents(
+            client, symbol="600519"
+        )
+        assert resolved[0].status == "unknown"
+        assert resolved[0].unknown_checks >= 2
+
+        # 等待期已过 + 次数达标 → 判定未提交（failed，解除阻塞）
+        _backdate_intent(
+            intent.id,
+            first_unknown_at=datetime.now(timezone.utc)
+            - timedelta(seconds=UNKNOWN_WAIT_SECONDS + 10),
+        )
         resolved = trade_intent_service.reconcile_unknown_intents(
             client, symbol="600519"
         )
         assert resolved[0].status == "failed"
 
-        # failed 不阻塞：允许重试（新档）
+        # failed 不阻塞：允许重试（技术重试档，不消耗真实分批）
         retry = trade_intent_service.check_and_register_trade_intent(
             client=client, symbol="600519", side="BUY", quantity=100
         )
         assert retry.tranche_id == 2
+    finally:
+        _reset_db_state()
+
+
+def test_unknown_intent_first_hidden_then_visible(monkeypatch, tmp_path) -> None:
+    """审计清单 #1：订单已被远端接受但第一次查询不到、第二次才出现。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        # 第一次查询：委托列表为空（远端延迟）
+        client = _IntentClient(orders=[])
+        intent = trade_intent_service.check_and_register_trade_intent(
+            client=client, symbol="600519", side="BUY", quantity=100
+        )
+        _backdate_intent(intent.id, status="unknown")
+
+        first = trade_intent_service.reconcile_unknown_intents(
+            client, symbol="600519"
+        )
+        assert first[0].status == "unknown"  # 不能误判 failed
+
+        # 第二次查询：委托出现（远端已接受）
+        client.orders = [
+            {
+                "stockCode": "600519",
+                "orderDrt": "1",
+                "orderStatus": "1",
+                "orderCount": 100,
+                "dealCount": 0,
+                "orderID": "ORD-LATE",
+            }
+        ]
+        second = trade_intent_service.reconcile_unknown_intents(
+            client, symbol="600519"
+        )
+        assert second[0].status == "submitted"  # 收敛为在途，继续阻塞
+    finally:
+        _reset_db_state()
+
+
+def test_order_list_key_parsed_in_reconcile(monkeypatch, tmp_path) -> None:
+    """审计清单 #2：妙想返回 orderList（而非 orders）也能被意图核对解析。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        client = _IntentClient()
+        client.get_orders = lambda: {
+            "data": {
+                "orderList": [
+                    {
+                        "stockCode": "600519",
+                        "orderDrt": "1",
+                        "orderStatus": "1",
+                        "orderCount": 100,
+                        "dealCount": 0,
+                        "orderID": "ORD-OL",
+                    }
+                ]
+            }
+        }
+        intent = trade_intent_service.check_and_register_trade_intent(
+            client=client, symbol="600519", side="BUY", quantity=100
+        )
+        _backdate_intent(intent.id, status="unknown")
+
+        resolved = trade_intent_service.reconcile_unknown_intents(
+            client, symbol="600519"
+        )
+        # orderList 被正确解析：委托存在 → 收敛 submitted，而不是误判 failed
+        assert resolved[0].status == "submitted"
+    finally:
+        _reset_db_state()
+
+
+def test_unparseable_orders_payload_keeps_blocking(monkeypatch, tmp_path) -> None:
+    """委托响应结构无法识别：不可判定，保持 UNKNOWN 阻塞。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        client = _IntentClient()
+        client.get_orders = lambda: {"unexpected": "shape"}
+        intent = trade_intent_service.check_and_register_trade_intent(
+            client=client, symbol="600519", side="BUY", quantity=100
+        )
+        _backdate_intent(intent.id, status="unknown")
+
+        # 不可判定的载荷让 reconcile 提前返回（不触碰任何意图状态）
+        resolved = trade_intent_service.reconcile_unknown_intents(
+            client, symbol="600519"
+        )
+        assert resolved == []
+        # 意图保持 UNKNOWN 且核验次数不被消耗
+        stored = _list_intents(id=intent.id)[0]
+        assert stored.status == "unknown"
+        assert stored.unknown_checks == 0
     finally:
         _reset_db_state()
 
@@ -605,3 +730,318 @@ def test_execution_report_payload_clean_run() -> None:
     assert payload["verified"] is False
     assert payload["trades"] == []
     assert payload["data_validation_passed"] is True
+
+
+# ---------------------------------------------------------------------------
+# 审计复审专项（清单 #3/#4/#5/#7/#9）
+# ---------------------------------------------------------------------------
+
+
+def test_unparseable_json_response_marks_unknown_not_failed(
+    monkeypatch, tmp_path
+) -> None:
+    """清单 #3：HTTP 200 但响应体无法解析 → 状态不确定（UNKNOWN），
+    不得被当作"远端明确拒绝"而解除阻塞。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        from skills.mx_core import execution as mx_execution
+        from skills.mx_core.client import MXResponseUnknown
+
+        monkeypatch.setattr(mx_execution, "is_market_open", lambda: True)
+
+        class _BadJsonClient:
+            def get_orders(self) -> dict:
+                return {"data": {"orders": []}}
+
+            def get_balance(self) -> dict:
+                return {"data": {"availBalance": 10_000_000.0}}
+
+            def trade(self, **kwargs) -> dict:
+                raise MXResponseUnknown("妙想接口返回了无法解析的响应: <html>")
+
+        result = mx_execution.mx_execution_service.execute_tool(
+            client=_BadJsonClient(),
+            app_settings=None,
+            tool_name="mx_moni_trade",
+            arguments={
+                "action": "BUY",
+                "symbol": "600519",
+                "quantity": 100,
+                "price_type": "LIMIT",
+                "price": 20.0,
+            },
+        )
+        assert result["ok"] is False
+        assert "委托状态未知（响应无法解析）" in str(result.get("error") or "")
+
+        # 意图为 UNKNOWN（阻塞），不是 failed（放行）
+        intents = _list_intents(symbol="600519")
+        assert len(intents) == 1
+        assert intents[0].status == "unknown"
+    finally:
+        _reset_db_state()
+
+
+def test_submitted_intent_syncs_to_filled(monkeypatch, tmp_path) -> None:
+    """清单 #4：正常 SUBMITTED 订单后续变成 FILLED（状态闭环）。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        client = _IntentClient()
+        intent = trade_intent_service.check_and_register_trade_intent(
+            client=client, symbol="600519", side="BUY", quantity=100
+        )
+        trade_intent_service.mark_intent_submitted(intent.id, "ORD-F")
+
+        # 远端委托全部成交
+        client.orders = [
+            {
+                "stockCode": "600519",
+                "orderDrt": "1",
+                "orderStatus": "1",
+                "orderCount": 100,
+                "dealCount": 100,
+                "orderID": "ORD-F",
+            }
+        ]
+        resolved = trade_intent_service.reconcile_open_trade_intents(
+            client, symbol="600519"
+        )
+        assert resolved[0].status == "filled"
+
+        # 成交后进入冷却期：同信号再次买入被冷却拦截（而非在途拦截）
+        with pytest.raises(RuntimeError, match="冷却期内禁止"):
+            trade_intent_service.check_and_register_trade_intent(
+                client=client, symbol="600519", side="BUY", quantity=100
+            )
+    finally:
+        _reset_db_state()
+
+
+def test_partially_filled_then_cancelled_is_terminal(monkeypatch, tmp_path) -> None:
+    """清单 #5：部分成交后剩余委托被撤销 → 终态 canceled（不再阻塞，
+    由策略判断是否新开仓）。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        client = _IntentClient()
+        intent = trade_intent_service.check_and_register_trade_intent(
+            client=client, symbol="600519", side="BUY", quantity=100
+        )
+        trade_intent_service.mark_intent_submitted(intent.id, "ORD-P")
+
+        # 部分成交 40 股，剩余撤销（非 pending 状态）
+        client.orders = [
+            {
+                "stockCode": "600519",
+                "orderDrt": "1",
+                "orderStatus": "3",  # 已撤
+                "orderCount": 100,
+                "dealCount": 40,
+                "orderID": "ORD-P",
+            }
+        ]
+        resolved = trade_intent_service.reconcile_open_trade_intents(
+            client, symbol="600519"
+        )
+        assert resolved[0].status == "partially_filled"
+
+        # 剩余全部撤销且无成交 → canceled 终态
+        client.orders = [
+            {
+                "stockCode": "600519",
+                "orderDrt": "1",
+                "orderStatus": "3",
+                "orderCount": 100,
+                "dealCount": 0,
+                "orderID": "ORD-P",
+            }
+        ]
+        resolved = trade_intent_service.reconcile_open_trade_intents(
+            client, symbol="600519"
+        )
+        assert resolved[0].status == "canceled"
+    finally:
+        _reset_db_state()
+
+
+def test_startup_recovery_skips_running_runs(monkeypatch, tmp_path) -> None:
+    """清单 #7：另一 worker 正在执行的 run（状态 running）的意图
+    不被启动恢复误判为遗留。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        from app.db.models import StrategyRun
+
+        with session_scope() as db:
+            live_run = StrategyRun(
+                trigger_source="schedule",
+                run_type="trade",
+                status="running",
+                started_at=datetime.now(timezone.utc),
+            )
+            dead_run = StrategyRun(
+                trigger_source="schedule",
+                run_type="trade",
+                status="failed",
+                started_at=datetime.now(timezone.utc),
+            )
+            db.add_all([live_run, dead_run])
+            db.flush()
+            today = datetime.now(SHANGHAI_TZ).date().isoformat()
+            db.add_all(
+                [
+                    TradeIntent(
+                        signal_date=today,
+                        symbol="600519",
+                        side="BUY",
+                        tranche_id=1,
+                        intent_key=f"{today}:600519:BUY:1",
+                        run_id=live_run.id,
+                        quantity=100,
+                        status="executing",
+                    ),
+                    TradeIntent(
+                        signal_date=today,
+                        symbol="000001",
+                        side="BUY",
+                        tranche_id=1,
+                        intent_key=f"{today}:000001:BUY:1",
+                        run_id=dead_run.id,
+                        quantity=100,
+                        status="executing",
+                    ),
+                ]
+            )
+
+        recovered = trade_intent_service.reconcile_stale_executing_intents()
+        # 只有 dead run 的意图被收敛；live run 的保持 executing
+        assert recovered == 1
+        assert _list_intents(symbol="600519")[0].status == "executing"
+        assert _list_intents(symbol="000001")[0].status == "unknown"
+    finally:
+        _reset_db_state()
+
+
+def test_missing_memory_read_blocks_planned_trade() -> None:
+    """清单 #9：拟交易标的没有 memory_read 检索记录 → 数据验证不通过。"""
+    from app.services.aniu_service import aniu_service
+    from types import SimpleNamespace
+
+    decision = {
+        "final_answer": "计划买入。",
+        "tool_calls": [
+            # 四个必需读取工具全部成功且载荷有效
+            {"name": "mx_get_balance", "arguments": {}, "result": {"ok": True, "result": {"data": {"availBalance": 1}}}},
+            {"name": "mx_get_positions", "arguments": {}, "result": {"ok": True, "result": {"data": {"posList": []}}}},
+            {"name": "mx_get_orders", "arguments": {}, "result": {"ok": True, "result": {"data": {"orders": []}}}},
+            {"name": "mx_get_self_selects", "arguments": {}, "result": {"ok": True, "result": {"data": {"rows": []}}}},
+            # 拟买入 600519 的计划
+            {
+                "name": "mx_moni_trade",
+                "arguments": {"action": "BUY", "symbol": "600519", "quantity": 100},
+                "result": {
+                    "ok": True,
+                    "planned_action": {"action": "BUY", "symbol": "600519", "name": "贵州茅台", "quantity": 100},
+                },
+            },
+            # memory_read 只检索了另一只股票（300059）
+            {
+                "name": "memory_read",
+                "arguments": {"keywords": ["300059"]},
+                "result": {"ok": True, "result_count": 0, "keywords": ["300059"]},
+            },
+        ],
+    }
+    settings = SimpleNamespace(run_type="trade", prompt_templates={}, task_prompt="")
+
+    merged, _, _, _ = aniu_service._enforce_required_tools(
+        settings=settings,
+        client=None,
+        decision=decision,
+        llm_request={},
+        llm_response={},
+        runtime_trace={},  # 无 messages：不触发补充调用
+        emit=None,
+        tool_executor=None,
+    )
+
+    assert merged.get("data_validation_passed") is False
+    assert "memory_read:600519" in (merged.get("missing_required_tools") or [])
+
+
+def test_memory_read_covering_symbol_passes_validation() -> None:
+    """拟交易标的有 memory_read 检索记录（结果为空也算有效）→ 通过。"""
+    from app.services.aniu_service import aniu_service
+    from types import SimpleNamespace
+
+    decision = {
+        "final_answer": "计划买入。",
+        "tool_calls": [
+            {"name": "mx_get_balance", "arguments": {}, "result": {"ok": True, "result": {"data": {"availBalance": 1}}}},
+            {"name": "mx_get_positions", "arguments": {}, "result": {"ok": True, "result": {"data": {"posList": []}}}},
+            {"name": "mx_get_orders", "arguments": {}, "result": {"ok": True, "result": {"data": {"orders": []}}}},
+            {"name": "mx_get_self_selects", "arguments": {}, "result": {"ok": True, "result": {"data": {"rows": []}}}},
+            {
+                "name": "mx_moni_trade",
+                "arguments": {"action": "BUY", "symbol": "600519", "quantity": 100},
+                "result": {
+                    "ok": True,
+                    "planned_action": {"action": "BUY", "symbol": "600519", "name": "贵州茅台", "quantity": 100},
+                },
+            },
+            # 检索了拟买入标的（按名称）
+            {
+                "name": "memory_read",
+                "arguments": {"keywords": ["贵州茅台", "白酒"]},
+                "result": {"ok": True, "result_count": 0, "keywords": ["贵州茅台", "白酒"]},
+            },
+        ],
+    }
+    settings = SimpleNamespace(run_type="trade", prompt_templates={}, task_prompt="")
+
+    merged, _, _, _ = aniu_service._enforce_required_tools(
+        settings=settings,
+        client=None,
+        decision=decision,
+        llm_request={},
+        llm_response={},
+        runtime_trace={},
+        emit=None,
+        tool_executor=None,
+    )
+
+    assert merged.get("data_validation_passed") is True
+
+
+def test_read_tool_ok_with_empty_payload_counts_as_missing() -> None:
+    """P1 数据完整性：工具 ok=True 但载荷不可识别 → 视为缺失。"""
+    from app.services.aniu_service import aniu_service
+    from types import SimpleNamespace
+
+    decision = {
+        "final_answer": "分析完成。",
+        "tool_calls": [
+            # 载荷为空 dict：不可识别
+            {"name": "mx_get_balance", "arguments": {}, "result": {"ok": True, "result": {}}},
+            {"name": "mx_get_positions", "arguments": {}, "result": {"ok": True, "result": {"data": {"posList": []}}}},
+            {"name": "mx_get_orders", "arguments": {}, "result": {"ok": True, "result": {"data": {"orders": []}}}},
+            {"name": "mx_get_self_selects", "arguments": {}, "result": {"ok": True, "result": {"data": {"rows": []}}}},
+        ],
+    }
+    settings = SimpleNamespace(run_type="trade", prompt_templates={}, task_prompt="")
+
+    merged, _, _, _ = aniu_service._enforce_required_tools(
+        settings=settings,
+        client=None,
+        decision=decision,
+        llm_request={},
+        llm_response={},
+        runtime_trace={},
+        emit=None,
+        tool_executor=None,
+    )
+
+    assert merged.get("data_validation_passed") is False
+    assert "mx_get_balance" in (merged.get("missing_required_tools") or [])

@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 import logging
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 
 from app.db.database import session_scope
@@ -51,6 +51,92 @@ _TERMINAL_STATUSES = {"filled", "canceled", "failed", "cancel_unknown"}
 # 撤单意图的 signal_date 用固定哨兵值：撤单按委托单号全局唯一，
 # 不按天滚动（委托不会跨天存在，但哨兵值让唯一性绝对成立）。
 _CANCEL_SIGNAL_DATE = "PERM"
+
+# UNKNOWN 可见性核验：远端委托列表查不到对应委托时，不能立即判定
+# "未提交"——订单可能已提交但暂时不可见（列表延迟/分页）。需要连续
+# UNKNOWN_MIN_CHECKS 次独立核验且距首次 UNKNOWN 超过等待期，才允许
+# 收敛为 failed（解除阻塞）。在此之前保持 UNKNOWN 阻塞同向提交。
+UNKNOWN_MIN_CHECKS = 2
+UNKNOWN_WAIT_SECONDS = 90
+
+# 技术性重试（确认未提交的 failed 档）单独计数，不消耗真实分批档位。
+MAX_TECHNICAL_RETRIES = 3
+
+# 委托列表的候选行键（与 skills.mx_core.execution._payload_rows 对齐，
+# 含 orderList——2026-10 复审 P0：两处解析器不一致会让 orderList 响应
+# 被误判为"无委托痕迹"从而错误解除 UNKNOWN 阻塞）。
+_ORDER_ROW_KEYS = (
+    "rows",
+    "list",
+    "data",
+    "orders",
+    "orderList",
+    "posList",
+    "positionList",
+)
+_PENDING_ORDER_STATUS_VALUES = {"1", "2", "8", "100"}
+
+
+def _extract_order_rows(payload: Any) -> list[dict[str, Any]] | None:
+    """解析委托列表载荷 → 行列表；结构无法识别时返回 None（不可判定）。
+
+    返回 None 表示"这不是一份可解析的完整委托快照"——调用方必须保持
+    阻塞，不得据此判定"没有委托痕迹"。
+    """
+    if not isinstance(payload, dict):
+        return None
+    source = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    if isinstance(source, dict):
+        for key in _ORDER_ROW_KEYS:
+            rows = source.get(key)
+            if isinstance(rows, list):
+                return [row for row in rows if isinstance(row, dict)]
+        return None
+    if isinstance(source, list):
+        return [row for row in source if isinstance(row, dict)]
+    return None
+
+
+def _row_str(row: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = row.get(key)
+        if value is not None:
+            return str(value).strip()
+    return ""
+
+
+def _row_int(row: dict[str, Any], *keys: str) -> int:
+    for key in keys:
+        value = row.get(key)
+        if value is None:
+            continue
+        try:
+            return int(float(str(value)))
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
+def _order_side(row: dict[str, Any]) -> str:
+    side = _row_str(row, "orderDrt", "drt", "bsFlag", "side", "tradeType")
+    return {"1": "BUY", "2": "SELL"}.get(side, side.upper())
+
+
+def _order_terminal_status(row: dict[str, Any]) -> str:
+    """按委托行计算意图终态：filled / partially_filled / canceled / submitted。"""
+    ordered = _row_int(row, "orderCount", "count", "quantity", "orderQty")
+    dealt = _row_int(
+        row, "dealCount", "tradeCount", "filledCount", "filledQty"
+    )
+    status = _row_str(row, "orderStatus", "status", "dbStatus") or "0"
+    if dealt > 0 and dealt >= ordered:
+        return "filled"
+    if dealt > 0:
+        return "partially_filled"
+    if status in _PENDING_ORDER_STATUS_VALUES:
+        return "submitted"
+    # 非待撤状态且无成交：委托已终局（撤单或废单）
+    return "canceled"
 
 
 def _now_utc() -> datetime:
@@ -142,6 +228,18 @@ class TradeIntentService:
                     "核对该委托状态。"
                 )
 
+            # 技术性重试（确认未提交的 failed 档）不消耗真实分批档位，
+            # 但单独设上限，防止接口故障导致无限重试（2026-10 复审）。
+            failed_count = sum(
+                1 for item in existing if str(item.status or "") == "failed"
+            )
+            if failed_count >= MAX_TECHNICAL_RETRIES:
+                raise RuntimeError(
+                    f"{normalized_symbol} 当日 {normalized_side} 的技术性重试已达"
+                    f"上限（{MAX_TECHNICAL_RETRIES} 次），请人工核对妙想接口与"
+                    "委托状态后再继续。"
+                )
+
             tranche = len(existing) + 1
             latest_terminal = existing[-1] if existing else None
             if latest_terminal is not None:
@@ -167,7 +265,11 @@ class TradeIntentService:
                                 f"（剩余约 {remaining} 分钟）。只有冷却期后且具备"
                                 "独立的新加仓依据，才允许建立新的分批。"
                             )
-                if tranche > MAX_TRANCHES_PER_SIGNAL:
+                # 真实分批上限只数非 failed 档（failed 是技术重试）
+                real_tranches = sum(
+                    1 for item in existing if str(item.status or "") != "failed"
+                )
+                if real_tranches >= MAX_TRANCHES_PER_SIGNAL:
                     raise RuntimeError(
                         f"{normalized_symbol} 当日 {normalized_side} 交易意图已达"
                         f"分批上限（{MAX_TRANCHES_PER_SIGNAL} 档），禁止继续提交。"
@@ -302,70 +404,64 @@ class TradeIntentService:
 
     # -- UNKNOWN 核对 -----------------------------------------------------
 
-    def reconcile_unknown_intents(
+    def reconcile_open_trade_intents(
         self, client: Any, *, symbol: str
     ) -> list[TradeIntent]:
-        """核对指定标的的全部 UNKNOWN 意图。
+        """核对指定标的的全部在途意图（submitted/partially_filled/unknown）。
 
-        规则（基于 mx_get_orders 的可见证据）：
-        - 委托列表中能找到该意图对应的委托（按单号或同标的同方向）→
-          已被远端接受：按成交情况收敛为 submitted/filled/partially_filled。
-        - 委托列表完全没有该标的该方向的委托痕迹 → 判定未提交成功，
-          收敛为 failed（解除阻塞，允许重试）。
-        - 无法判断（如委托列表读取失败）→ 保持 unknown，继续阻塞。
+        P0-1/P0-3（2026-10 复审）：
+        - 委托列表解析与 execution._payload_rows 同源（含 orderList），
+          结构无法识别视为"不可判定"，保持阻塞。
+        - 按远端单号优先匹配；无单号时按 标的+方向 唯一匹配。
+        - "查不到痕迹"≠"未提交"：需连续 UNKNOWN_MIN_CHECKS 次独立核验
+          且超过等待期才收敛 failed；此前保持 UNKNOWN 阻塞。
+        - 正常 SUBMITTED/PARTIALLY_FILLED 意图同步为远端真实状态
+          （filled/partially_filled/canceled/submitted）。
         """
         normalized_symbol = _normalize_symbol(symbol)
         try:
             orders_payload = client.get_orders()
         except Exception:  # noqa: BLE001
             logger.warning(
-                "reconcile_unknown_intents: orders query failed for %s, "
-                "keeping unknown intents blocking",
+                "reconcile_open_trade_intents: orders query failed for %s, "
+                "keeping intents blocking",
                 normalized_symbol,
             )
             return []
 
-        rows = orders_payload.get("data") if isinstance(orders_payload, dict) else None
-        if isinstance(rows, dict):
-            rows = (
-                rows.get("orders")
-                or rows.get("rows")
-                or rows.get("list")
-                or rows.get("data")
-                or []
+        rows = _extract_order_rows(orders_payload)
+        if rows is None:
+            logger.warning(
+                "reconcile_open_trade_intents: unparseable orders payload for %s, "
+                "keeping intents blocking",
+                normalized_symbol,
             )
-        if not isinstance(rows, list):
-            rows = []
-
-        def _row_str(row: dict, *keys: str) -> str:
-            for key in keys:
-                value = row.get(key)
-                if value is not None:
-                    return str(value).strip()
-            return ""
+            return []
 
         symbol_rows = [
             row
             for row in rows
-            if isinstance(row, dict)
-            and _normalize_symbol(
+            if _normalize_symbol(
                 _row_str(row, "stockCode", "code", "SECURITY_CODE", "secCode")
             )
             == normalized_symbol
         ]
 
         with session_scope() as db:
-            unknowns = list(
+            open_intents = list(
                 db.scalars(
                     select(TradeIntent).where(
                         TradeIntent.symbol == normalized_symbol,
-                        TradeIntent.status == "unknown",
+                        TradeIntent.status.in_(
+                            ["submitted", "partially_filled", "unknown"]
+                        ),
                         TradeIntent.side.in_(["BUY", "SELL"]),
                     )
                 ).all()
             )
             resolved: list[TradeIntent] = []
-            for intent in unknowns:
+            now = _now_utc()
+            for intent in open_intents:
                 matched_row = None
                 if intent.provider_order_id:
                     for row in symbol_rows:
@@ -375,46 +471,86 @@ class TradeIntentService:
                             matched_row = row
                             break
                 if matched_row is None:
-                    # 没有单号时按方向匹配（该标的当日该方向的委托）
                     side_rows = [
                         row
                         for row in symbol_rows
-                        if _row_str(row, "orderDrt", "drt", "bsFlag", "side")
-                        in ({"BUY": "1", "SELL": "2"}[intent.side], intent.side)
+                        if _order_side(row) == intent.side
                     ]
+                    # 无单号时仅当该标的该方向委托唯一才可对应
                     matched_row = side_rows[0] if len(side_rows) == 1 else None
 
                 if matched_row is not None:
-                    ordered = _to_int(
-                        _row_str(
-                            matched_row, "orderCount", "count", "quantity", "orderQty"
+                    intent.status = _order_terminal_status(matched_row)
+                    intent.note = "已按远端委托列表同步状态"
+                    intent.unknown_checks = 0
+                    intent.first_unknown_at = None
+                else:
+                    # 查不到痕迹：可见性等待期内保持 UNKNOWN
+                    checks = int(intent.unknown_checks or 0) + 1
+                    first_at = intent.first_unknown_at
+                    if first_at is None:
+                        first_at = now
+                        intent.first_unknown_at = now
+                    if first_at.tzinfo is None:
+                        first_at = first_at.replace(tzinfo=timezone.utc)
+                    intent.unknown_checks = checks
+                    waited = (now - first_at).total_seconds() >= UNKNOWN_WAIT_SECONDS
+                    if checks >= UNKNOWN_MIN_CHECKS and waited:
+                        intent.status = "failed"
+                        intent.note = (
+                            f"连续 {checks} 次独立核验且超过等待期，委托列表"
+                            "均无该标的委托痕迹，判定未提交"
                         )
-                    )
-                    dealt = _to_int(
-                        _row_str(
-                            matched_row,
-                            "dealCount",
-                            "tradeCount",
-                            "filledCount",
-                            "filledQty",
-                        )
-                    )
-                    if ordered > 0 and dealt >= ordered:
-                        intent.status = "filled"
-                    elif dealt > 0:
-                        intent.status = "partially_filled"
+                        intent.unknown_checks = 0
+                        intent.first_unknown_at = None
                     else:
-                        intent.status = "submitted"
-                    intent.note = "UNKNOWN 已通过委托列表核对收敛"
-                elif not symbol_rows:
-                    # 委托列表中该标的完全没有委托痕迹 → 未提交成功
-                    intent.status = "failed"
-                    intent.note = "UNKNOWN 核对：委托列表无该标的委托痕迹，判定未提交"
-                # else：有该标的的委托但无法唯一对应 → 保持 unknown 继续阻塞
-                intent.updated_at = _now_utc()
+                        intent.note = (
+                            f"委托列表暂无痕迹（第 {checks} 次核验，"
+                            f"需 ≥{UNKNOWN_MIN_CHECKS} 次且超过 "
+                            f"{UNKNOWN_WAIT_SECONDS}s 等待期才可判定未提交）"
+                        )
+                intent.updated_at = now
                 db.add(intent)
                 resolved.append(intent)
             return resolved
+
+    def reconcile_all_open_intents(self, client: Any) -> dict[str, int]:
+        """每轮 Trade 任务开始前同步全部在途意图（P0-3 状态闭环）。
+
+        SUBMITTED / PARTIALLY_FILLED / UNKNOWN 意图按远端委托列表更新为
+        真实状态：全部成交 → filled（进入冷却期）、部分成交 →
+        partially_filled（继续阻塞）、已撤/废单 → canceled（按策略放行）。
+        返回 {状态: 数量} 摘要。
+        """
+        with session_scope() as db:
+            symbols = list(
+                db.scalars(
+                    select(TradeIntent.symbol)
+                    .where(
+                        TradeIntent.status.in_(
+                            ["submitted", "partially_filled", "unknown"]
+                        ),
+                        TradeIntent.side.in_(["BUY", "SELL"]),
+                    )
+                    .distinct()
+                ).all()
+            )
+
+        status_counts: dict[str, int] = {}
+        for symbol in symbols:
+            for intent in self.reconcile_open_trade_intents(client, symbol=symbol):
+                status_counts[intent.status] = (
+                    status_counts.get(intent.status, 0) + 1
+                )
+        if status_counts:
+            logger.info("open trade intents reconciled: %s", status_counts)
+        return status_counts
+
+    # 兼容旧名：UNKNOWN 核对已并入在途意图同步
+    def reconcile_unknown_intents(
+        self, client: Any, *, symbol: str
+    ) -> list[TradeIntent]:
+        return self.reconcile_open_trade_intents(client, symbol=symbol)
 
     # -- 启动恢复 ---------------------------------------------------------
 
@@ -422,11 +558,27 @@ class TradeIntentService:
         """服务重启恢复：遗留 executing 意图收敛为 unknown（阻塞直到核对）。
 
         进程崩溃/重启时正在发送的意图状态不明，绝不能当作新操作重新执行。
+        多 worker 守卫：只收敛所属 run 已不在 running 状态的意图——另一
+        个 worker 正在执行的 run（DB 状态仍为 running）不会被误判为遗留。
         """
+        from app.db.models import StrategyRun
+
         with session_scope() as db:
             stale = list(
                 db.scalars(
-                    select(TradeIntent).where(TradeIntent.status == "executing")
+                    select(TradeIntent)
+                    .where(TradeIntent.status == "executing")
+                    .join(
+                        StrategyRun,
+                        TradeIntent.run_id == StrategyRun.id,
+                        isouter=True,
+                    )
+                    .where(
+                        or_(
+                            StrategyRun.status != "running",
+                            StrategyRun.id.is_(None),
+                        )
+                    )
                 ).all()
             )
             for intent in stale:

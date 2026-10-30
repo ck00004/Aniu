@@ -128,6 +128,7 @@ class ExecutionRunnerService:
                     app_settings=app_settings,
                     tool_name=action.tool_name,
                     arguments=arguments,
+                    run_id=run_id,
                 )
                 _emit(
                     "tool_call",
@@ -158,6 +159,18 @@ class ExecutionRunnerService:
                 if success:
                     if normalized_action is not None:
                         executed_actions.append(normalized_action)
+                    # P1（2026-10 复审）：回填意图的 action_id，补足
+                    # 交易 → 模型决策 → 计划动作的追溯链。
+                    try:
+                        self._backfill_intent_action_id(
+                            run_id=run_id,
+                            action_id=action.id,
+                            executed_action=normalized_action,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "intent action_id backfill failed: %s", exc
+                        )
                     break
 
         status_counts, unresolved_count, error_message = self._summarize_actions(run_id)
@@ -224,6 +237,33 @@ class ExecutionRunnerService:
                 return None
             db.expunge(action)
             return action
+
+    @staticmethod
+    def _backfill_intent_action_id(
+        *, run_id: int, action_id: int, executed_action: dict[str, Any] | None
+    ) -> None:
+        """把成功的计划动作 id 回填到对应的交易意图（追溯链）。"""
+        if not isinstance(executed_action, dict):
+            return
+        action_name = str(executed_action.get("action") or "").upper()
+        if action_name not in {"BUY", "SELL", "CANCEL", "MANAGE_SELF_SELECT"}:
+            return
+        from sqlalchemy import and_, update as sa_update
+
+        from app.db.models import TradeIntent
+
+        with session_scope() as db:
+            stmt = (
+                sa_update(TradeIntent)
+                .where(
+                    and_(
+                        TradeIntent.run_id == run_id,
+                        TradeIntent.action_id.is_(None),
+                    )
+                )
+                .values(action_id=action_id)
+            )
+            db.execute(stmt)
 
     def _record_attempt(
         self,

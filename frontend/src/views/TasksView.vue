@@ -451,7 +451,23 @@
                     </div>
                   </div>
 
-                  <div v-if="displayBackendExecutionReport.unresolvedCount > 0" class="execution-report-note tone-warning">
+                  <div v-if="displayBackendExecutionReport.unresolvedActions.length" class="execution-report-group">
+                    <span class="execution-report-group-label">未落地计划动作</span>
+                    <div class="execution-report-rows">
+                      <div
+                        v-for="(item, index) in displayBackendExecutionReport.unresolvedActions"
+                        :key="`unresolved-${index}`"
+                        class="execution-report-row"
+                      >
+                        <span class="execution-report-main">
+                          {{ item.action }} {{ item.symbol }}<template v-if="item.quantity"> {{ item.quantity }}股</template>
+                          <small v-if="item.reason" class="execution-report-reason">{{ item.reason }}</small>
+                        </span>
+                        <span class="execution-report-status tone-warning">未确认</span>
+                      </div>
+                    </div>
+                  </div>
+                  <div v-else-if="displayBackendExecutionReport.unresolvedCount > 0" class="execution-report-note tone-warning">
                     未落地计划动作 {{ displayBackendExecutionReport.unresolvedCount }} 条，相关操作不得表述为已执行。
                   </div>
                   <div v-if="!displayBackendExecutionReport.dataValidationPassed" class="execution-report-note tone-error">
@@ -1992,6 +2008,13 @@ onBeforeUnmount(() => {
   font-size: 12.5px;
   line-height: 1.45;
   overflow-wrap: anywhere;
+}
+
+.execution-report-reason {
+  display: block;
+  color: #8ea4c5;
+  font-size: 11px;
+  line-height: 1.4;
 }
 
 .execution-report-status {

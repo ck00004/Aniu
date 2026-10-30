@@ -10,7 +10,11 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
-from skills.mx_core.client import MXClient
+from skills.mx_core.client import (
+    MXBusinessRejected,
+    MXClient,
+    MXResponseUnknown,
+)
 from skills.mx_core.tool_specs import TOOL_PROFILES, TOOL_SPECS, build_tools
 
 logger = logging.getLogger(__name__)
@@ -495,6 +499,7 @@ class MXExecutionService:
         app_settings: Any,
         tool_name: str,
         arguments: dict[str, Any],
+        run_id: int | None = None,
     ) -> dict[str, Any]:
         handler = self._handlers.get(tool_name)
         if handler is None:
@@ -505,9 +510,18 @@ class MXExecutionService:
             }
 
         try:
-            return handler(
-                client=client, app_settings=app_settings, arguments=arguments
-            )
+            try:
+                return handler(
+                    client=client,
+                    app_settings=app_settings,
+                    arguments=arguments,
+                    run_id=run_id,
+                )
+            except TypeError:
+                # 其余 handler 不接受 run_id 参数
+                return handler(
+                    client=client, app_settings=app_settings, arguments=arguments
+                )
         except Exception as exc:
             guidance = self._build_error_guidance(str(exc))
             return {
@@ -755,7 +769,12 @@ class MXExecutionService:
         return codes, names
 
     def _handle_moni_trade(
-        self, *, client: MXClient, app_settings: Any, arguments: dict[str, Any]
+        self,
+        *,
+        client: MXClient,
+        app_settings: Any,
+        arguments: dict[str, Any],
+        run_id: int | None = None,
     ) -> dict[str, Any]:
         del app_settings
         action = str(arguments.get("action") or "").upper()
@@ -817,6 +836,7 @@ class MXExecutionService:
             symbol=symbol,
             side=action,
             quantity=quantity,
+            run_id=run_id,
         )
 
         try:
@@ -840,12 +860,24 @@ class MXExecutionService:
                 "未提交。请先调用 mx_get_orders 核对该委托状态，确认前"
                 "不得重复提交同方向委托。"
             ) from exc
-        except RuntimeError:
-            # 业务错误（远端明确拒绝）：意图确认未生效，不阻塞后续重试
+        except MXBusinessRejected as exc:
+            # 远端明确拒绝（业务错误 status/code）：意图确认未生效，
+            # 不阻塞后续重试。
             trade_intent_service.mark_intent_failed(
-                intent.id, "远端拒绝该委托（业务错误）"
+                intent.id, f"远端明确拒绝该委托：{exc}"
             )
             raise
+        except MXResponseUnknown as exc:
+            # HTTP 200 但响应体无法解析：远端可能已接受，状态不确定。
+            trade_intent_service.mark_intent_unknown(
+                intent.id, f"交易响应无法解析，状态不确定：{exc}"
+            )
+            raise RuntimeError(
+                f"委托状态未知（响应无法解析）：{symbol} {action} "
+                f"{quantity} 股的请求已发出但响应体无法确认结果。"
+                "请先调用 mx_get_orders 核对该委托状态，确认前"
+                "不得重复提交同方向委托。"
+            ) from exc
 
         trade_intent_service.mark_intent_submitted(
             intent.id, extract_order_id(result)
@@ -867,7 +899,12 @@ class MXExecutionService:
         }
 
     def _handle_moni_cancel(
-        self, *, client: MXClient, app_settings: Any, arguments: dict[str, Any]
+        self,
+        *,
+        client: MXClient,
+        app_settings: Any,
+        arguments: dict[str, Any],
+        run_id: int | None = None,
     ) -> dict[str, Any]:
         del app_settings
         cancel_type = str(arguments.get("cancel_type") or "").strip().lower()
@@ -895,7 +932,8 @@ class MXExecutionService:
         )
 
         intent = trade_intent_service.check_and_register_cancel_intent(
-            order_id=order_id
+            order_id=order_id,
+            run_id=run_id,
         )
 
         try:
@@ -913,11 +951,20 @@ class MXExecutionService:
                 "请求已发出但未收到确认。请调用 mx_get_orders 核对该委托"
                 "状态，确认前不得重复提交撤单。"
             ) from exc
-        except RuntimeError:
+        except MXBusinessRejected as exc:
             trade_intent_service.mark_intent_failed(
-                intent.id, "撤单请求被远端拒绝"
+                intent.id, f"远端明确拒绝撤单：{exc}"
             )
             raise
+        except MXResponseUnknown as exc:
+            trade_intent_service.mark_intent_unknown(
+                intent.id, f"撤单响应无法解析，状态不确定：{exc}"
+            )
+            raise RuntimeError(
+                f"撤单状态未知（响应无法解析）：委托 {order_id} 的撤单请求"
+                "已发出但响应体无法确认结果。请调用 mx_get_orders 核对该"
+                "委托状态，确认前不得重复提交撤单。"
+            ) from exc
 
         trade_intent_service.mark_intent_submitted(
             intent.id, extract_order_id(result)

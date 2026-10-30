@@ -60,6 +60,7 @@ export interface BackendExecutionReportViewModel {
   selfSelects: Array<{ query: string, statusText: string, tone: ActionTone }>
   notCalledClaims: Array<{ action: string, target: string }>
   blockedActions: Array<{ toolName: string, actionType: string, reason: string }>
+  unresolvedActions: Array<{ symbol: string, action: string, quantity: number, reason: string }>
   unresolvedCount: number
   missingRequiredTools: string[]
   dataValidationPassed: boolean
@@ -572,6 +573,7 @@ const EXECUTION_REPORT_STATUS_META: Record<string, { label: string, tone: Action
   UNKNOWN: { label: '状态未确认', tone: 'warning' },
   NOT_CALLED: { label: '声明未执行', tone: 'error' },
   BLOCKED_MISSING_DATA: { label: '已拦截', tone: 'error' },
+  INCOMPLETE: { label: '数据不完整', tone: 'warning' },
   NO_ACTION: { label: '本轮无写操作', tone: 'neutral' },
 }
 
@@ -648,6 +650,18 @@ function getBackendExecutionReport(detail: RunDetail): BackendExecutionReportVie
     : []
   ).map((item) => String(item ?? '')).filter(Boolean)
 
+  const unresolvedActions = (Array.isArray(payload.unresolved_actions)
+    ? payload.unresolved_actions
+    : []
+  )
+    .filter((item): item is Record<string, unknown> => !!item && typeof item === 'object')
+    .map((item) => ({
+      symbol: getStringValue(item.symbol) || '',
+      action: getStringValue(item.action) || '',
+      quantity: Number(item.quantity ?? 0),
+      reason: getStringValue(item.reason) || '',
+    }))
+
   return {
     overallStatus,
     overallStatusText: overallMeta.label,
@@ -658,6 +672,7 @@ function getBackendExecutionReport(detail: RunDetail): BackendExecutionReportVie
     selfSelects,
     notCalledClaims,
     blockedActions,
+    unresolvedActions,
     unresolvedCount: Number(payload.unresolved_count ?? 0),
     missingRequiredTools,
     dataValidationPassed: payload.data_validation_passed !== false,

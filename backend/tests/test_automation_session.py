@@ -49,7 +49,19 @@ def reset_db_state() -> None:
 
 
 def _required_read_tool_calls(run_type: str) -> list[dict]:
-    """生成补丁 E 必需读取工具的 tool_calls 条目（result.ok=True）。"""
+    """生成补丁 E 必需读取工具的 tool_calls 条目。
+
+    result.result 必须带可识别的载荷结构（P1 数据完整性校验：
+    ok=True 但载荷为空/不可识别视为未拿到有效数据）。
+    """
+    payloads = {
+        "mx_get_balance": {"data": {"availBalance": 1000000.0}},
+        "mx_get_positions": {"data": {"posList": []}},
+        "mx_get_orders": {"data": {"orders": []}},
+        "mx_get_self_selects": {"data": {"rows": []}},
+        "mx_search_news": {"data": {"rows": []}},
+        "mx_screen_stocks": {"data": {"rows": []}},
+    }
     names = {
         "analysis": ["mx_get_self_selects", "mx_search_news", "mx_screen_stocks"],
         "trade": [
@@ -64,10 +76,32 @@ def _required_read_tool_calls(run_type: str) -> list[dict]:
             "id": f"required-{name}",
             "name": name,
             "arguments": {},
-            "result": {"ok": True, "tool_name": name, "summary": "已读取。", "result": {}},
+            "result": {
+                "ok": True,
+                "tool_name": name,
+                "summary": "已读取。",
+                "result": payloads[name],
+            },
         }
         for name in names
     ]
+
+
+def _memory_read_call(symbol: str) -> dict:
+    """拟操作标的的记忆检索调用（P1：trade 对每个拟交易标的逐只检查）。"""
+    return {
+        "id": f"memory-{symbol}",
+        "name": "memory_read",
+        "arguments": {"keywords": [symbol]},
+        "result": {
+            "ok": True,
+            "tool_name": "memory_read",
+            "summary": "已检索记忆。",
+            "items": [],
+            "result_count": 0,
+            "keywords": [symbol],
+        },
+    }
 
 
 def _prepare_schedule(db, *, name: str, run_type: str = "analysis") -> StrategySchedule:
@@ -323,8 +357,9 @@ def test_execute_run_persists_planned_actions_and_execution_results(
             {
                 "final_answer": "本轮计划买入东方财富 100股。",
                 "tool_calls": [
-                    # 手动运行 + task_prompt → analysis 类型，必需工具按 analysis 清单
+                    # 手动运行 + task_prompt �� analysis 类型，必需工具按 analysis 清单
                     *_required_read_tool_calls("analysis"),
+                    _memory_read_call("300059"),
                     {
                         "id": "call-1",
                         "name": "mx_moni_trade",
@@ -338,7 +373,7 @@ def test_execute_run_persists_planned_actions_and_execution_results(
             {"messages": []},
         )
 
-    def fake_execute_tool(*, client, app_settings, tool_name, arguments):
+    def fake_execute_tool(*, client, app_settings, tool_name, arguments, run_id=None):
         del client, app_settings
         assert tool_name == "mx_moni_trade"
         return {
@@ -428,7 +463,7 @@ def test_execute_run_marks_failed_when_planned_action_execution_fails(
             {"messages": []},
         )
 
-    def fake_execute_tool(*, client, app_settings, tool_name, arguments):
+    def fake_execute_tool(*, client, app_settings, tool_name, arguments, run_id=None):
         del client, app_settings, tool_name, arguments
         return {
             "ok": False,
@@ -658,9 +693,9 @@ def test_analysis_schedule_consistency_marks_gap_without_self_select_writes(
                 {
                     "final_answer": "本轮自选股变更结果\n新增自选股：仕佳光子\n移除自选股：无",
                     "tool_calls": [
-                        {"name": "mx_get_self_selects", "result": {"ok": True, "summary": "已查询自选股列表。"}},
-                        {"name": "mx_search_news", "result": {"ok": True, "summary": "已查询资讯。"}},
-                        {"name": "mx_screen_stocks", "result": {"ok": True, "summary": "已执行选股。"}},
+                        {"name": "mx_get_self_selects", "result": {"ok": True, "summary": "已查询自选股列表。", "result": {"data": {"rows": []}}}},
+                        {"name": "mx_search_news", "result": {"ok": True, "summary": "已查询资讯。", "result": {"data": {"rows": []}}}},
+                        {"name": "mx_screen_stocks", "result": {"ok": True, "summary": "已执行选股。", "result": {"data": {"rows": []}}}},
                     ],
                 },
                 {"messages": []},
@@ -678,7 +713,7 @@ def test_analysis_schedule_consistency_marks_gap_without_self_select_writes(
             {"messages": messages},
         )
 
-    def fake_execute_tool(*, client, app_settings, tool_name, arguments):
+    def fake_execute_tool(*, client, app_settings, tool_name, arguments, run_id=None):
         del client, app_settings, arguments
         executed_tools.append(tool_name)
         raise AssertionError(f"一致性检查不得自动执行写操作：{tool_name}")
@@ -742,6 +777,7 @@ def test_trade_schedule_followup_executes_trade_when_final_answer_claims_sell(
                 "final_answer": "已实际提交卖出立讯精密 5000股委托。",
                 "tool_calls": [
                     *_required_read_tool_calls("trade"),
+                    _memory_read_call("002475"),
                     {
                         "name": "mx_moni_trade",
                         "result": {
@@ -839,7 +875,7 @@ def test_trade_schedule_consistency_marks_gap_without_auto_trades(
             {"messages": messages},
         )
 
-    def fake_execute_tool(*, client, app_settings, tool_name, arguments):
+    def fake_execute_tool(*, client, app_settings, tool_name, arguments, run_id=None):
         del client, app_settings, arguments
         executed_tools.append(tool_name)
         raise AssertionError(f"一致性检查不得自动执行交易：{tool_name}")
@@ -913,6 +949,7 @@ def test_trade_execution_does_not_retry_sell_after_first_failure(
                 "final_answer": "执行：卖出立讯精密（002475）5000股",
                 "tool_calls": [
                     *_required_read_tool_calls("trade"),
+                    _memory_read_call("002475"),
                     {
                         "id": "call-sell-1",
                         "name": "mx_moni_trade",
@@ -928,7 +965,7 @@ def test_trade_execution_does_not_retry_sell_after_first_failure(
 
     call_count = {"value": 0}
 
-    def fake_execute_tool(*, client, app_settings, tool_name, arguments):
+    def fake_execute_tool(*, client, app_settings, tool_name, arguments, run_id=None):
         del client, app_settings, arguments
         assert tool_name == "mx_moni_trade"
         call_count["value"] += 1
@@ -1574,7 +1611,7 @@ def test_trade_run_blocks_writes_when_required_tools_missing(
             {"messages": list(messages)},
         )
 
-    def fake_execute_tool(*, client, app_settings, tool_name, arguments):
+    def fake_execute_tool(*, client, app_settings, tool_name, arguments, run_id=None):
         del client, app_settings, arguments
         raise AssertionError(f"必需数据缺失时不得执行写操作：{tool_name}")
 

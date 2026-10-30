@@ -83,6 +83,40 @@ _REQUIRED_TOOLS_BY_RUN_TYPE: dict[str, frozenset[str]] = {
         {"mx_get_balance", "mx_get_positions", "mx_get_orders", "mx_get_self_selects"}
     ),
 }
+
+# 必需读取工具的数据完整性校验（P1，2026-10 复审）：工具 ok=True 但
+# 载荷结构无法识别时视为"未拿到有效数据"，等同缺失。
+_READ_TOOL_PAYLOAD_KEYS: dict[str, tuple[str, ...]] = {
+    "mx_get_balance": ("data",),
+    "mx_get_positions": ("data", "posList", "rows", "list"),
+    "mx_get_orders": ("data", "orders", "orderList", "rows", "list"),
+    "mx_get_self_selects": ("data", "rows", "list"),
+    "mx_search_news": ("data", "rows", "list"),
+    "mx_screen_stocks": ("data", "rows", "list"),
+}
+
+
+def _tool_result_has_valid_payload(call: dict[str, Any]) -> bool:
+    """必需读取工具的数据完整性：result 载荷可识别且非空结构。"""
+    name = str(call.get("name") or "")
+    keys = _READ_TOOL_PAYLOAD_KEYS.get(name)
+    if not keys:
+        return True
+    result = call.get("result")
+    if not isinstance(result, dict) or not bool(result.get("ok")):
+        return False
+    payload = result.get("result")
+    if not isinstance(payload, dict):
+        return False
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, dict) and value:
+            return True
+        if isinstance(value, list) and value:
+            return True
+        if value is not None and not isinstance(value, (dict, list)):
+            return True
+    return False
 SCHEDULE_RETRY_DELAY = timedelta(minutes=5)
 SCHEDULE_MAX_RETRIES = 3
 ACCOUNT_PREFETCH_TOOL_NAMES = (
@@ -2743,6 +2777,20 @@ class AniuService:
             if not settings.mx_api_key:
                 raise RuntimeError("未配置 MX API Key，请先在设置页保存后再运行。")
             client = MXClient(api_key=settings.mx_api_key)
+            # P0-3（2026-10 复审）：交易任务开始前同步全部在途交易意图
+            # （SUBMITTED/PARTIALLY_FILLED/UNKNOWN → 远端真实状态），
+            # 让成交冷却与分批规则基于真实订单状态判定。
+            if str(getattr(settings, "run_type", "analysis") or "analysis") == "trade":
+                try:
+                    from app.services.trade_intent_service import (
+                        trade_intent_service,
+                    )
+
+                    trade_intent_service.reconcile_all_open_intents(client)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "pre-run trade intent reconcile failed: %s", exc
+                    )
             try:
                 _emit("stage", stage="llm", message="正在调用大模型")
                 session_context = self._prepare_persistent_session_context(
@@ -2922,6 +2970,7 @@ class AniuService:
                     executed_actions=executed_actions,
                     blocked_write_drafts=blocked_write_drafts,
                     execution_summary=execution_summary,
+                    planned_actions=planned_actions,
                 )
                 finalized_answer = (
                     f"{finalized_answer}\n\n{backend_execution_report}".strip()
@@ -4519,6 +4568,58 @@ class AniuService:
             merged["final_message"] = second.get("final_message")
         return merged
 
+    def _extract_planned_trade_symbols(
+        self, decision: dict[str, Any]
+    ) -> list[tuple[str, str]]:
+        """从合并 tool_calls 提取拟交易标的 → [(代码, 名称)]。"""
+        symbols: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for call in (decision.get("tool_calls") or []):
+            if not isinstance(call, dict):
+                continue
+            result = call.get("result")
+            if not isinstance(result, dict) or not bool(result.get("ok")):
+                continue
+            planned = result.get("planned_action")
+            if not isinstance(planned, dict):
+                continue
+            action = str(planned.get("action") or "").upper()
+            if action not in {"BUY", "SELL"}:
+                continue
+            symbol = str(planned.get("symbol") or "").strip()
+            if not symbol or symbol in seen:
+                continue
+            seen.add(symbol)
+            symbols.append((symbol, str(planned.get("name") or "").strip()))
+        return symbols
+
+    @staticmethod
+    def _extract_memory_read_targets(decision: dict[str, Any]) -> set[str]:
+        """收集全部成功 memory_read 调用的检索关键词（小写）。"""
+        targets: set[str] = set()
+        for call in (decision.get("tool_calls") or []):
+            if not isinstance(call, dict):
+                continue
+            if str(call.get("name") or "") != "memory_read":
+                continue
+            result = call.get("result")
+            if not isinstance(result, dict) or not bool(result.get("ok")):
+                continue
+            arguments = call.get("arguments")
+            keywords = None
+            if isinstance(arguments, dict):
+                keywords = arguments.get("keywords")
+            if keywords is None and isinstance(result, dict):
+                keywords = result.get("keywords")
+            if isinstance(keywords, str):
+                keywords = [keywords]
+            if isinstance(keywords, list):
+                for item in keywords:
+                    text = str(item or "").strip().lower()
+                    if text:
+                        targets.add(text)
+        return targets
+
     def _enforce_required_tools(
         self,
         *,
@@ -4547,12 +4648,27 @@ class AniuService:
             for call in (payload.get("tool_calls") or []):
                 if not isinstance(call, dict):
                     continue
-                result = call.get("result")
-                if isinstance(result, dict) and bool(result.get("ok")):
+                if _tool_result_has_valid_payload(call):
                     names.add(str(call.get("name") or ""))
             return names
 
         missing = set(required) - _successful_tool_names(decision)
+
+        # P1（2026-10 复审）：交易任务对每个拟操作标的做逐标的记忆检索
+        # 检查——拟买入/卖出的标的必须在 memory_read 的关键词里出现过
+        #（检索结果为空是有效结果，但完全没检索不算完成数据验证）。
+        if run_type == "trade" and not missing:
+            planned_symbols = self._extract_planned_trade_symbols(decision)
+            if planned_symbols:
+                searched_targets = self._extract_memory_read_targets(decision)
+                for symbol, name in planned_symbols:
+                    covered = (
+                        symbol in searched_targets
+                        or (bool(name) and name in searched_targets)
+                    )
+                    if not covered:
+                        missing.add(f"memory_read:{symbol}")
+
         if not missing:
             decision["data_validation_passed"] = True
             return decision, llm_request, llm_response, runtime_trace
@@ -4636,6 +4752,7 @@ class AniuService:
         executed_actions: list[dict[str, Any]],
         blocked_write_drafts: list[dict[str, Any]],
         execution_summary: dict[str, Any] | None,
+        planned_actions: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """补丁 D：结构化执行报告（机器可读，供前端执行卡片渲染）。
 
@@ -4712,19 +4829,61 @@ class AniuService:
         ]
         data_validation_passed = bool(decision.get("data_validation_passed", True))
 
+        # 逐笔未落地动作详情（P2，2026-10 复审：不只给数量，还给
+        # 哪只股票、什么动作、为什么没完成）。
+        executed_keys: set[tuple[str, str, int]] = set()
+        for item in executed_actions:
+            if isinstance(item, dict):
+                executed_keys.add(
+                    (
+                        str(item.get("symbol") or item.get("order_id") or ""),
+                        str(item.get("action") or "").upper(),
+                        int(item.get("quantity") or 0),
+                    )
+                )
+        unresolved_actions: list[dict[str, Any]] = []
+        for item in planned_actions or []:
+            if not isinstance(item, dict):
+                continue
+            action_name = str(item.get("action") or "").upper()
+            if action_name not in {"BUY", "SELL", "CANCEL", "MANAGE_SELF_SELECT"}:
+                continue
+            key = (
+                str(item.get("symbol") or item.get("order_id") or ""),
+                action_name,
+                int(item.get("quantity") or 0),
+            )
+            if key in executed_keys:
+                continue
+            unresolved_actions.append(
+                {
+                    "symbol": str(item.get("symbol") or item.get("order_id") or ""),
+                    "action": action_name,
+                    "quantity": int(item.get("quantity") or 0),
+                    "status": "UNKNOWN",
+                    "reason": str(
+                        (execution_summary or {}).get("error_message")
+                        or "计划动作未确认执行"
+                    ),
+                }
+            )
+
         # 总体状态（前端徽章）：按最严重的事实降序取值
         if blocked_actions or not_called_claims:
             overall = "NOT_CALLED"
-        elif unresolved_count > 0:
+        elif unresolved_count > 0 or unresolved_actions:
             overall = "UNKNOWN"
         elif any(item["status"] == "UNKNOWN" for item in self_selects):
             overall = "UNKNOWN"
         elif trades or cancels or self_selects:
             overall = "SUBMITTED"
+        elif not data_validation_passed:
+            # 无写操作但必需数据缺失：不能显示成正常完成的无操作分析
+            overall = "INCOMPLETE"
         else:
             overall = "NO_ACTION"
         if trades or cancels or self_selects:
-            if not blocked_actions and not not_called_claims and unresolved_count == 0:
+            if not blocked_actions and not not_called_claims and unresolved_count == 0 and not unresolved_actions:
                 overall = "VERIFIED" if all(
                     item["status"] in {"VERIFIED", "NOOP"} for item in self_selects
                 ) and not trades and not cancels else "SUBMITTED"
@@ -4739,6 +4898,7 @@ class AniuService:
             "not_called_claims": not_called_claims,
             "blocked_actions": blocked_actions,
             "unresolved_count": unresolved_count,
+            "unresolved_actions": unresolved_actions,
             "missing_required_tools": missing_tools,
             "data_validation_passed": data_validation_passed,
         }

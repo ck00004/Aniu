@@ -413,6 +413,10 @@ class TradeIntent(Base):
     # / CANCELED / FAILED / CANCEL_UNKNOWN
     status: Mapped[str] = mapped_column(String(20), default="planned", index=True)
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # UNKNOWN 可见性核验：远端委托列表暂不可见时不能立即判定"未提交"，
+    # 需要连续多次独立核验且超过等待期才允许收敛为 failed。
+    unknown_checks: Mapped[int] = mapped_column(Integer, default=0)
+    first_unknown_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), index=True
     )

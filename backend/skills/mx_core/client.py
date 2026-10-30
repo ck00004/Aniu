@@ -28,6 +28,14 @@ _MESSAGE_FIELDS: tuple[str, ...] = (
 _SUCCESS_CODES = (0, 200)
 
 
+class MXBusinessRejected(RuntimeError):
+    """远端明确拒绝请求（业务错误 status/code/错误体）——可认定未生效。"""
+
+
+class MXResponseUnknown(RuntimeError):
+    """远端是否接受请求无法确定（响应体无法解析等）——不得认定未提交。"""
+
+
 class MXClient:
     def __init__(self, api_key: str | None = None, base_url: str | None = None) -> None:
         settings = get_settings()
@@ -67,7 +75,9 @@ class MXClient:
             try:
                 data = response.json()
             except ValueError as exc:
-                raise RuntimeError(
+                # HTTP 200 但响应体无法解析：远端可能已接受请求，
+                # 状态不确定——不得被调用方当作"明确拒绝"处理。
+                raise MXResponseUnknown(
                     f"妙想接口返回了无法解析的响应: {response.text[:200]}"
                 ) from exc
             invocation.observe(
@@ -90,7 +100,7 @@ class MXClient:
         if isinstance(data, str):
             text = data.strip()
             if text and any(marker in text for marker in _BODY_ERROR_MARKERS):
-                raise RuntimeError(f"妙想接口业务错误: {text[:200]}")
+                raise MXBusinessRejected(f"妙想接口业务错误: {text[:200]}")
             return
         if not isinstance(data, dict):
             return
@@ -101,7 +111,7 @@ class MXClient:
         if isinstance(status, bool):
             status = None
         if isinstance(status, int) and status != 0:
-            raise RuntimeError(
+            raise MXBusinessRejected(
                 f"妙想接口业务错误 status={status}: "
                 f"{MXClient._extract_error_text(data)}"
             )
@@ -117,7 +127,7 @@ class MXClient:
         if isinstance(code, bool):
             code = None
         if isinstance(code, int) and code not in _SUCCESS_CODES:
-            raise RuntimeError(
+            raise MXBusinessRejected(
                 f"妙想接口业务错误 code={code}: "
                 f"{MXClient._extract_error_text(data)}"
             )
@@ -133,7 +143,7 @@ class MXClient:
         if message_text and any(
             marker in message_text for marker in _BODY_ERROR_MARKERS
         ):
-            raise RuntimeError(f"妙想接口业务错误: {message_text[:200]}")
+            raise MXBusinessRejected(f"妙想接口业务错误: {message_text[:200]}")
 
     @staticmethod
     def _extract_error_text(data: dict[str, Any]) -> str:

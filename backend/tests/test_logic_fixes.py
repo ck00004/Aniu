@@ -822,7 +822,7 @@ def test_execute_plan_skips_completed_actions(monkeypatch, tmp_path) -> None:
 
     executed_symbols: list[str] = []
 
-    def fake_execute_tool(*, client, app_settings, tool_name, arguments):
+    def fake_execute_tool(*, client, app_settings, tool_name, arguments, run_id=None):
         executed_symbols.append(str(arguments.get("symbol")))
         return {
             "ok": True,
