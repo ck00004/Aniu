@@ -424,6 +424,21 @@ export const api = {
       method: 'DELETE',
     })
   },
+  retryRunAction(actionId: number) {
+    return request<{
+      action_id: number
+      run_id: number
+      tool_name: string
+      status: string
+      ok: boolean
+      summary: string | null
+      error: string | null
+      attempt_no: number
+    }>(`${API_PREFIX}/runs/actions/${actionId}/retry`, {
+      method: 'POST',
+      timeoutMs: 60 * 1000,
+    })
+  },
   getRuntimeOverview() {
     return request<RuntimeOverview>(`${API_PREFIX}/runtime-overview`)
   },

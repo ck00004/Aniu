@@ -378,28 +378,45 @@ def test_sell_preflight_uses_avail_count_from_production_payload() -> None:
 
 
 def test_cancel_preflight_with_production_orders_payload() -> None:
-    """生产结构（data.orders + drt/status 字段）下撤单预检。"""
+    """生产结构（data.orders + drt/status 字段）下撤单预检。
+
+    官方状态码（2026-10-31 用户提供）：8=已撤、9=废单、4=已成——
+    均不可撤；此前 status=8 被误当"未成交可撤"（观测推断错误）。
+    """
     client = SimpleNamespace(
         get_positions=lambda: _production_positions_payload(),
         get_orders=lambda: _production_orders_payload(),
     )
-    # 未成交委托（status=8）→ 可撤
-    preflight_cancel(
-        client=client,
-        order_id="262884700000047253",
-        stock_code="688825",
-    )
-    # 已撤单（status=9/dbStatus=206）→ 不可撤
+    # 已撤（status=8，官方语义）→ 不可撤
+    with pytest.raises(RuntimeError, match="不可撤销"):
+        preflight_cancel(
+            client=client,
+            order_id="262884700000047253",
+            stock_code="688825",
+        )
+    # 废单（status=9/dbStatus=206，官方语义）→ 不可撤
     with pytest.raises(RuntimeError, match="不可撤销"):
         preflight_cancel(
             client=client,
             order_id="262884800000052612",
             stock_code="603986",
         )
-    # 已成交（status=4，tradeCount=count）→ 不可撤
+    # 已成（status=4，tradeCount=count）→ 不可撤
     with pytest.raises(RuntimeError, match="不可撤销"):
         preflight_cancel(
             client=client,
             order_id="262884800000049805",
             stock_code="600276",
         )
+    # 在途（status=2=已报）→ 可撤（官方语义下唯一可撤形态之一）
+    pending_payload = _production_orders_payload()
+    pending_payload["data"]["orders"][1]["status"] = 2
+    pending_client = SimpleNamespace(
+        get_positions=lambda: _production_positions_payload(),
+        get_orders=lambda: pending_payload,
+    )
+    preflight_cancel(
+        client=pending_client,
+        order_id="262884700000047253",
+        stock_code="688825",
+    )

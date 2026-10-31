@@ -8,7 +8,9 @@ from typing import Any
 from sqlalchemy import select, update
 
 from app.db.database import session_scope
-from app.db.models import StrategyRunAction, StrategyRunActionResult
+import json
+
+from app.db.models import StrategyRun, StrategyRunAction, StrategyRunActionResult, TradeOrder
 from app.services.mx_skill_service import mx_skill_service
 
 logger = logging.getLogger(__name__)
@@ -237,6 +239,200 @@ class ExecutionRunnerService:
                 return None
             db.expunge(action)
             return action
+
+    def retry_action(self, action_id: int) -> dict[str, Any]:
+        """手动重试失败的动作（用户功能：工具执行失败后可手动再触发）。
+
+        重试走全部安全挡板（意图注册、预检、开市门禁、自选股回查）——
+        失败原因未消除时会再次被拦截（正确行为）；瞬时错误（超时/接口
+        异常）重试可能成功。每次重试记录为新的尝试（attempt），成功后
+        持久化交易委托、回填意图关联并重新汇总运行状态。
+        """
+        # ---- 1. 校验 + 原子抢占 ----
+        with session_scope() as db:
+            action = db.get(StrategyRunAction, action_id)
+            if action is None:
+                raise RuntimeError(f"动作 {action_id} 不存在")
+            if str(action.status or "") not in ("failed_terminal", "failed_retryable"):
+                raise RuntimeError(
+                    f"动作当前状态为 {action.status}，仅失败动作允许手动重试"
+                )
+            run_id = action.run_id
+            tool_name = str(action.tool_name or "")
+            arguments = (
+                dict(action.arguments_payload)
+                if isinstance(action.arguments_payload, dict)
+                else {}
+            )
+            # 已有尝试数（重试从 max+1 开始编号）
+            existing_attempts = len(
+                list(
+                    db.scalars(
+                        select(StrategyRunActionResult.id).where(
+                            StrategyRunActionResult.action_id == action_id
+                        )
+                    ).all()
+                )
+            )
+
+        claimed = None
+        with session_scope() as db:
+            claimed = db.execute(
+                update(StrategyRunAction)
+                .where(
+                    StrategyRunAction.id == action_id,
+                    StrategyRunAction.status.in_(
+                        ("failed_terminal", "failed_retryable")
+                    ),
+                )
+                .values(status="executing")
+            )
+            if claimed.rowcount != 1:
+                raise RuntimeError("动作已被其他重试抢占或状态已变化")
+        del claimed
+
+        # ---- 2. 构建执行环境（真实客户端 + 设置） ----
+        from types import SimpleNamespace
+
+        from app.services.aniu_service import aniu_service
+
+        with session_scope() as db:
+            settings = aniu_service.get_or_create_settings(db)
+            mx_api_key = str(settings.mx_api_key or "")
+            task_prompt = str(getattr(settings, "task_prompt", "") or "")
+
+        if not mx_api_key:
+            # 抢占回滚：无 Key 时把动作放回失败状态
+            with session_scope() as db:
+                db.execute(
+                    update(StrategyRunAction)
+                    .where(
+                        StrategyRunAction.id == action_id,
+                        StrategyRunAction.status == "executing",
+                    )
+                    .values(status="failed_terminal")
+                )
+            raise RuntimeError("未配置 MX API Key，无法重试")
+
+        from skills.mx_core.client import MXClient
+
+        app_settings = SimpleNamespace(task_prompt=task_prompt)
+        client = MXClient(api_key=mx_api_key)
+        try:
+            # ---- 3. 执行（走全部挡板） ----
+            result = mx_skill_service.execute_tool(
+                client=client,
+                app_settings=app_settings,
+                tool_name=tool_name,
+                arguments=arguments,
+                run_id=run_id,
+            )
+            attempt_no = existing_attempts + 1
+            success, normalized_action = self._record_attempt(
+                action_id=action_id,
+                attempt_no=attempt_no,
+                result=result,
+                max_attempts=1,  # 手动重试失败直接终态（可再次手动重试）
+            )
+            if success and isinstance(normalized_action, dict):
+                # ---- 4. 意图关联回填 + 交易委托落库 ----
+                try:
+                    self._backfill_intent_action_id(
+                        run_id=run_id,
+                        action_id=action_id,
+                        executed_action=normalized_action,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "retry intent action_id backfill failed: %s", exc
+                    )
+                if str(normalized_action.get("action") or "") in {"BUY", "SELL"}:
+                    with session_scope() as db:
+                        db.add(
+                            TradeOrder(
+                                run_id=run_id,
+                                symbol=str(normalized_action.get("symbol") or ""),
+                                action=str(normalized_action.get("action") or ""),
+                                quantity=int(
+                                    normalized_action.get("quantity") or 0
+                                ),
+                                price_type=str(
+                                    normalized_action.get("price_type") or "MARKET"
+                                ),
+                                price=self._parse_float_or_none(
+                                    normalized_action.get("price")
+                                ),
+                                status=str(
+                                    normalized_action.get("status") or "submitted"
+                                ),
+                                response_payload=normalized_action.get("response"),
+                            )
+                        )
+                # 追加到 run.executed_actions
+                with session_scope() as db:
+                    run = db.get(StrategyRun, run_id)
+                    if run is not None:
+                        try:
+                            executed = json.loads(run.executed_actions or "[]")
+                            if not isinstance(executed, list):
+                                executed = []
+                        except (TypeError, ValueError):
+                            executed = []
+                        executed.append(normalized_action)
+                        run.executed_actions = executed
+                        db.add(run)
+        finally:
+            client.close()
+
+        # ---- 5. 重新汇总运行状态 ----
+        self._refresh_run_summary(run_id)
+
+        with session_scope() as db:
+            action = db.get(StrategyRunAction, action_id)
+            return {
+                "action_id": action_id,
+                "run_id": run_id,
+                "tool_name": tool_name,
+                "status": str(action.status or "") if action else "unknown",
+                "ok": bool(result.get("ok")),
+                "summary": result.get("summary"),
+                "error": result.get("error"),
+                "attempt_no": attempt_no,
+            }
+
+    def _refresh_run_summary(self, run_id: int) -> None:
+        """重试后重新汇总运行状态（错误信息/状态/executed_actions 一致）。"""
+        from app.services.execution_reconcile_service import (
+            execution_reconcile_service,
+        )
+
+        status_counts, unresolved_count, error_message = self._summarize_actions(
+            run_id
+        )
+        summary = {
+            "total_planned": sum(status_counts.values()),
+            "total_executed": status_counts.get("completed", 0),
+            "unresolved_count": unresolved_count,
+            "status_counts": status_counts,
+            "error_message": error_message,
+        }
+        run_error = execution_reconcile_service.build_run_error_message(summary)
+        with session_scope() as db:
+            run = db.get(StrategyRun, run_id)
+            if run is None:
+                return
+            run.error_message = run_error
+            run.status = "completed" if not run_error else "failed"
+            db.add(run)
+
+    @staticmethod
+    def _parse_float_or_none(value: Any) -> float | None:
+        if value is None or value == "":
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def _backfill_intent_action_id(

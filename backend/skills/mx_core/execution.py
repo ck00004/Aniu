@@ -36,9 +36,6 @@ _MARKET_SESSIONS: tuple[tuple[int, int], ...] = (
     (9 * 60 + 15, 11 * 60 + 30),
     (13 * 60, 15 * 60),
 )
-# 委托仍占用资金/份额的状态（已报/未成交/处理中）
-_PENDING_ORDER_STATUSES = {"1", "2", "8", "100"}
-
 # 自选股操作互斥锁：读取 → 判断 → 写入 → 回查必须串行执行，防止两个
 # 并发任务同时读到"不存在"然后同时发送 ADD（2026-10 外部审计）。
 _SELF_SELECT_OP_LOCK = threading.Lock()
@@ -133,6 +130,40 @@ def _require_parseable_rows(payload: Any, *, what: str) -> list[dict[str, Any]]:
             "已阻断本次交易；请稍后重试或核对妙想接口状态。"
         )
     return rows
+
+
+def _extract_self_select_rows(payload: Any) -> list[dict[str, Any]] | None:
+    """解析自选股列表载荷 → 行列表；结构不可识别返回 None。
+
+    生产真实结构（2026-10-31 远程确认）：
+      data.allResults.result.dataList: [{SECURITY_CODE, SECURITY_SHORT_NAME, ...}]
+    兼容结构：data.rows / data.list / data.dataList 等直接键
+    （测试桩与历史格式）。空列表是有效结果（VALID_EMPTY）。
+    """
+    if not isinstance(payload, dict):
+        return None
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return None
+
+    # 生产真实结构：data.allResults.result.dataList
+    all_results = data.get("allResults")
+    if isinstance(all_results, dict):
+        result = all_results.get("result")
+        if isinstance(result, dict):
+            data_list = result.get("dataList")
+            if isinstance(data_list, list):
+                return [row for row in data_list if isinstance(row, dict)]
+        # allResults 存在但 result/dataList 形态不对 → 不可判定
+        return None
+
+    # 兼容结构：直接列表键
+    for key in ("rows", "list", "dataList", "data"):
+        value = data.get(key)
+        if isinstance(value, list):
+            return [row for row in value if isinstance(row, dict)]
+    # data 是 dict 但无任何已知列表键：不可判定（不是空列表）
+    return None
 
 
 def _require_parseable_order_rows(payload: Any, *, what: str) -> list[dict[str, Any]]:
@@ -1022,21 +1053,41 @@ class MXExecutionService:
         NOOP_VERIFIED（实际没删也声称满足目标状态）、添加场景对已在
         自选的股票重复发送 ADD。只有 VALID_EMPTY/VALID_DATA 才可作为
         判断依据。
+
+        生产真实结构（2026-10-31 远程排查确认，run 2022 载荷）：
+        data.allResults.result.dataList（84 行，字段 SECURITY_CODE /
+        SECURITY_SHORT_NAME / MARKET_SHORT_NAME）——三层嵌套，通用
+        订单解析器不认识，导致所有自选股写操作被 Fail-Closed 门禁
+        拒绝（run 2021/2022 失败根因）。此处优先解析真实结构，
+        保留通用键兼容（测试桩/其他格式）。
         """
         try:
             payload = client.get_self_selects()
         except Exception:  # noqa: BLE001
             return None
-        rows, state = _payload_rows_with_state(payload)
-        if state in (_ROWS_INVALID, _ROWS_ERROR):
+        rows = _extract_self_select_rows(payload)
+        if rows is None:
             return None
         codes: set[str] = set()
         names: list[str] = []
         for row in rows:
             row_code = _normalize_symbol(
-                _row_str(row, "stockCode", "code", "SECURITY_CODE", "secCode")
+                _row_str(
+                    row,
+                    "SECURITY_CODE",
+                    "stockCode",
+                    "code",
+                    "secCode",
+                )
             )
-            row_name = _row_str(row, "stockName", "secName", "name", "stock_name")
+            row_name = _row_str(
+                row,
+                "SECURITY_SHORT_NAME",
+                "stockName",
+                "secName",
+                "name",
+                "stock_name",
+            )
             # 行级身份校验：既无代码也无名称的行不可判定（防止把
             # 结构异常的行静默跳过后误判目标股票不在列表中）
             if not row_code and not row_name:
@@ -1355,11 +1406,21 @@ class MXExecutionService:
         except RuntimeError as exc:
             return "unknown", f"（回查失败（UNKNOWN）：{exc}）"
         for row in rows:
-            row_order_id = _row_str(row, "orderID", "orderId", "order_id", "entrustNo")
+            # 真实委托行的单号字段是 "id"（2026-10-31 实测 124 条委托：
+            # 行内无 orderID/orderId，仅有 id）——缺它则撤单回查永远
+            # 找不到订单、误报 UNKNOWN。
+            row_order_id = _row_str(row, "id", "orderID", "orderId", "order_id", "entrustNo")
             if row_order_id and row_order_id == str(order_id).strip():
                 from skills.mx_core.order_schema import order_terminal_status
 
                 terminal = order_terminal_status(row)
+                if terminal == "failed":
+                    # 9=废单：原委托被拒绝从未生效，无需撤销
+                    return (
+                        "verified",
+                        "（回查（VERIFIED）：原委托为废单（被拒绝），"
+                        "从未生效，无需撤销。）",
+                    )
                 if terminal == "canceled":
                     return (
                         "verified",

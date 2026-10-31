@@ -95,3 +95,21 @@ test('analysis runs composable parses backend execution report payload', () => {
   assert.ok(source.includes('NOOP'))
   assert.ok(source.includes('NOT_CALLED'))
 })
+
+test('tasks view provides retry button for failed actions', () => {
+  const source = readFileSync(new URL('../src/views/TasksView.vue', import.meta.url), 'utf-8')
+
+  assert.ok(source.includes('handleRetryAction'))
+  assert.ok(source.includes('retryingActionIds'))
+  assert.ok(source.includes("action.status === 'failed_terminal'"))
+  assert.ok(source.includes('api.retryRunAction'))
+  // 重试后刷新运行详情
+  assert.ok(source.includes('loadRunDetail'))
+})
+
+test('api service exposes retryRunAction', () => {
+  const source = readFileSync(new URL('../src/services/api.ts', import.meta.url), 'utf-8')
+
+  assert.ok(source.includes('retryRunAction'))
+  assert.ok(source.includes('/runs/actions/${actionId}/retry'))
+})

@@ -454,7 +454,7 @@ def test_unknown_intent_never_auto_fails(
             {
                 "stockCode": "000001",
                 "orderDrt": "1",
-                "orderStatus": "3",
+                "orderStatus": "4",  # 官方：已成（历史终局痕迹）
                 "orderCount": 100,
                 "dealCount": 100,
                 "orderID": "ORD-HIST",
@@ -873,7 +873,7 @@ def test_partially_filled_then_cancelled_is_terminal(monkeypatch, tmp_path) -> N
             {
                 "stockCode": "600519",
                 "orderDrt": "1",
-                "orderStatus": "3",  # 已撤
+                "orderStatus": "7",  # 官方：部撤
                 "orderCount": 100,
                 "dealCount": 40,
                 "orderID": "ORD-P",
@@ -890,7 +890,7 @@ def test_partially_filled_then_cancelled_is_terminal(monkeypatch, tmp_path) -> N
             {
                 "stockCode": "600519",
                 "orderDrt": "1",
-                "orderStatus": "3",
+                "orderStatus": "8",  # 官方：已撤
                 "orderCount": 100,
                 "dealCount": 0,
                 "orderID": "ORD-P",
@@ -1391,7 +1391,7 @@ def test_cancel_intent_state_closure(monkeypatch, tmp_path) -> None:
             {
                 "stockCode": "600519",
                 "orderDrt": "1",
-                "orderStatus": "3",
+                "orderStatus": "8",  # 官方：已撤
                 "orderCount": 100,
                 "dealCount": 0,
                 "orderID": "ORD-C",
@@ -1405,7 +1405,7 @@ def test_cancel_intent_state_closure(monkeypatch, tmp_path) -> None:
             {
                 "stockCode": "600519",
                 "orderDrt": "1",
-                "orderStatus": "3",
+                "orderStatus": "4",  # 官方：已成
                 "orderCount": 100,
                 "dealCount": 100,
                 "orderID": "ORD-C",
@@ -2140,7 +2140,7 @@ def test_unknown_without_order_id_never_fuzzy_matches(monkeypatch, tmp_path) -> 
                 {
                     "stockCode": "600519",
                     "orderDrt": "1",
-                    "orderStatus": "3",
+                    "orderStatus": "4",  # 官方：已成（历史）
                     "orderCount": 100,
                     "dealCount": 100,
                     "orderID": "ORD-HIST",
@@ -2162,7 +2162,7 @@ def test_unknown_without_order_id_never_fuzzy_matches(monkeypatch, tmp_path) -> 
             {
                 "stockCode": "600519",
                 "orderDrt": "1",
-                "orderStatus": "3",
+                    "orderStatus": "4",  # 官方：已成（历史）
                 "orderCount": 100,
                 "dealCount": 100,
                 "orderID": "ORD-H1",
@@ -2270,7 +2270,7 @@ def test_canceled_buy_order_not_blocking() -> None:
                         {
                             "stockCode": "600519",
                             "orderDrt": "1",
-                            "orderStatus": "3",  # 已撤销
+                            "orderStatus": "8",  # 官方：已撤（历史）
                             "orderCount": 100,
                             "dealCount": 0,
                             "orderID": "ORD-CX",
@@ -2310,7 +2310,7 @@ def test_canceled_sell_order_not_occupying() -> None:
                         {
                             "stockCode": "600519",
                             "orderDrt": "2",
-                            "orderStatus": "3",
+                            "orderStatus": "8",  # 官方：已撤
                             "orderCount": 500,
                             "dealCount": 0,
                             "orderID": "ORD-CXS",
@@ -2337,7 +2337,7 @@ def test_canceled_partial_is_terminal() -> None:
     row = {
         "stockCode": "600519",
         "orderDrt": "1",
-        "orderStatus": "3",
+        "orderStatus": "7",  # 官方：部撤
         "orderCount": 1000,
         "dealCount": 400,
     }
@@ -2354,7 +2354,7 @@ def test_cancel_after_partial_fill_verified(monkeypatch, tmp_path) -> None:
                 {
                     "stockCode": "600519",
                     "orderDrt": "1",
-                    "orderStatus": "3",  # 撤销成功
+                    "orderStatus": "7",  # 官方：部撤
                     "orderCount": 1000,
                     "dealCount": 400,  # 部分成交
                     "orderID": "ORD-CP",
@@ -2538,7 +2538,7 @@ def test_mixed_history_and_active_orders() -> None:
                         {
                             "stockCode": "600519",
                             "orderDrt": "1",
-                            "orderStatus": "3",  # 历史已撤
+                            "orderStatus": "7",  # 官方：部撤
                             "orderCount": 500,
                             "dealCount": 0,
                             "orderID": "ORD-OLD",
@@ -2704,7 +2704,7 @@ def test_cancel_verify_reports_canceled_partial_verified() -> None:
                         {
                             "stockCode": "600519",
                             "orderDrt": "1",
-                            "orderStatus": "3",
+                            "orderStatus": "7",  # 官方：部撤（部分成交+剩余撤销）
                             "orderCount": 1000,
                             "dealCount": 400,
                             "orderID": "ORD-PC",
@@ -2907,7 +2907,7 @@ def test_cancel_handler_uses_dedicated_intent_submit_method(
 
             def cancel_order(self, *, cancel_type, order_id, stock_code):
                 # 撤单成功：远端状态变为已撤销；响应返回原委托编号
-                remote_orders[0]["orderStatus"] = "3"
+                remote_orders[0]["orderStatus"] = "8"
                 return {
                     "code": "200",
                     "message": "成功",
@@ -3083,7 +3083,7 @@ def test_cancel_immediate_verify_persists_intent_status(
                 return {"data": {"orders": remote_orders}}
 
             def cancel_order(self, *, cancel_type, order_id, stock_code):
-                remote_orders[0]["orderStatus"] = "3"
+                remote_orders[0]["orderStatus"] = "8"
                 return {"code": "200", "message": "成功", "data": {"orderID": order_id}}
 
         result = mx_execution.mx_execution_service.execute_tool(
@@ -3268,7 +3268,7 @@ def test_cancel_persist_failure_visible_in_result(monkeypatch, tmp_path) -> None
                 return {"data": {"orders": remote_orders}}
 
             def cancel_order(self, *, cancel_type, order_id, stock_code):
-                remote_orders[0]["orderStatus"] = "3"
+                remote_orders[0]["orderStatus"] = "8"
                 return {"code": "200", "message": "成功", "data": {"orderID": order_id}}
 
         # 让状态持久化方法抛异常（模拟数据库提交失败）
@@ -3744,5 +3744,569 @@ def test_run_id_persisted_to_self_select_intent(monkeypatch, tmp_path) -> None:
         intents = self_select_intent_service.list_intents()
         assert len(intents) == 1
         assert intents[0].run_id == 42  # 贯通到数据库
+    finally:
+        _reset_db_state()
+
+
+# ---------------------------------------------------------------------------
+# 生产真实自选股结构（2026-10-31 远程 run 2021/2022 失败根因）
+# ---------------------------------------------------------------------------
+
+
+def _production_self_select_payload() -> dict:
+    """生产真实结构样本（字段名与嵌套层级来自远程 run 2022 载荷）。"""
+    return {
+        "requestId": "c7f29322232125e6341da78ecba8134a",
+        "message": "OK",
+        "status": 0,
+        "code": 0,
+        "data": {
+            "protocolType": "SELECT_STOCK",
+            "selectType": "A_STOCK",
+            "securityCount": 2,
+            "securityNames": [],
+            "responseConditionList": [
+                {"describe": "我的自选", "stockCount": 2}
+            ],
+            "allResults": {
+                "code": "0",
+                "result": {
+                    "columns": [{"title": "序号", "key": "SERIAL"}],
+                    "total": 2,
+                    "totalRecordCount": 2,
+                    "dataList": [
+                        {
+                            "SERIAL": "1",
+                            "SECURITY_CODE": "000568",
+                            "SECURITY_SHORT_NAME": "泸州老窖",
+                            "MARKET_SHORT_NAME": "SZ",
+                            "NEWEST_PRICE": "88.5",
+                            "CHG": "10.01",
+                            "IN_OPTIONAL": "1",
+                        },
+                        {
+                            "SERIAL": "2",
+                            "SECURITY_CODE": "600519",
+                            "SECURITY_SHORT_NAME": "贵州茅台",
+                            "MARKET_SHORT_NAME": "SH",
+                            "NEWEST_PRICE": "1480.0",
+                        },
+                    ],
+                    "diverseList": [],
+                },
+            },
+        },
+    }
+
+
+def test_self_select_production_structure_parsed() -> None:
+    """生产真实结构（data.allResults.result.dataList）能被正确解析。
+
+    run 2021/2022 失败根因：通用订单解析器不认识三层嵌套结构，
+    Fail-Closed 门禁拒绝了所有自选股写操作。
+    """
+    from skills.mx_core.execution import _extract_self_select_rows
+
+    rows = _extract_self_select_rows(_production_self_select_payload())
+    assert rows is not None
+    assert len(rows) == 2
+    assert rows[0]["SECURITY_CODE"] == "000568"
+
+
+def test_self_select_production_state_read(monkeypatch, tmp_path) -> None:
+    """真实结构下完整读写流程恢复：预读 → NOOP/写 → 回查。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        from skills.mx_core import execution as mx_execution
+
+        payload = _production_self_select_payload()
+
+        class _ProdClient:
+            def __init__(self) -> None:
+                self.manage_calls: list[str] = []
+
+            def get_self_selects(self) -> dict:
+                return payload
+
+            def manage_self_select(self, query: str) -> dict:
+                self.manage_calls.append(query)
+                # 真实生效：600030 加入
+                payload["data"]["allResults"]["result"]["dataList"].append(
+                    {
+                        "SERIAL": "3",
+                        "SECURITY_CODE": "600030",
+                        "SECURITY_SHORT_NAME": "中信证券",
+                        "MARKET_SHORT_NAME": "SH",
+                    }
+                )
+                return {"code": "200", "message": "成功"}
+
+        # 1. 已在列表（600519 贵州茅台）→ ADD 判 NOOP
+        result = mx_execution.mx_execution_service.execute_tool(
+            client=_ProdClient(),
+            app_settings=None,
+            tool_name="mx_manage_self_select",
+            arguments={"query": "将600519加入自选股"},
+        )
+        assert result["ok"] is True
+        assert result["executed_action"]["noop"] is True
+
+        # 2. 不在列表（600030）→ 真实执行 ADD 并回查确认
+        client = _ProdClient()
+        result = mx_execution.mx_execution_service.execute_tool(
+            client=client,
+            app_settings=None,
+            tool_name="mx_manage_self_select",
+            arguments={"query": "将600030加入自选股"},
+        )
+        assert result["ok"] is True
+        assert "回查确认" in result["summary"]
+        assert len(client.manage_calls) == 1
+
+        # 3. 在列表（000568 泸州老窖）→ REMOVE 真实执行并回查确认
+        class _RemoveClient:
+            def __init__(self) -> None:
+                self.manage_calls: list[str] = []
+
+            def get_self_selects(self) -> dict:
+                return payload
+
+            def manage_self_select(self, query: str) -> dict:
+                self.manage_calls.append(query)
+                payload["data"]["allResults"]["result"]["dataList"] = [
+                    row
+                    for row in payload["data"]["allResults"]["result"][
+                        "dataList"
+                    ]
+                    if row["SECURITY_CODE"] != "000568"
+                ]
+                return {"code": "200", "message": "成功"}
+
+        rc = _RemoveClient()
+        result = mx_execution.mx_execution_service.execute_tool(
+            client=rc,
+            app_settings=None,
+            tool_name="mx_manage_self_select",
+            arguments={"query": "将000568从自选股删除"},
+        )
+        assert result["ok"] is True
+        assert "回查确认" in result["summary"]
+        assert len(rc.manage_calls) == 1
+    finally:
+        _reset_db_state()
+
+
+def test_self_select_structure_with_allresults_but_no_datalist() -> None:
+    """allResults 存在但 result/dataList 形态不对 → 不可判定（None）。"""
+    from skills.mx_core.execution import _extract_self_select_rows
+
+    assert _extract_self_select_rows({"data": {"allResults": {}}}) is None
+    assert (
+        _extract_self_select_rows({"data": {"allResults": {"result": None}}})
+        is None
+    )
+    assert (
+        _extract_self_select_rows(
+            {"data": {"allResults": {"result": {"dataList": "not-a-list"}}}}
+        )
+        is None
+    )
+
+
+# ---------------------------------------------------------------------------
+# 真实账户集成验证（2026-10-31，只读）——状态码证据锁定
+# ---------------------------------------------------------------------------
+
+
+def test_official_status_code_map() -> None:
+    """官方状态码定义逐码锁定（2026-10-31 用户提供，权威来源）：
+
+    1=未报 2=已报 3=部成 4=已成 5=部成待撤 6=已报待撤
+    7=部撤 8=已撤 9=废单 10=撤单失败
+    """
+    from skills.mx_core.order_schema import (
+        CANCELED_ORDER_STATUSES,
+        PENDING_ORDER_STATUSES,
+        order_terminal_status,
+    )
+
+    assert PENDING_ORDER_STATUSES == {"1", "2", "3", "5", "6", "10"}
+    assert CANCELED_ORDER_STATUSES == {"7", "8", "9"}
+    # '8'=已撤 不得出现在在途集（此前观测推断错误）
+    assert "8" not in PENDING_ORDER_STATUSES
+
+    def st(code, ordered=100, dealt=0):
+        return order_terminal_status(
+            {"orderStatus": str(code), "orderCount": ordered, "dealCount": dealt}
+        )
+
+    assert st(1) == "submitted"                    # 未报
+    assert st(2) == "submitted"                    # 已报
+    assert st(3, dealt=40) == "partially_filled"   # 部成（在途）
+    assert st(4, dealt=100) == "filled"            # 已成
+    assert st(5, dealt=40) == "partially_filled"   # 部成待撤（在途）
+    assert st(6) == "submitted"                    # 已报待撤（在途）
+    assert st(7, dealt=40) == "canceled_partial"   # 部撤（终态）
+    assert st(8) == "canceled"                     # 已撤（终态）
+    assert st(9) == "failed"                        # 废单（被拒绝，可重试）
+    assert st(10) == "submitted"                    # 撤单失败（仍在途）
+
+    # 语义矛盾 → unknown 阻塞
+    assert st(8, dealt=40) == "unknown"            # 已撤却有成交
+    assert st(7) == "unknown"                      # 部撤却零成交
+    assert st(4, dealt=90) == "unknown"            # 已成却未全成交
+    assert st(77) == "unknown"                     # 未知码
+
+
+
+def test_real_order_row_id_field_matched() -> None:
+    """真实接口证据：委托行单号字段是 "id"（非 orderID/orderId）。
+
+    缺它则撤单回查/意图单号匹配永远找不到订单。
+    """
+    from skills.mx_core.execution import mx_execution_service
+
+    class _RealRowClient:
+        def get_orders(self) -> dict:
+            # 真实行结构（字段名来自 2026-10-31 实测）
+            return {
+                "data": {
+                    "orders": [
+                        {
+                            "id": "263024600000052882",
+                            "secCode": "600160",
+                            "secMkt": 1,
+                            "secName": "巨化股份",
+                            "drt": 2,
+                            "count": 1800,
+                            "tradeCount": 1800,
+                            "status": 4,
+                            "dbStatus": 200,
+                            "price": 289,
+                            "priceDec": 1,
+                            "time": 1793342482,
+                            "type": 5,
+                        }
+                    ]
+                }
+            }
+
+    note = mx_execution_service._verify_cancel_result(
+        _RealRowClient(), "263024600000052882"
+    )
+    # 单号 "id" 被匹配到 → 状态 4 全成交 → FILLED（不是"找不到订单"）
+    status, text = note
+    assert status == "filled"
+    assert "已全部成交" in text
+
+
+# ---------------------------------------------------------------------------
+# 手动重试失败动作（用户功能）
+# ---------------------------------------------------------------------------
+
+
+def test_retry_action_success(monkeypatch, tmp_path) -> None:
+    """失败动作手动重试成功：状态更新、尝试记录、run 重新汇总。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        from app.db.models import StrategyRun
+        from app.services import execution_runner_service as ers
+
+        # 构造：run + 失败动作
+        with session_scope() as db:
+            run = StrategyRun(
+                trigger_source="schedule",
+                run_type="trade",
+                status="failed",
+                error_message="执行计划未完全落地：mx_moni_trade#1: mock 失败",
+                started_at=datetime.now(timezone.utc),
+                finished_at=datetime.now(timezone.utc),
+            )
+            db.add(run)
+            db.flush()
+            run_id = run.id
+            from app.db.models import StrategyRunAction, StrategyRunActionResult
+
+            db.add(
+                StrategyRunAction(
+                    run_id=run_id,
+                    sequence_no=1,
+                    phase="planned",
+                    tool_name="mx_moni_trade",
+                    action_type="BUY",
+                    status="failed_terminal",
+                    arguments_payload={
+                        "action": "BUY",
+                        "symbol": "600519",
+                        "quantity": 100,
+                        "price_type": "LIMIT",
+                        "price": 20.0,
+                    },
+                    error_message="mock 失败",
+                )
+            )
+            db.flush()
+            action_id = (
+                db.scalars(
+                    select(StrategyRunAction.id)
+                    .where(StrategyRunAction.run_id == run_id)
+                ).all()
+            )[0]
+            db.add(
+                StrategyRunActionResult(
+                    action_id=action_id,
+                    attempt_no=1,
+                    status="failed",
+                    response_payload={"ok": False, "error": "mock 失败"},
+                    error_message="mock 失败",
+                    finished_at=datetime.now(timezone.utc),
+                )
+            )
+
+        # mock：execute_tool 重试成功
+        from types import SimpleNamespace
+
+        original_execute = ers.mx_skill_service.execute_tool
+
+        def _mock_execute(*, client, app_settings, tool_name, arguments, run_id=None):
+            del client, app_settings, run_id
+            return {
+                "ok": True,
+                "tool_name": tool_name,
+                "summary": f"重试成功 {arguments.get('symbol')}",
+                "result": {"orderID": "RETRY-1"},
+                "executed_action": {
+                    "action": arguments.get("action"),
+                    "symbol": arguments.get("symbol"),
+                    "quantity": arguments.get("quantity"),
+                    "price_type": arguments.get("price_type"),
+                    "price": arguments.get("price"),
+                    "status": "submitted",
+                    "response": {"orderID": "RETRY-1"},
+                },
+            }
+
+        ers.mx_skill_service.execute_tool = _mock_execute
+        # mock MXClient 构造（避免真实 API 调用）
+        from unittest.mock import patch
+
+        with patch(
+            "skills.mx_core.client.MXClient.__init__", return_value=None
+        ), patch(
+            "skills.mx_core.client.MXClient.close", return_value=None
+        ):
+            # 设置 MX Key
+            with session_scope() as db:
+                from app.services.aniu_service import aniu_service
+
+                settings = aniu_service.get_or_create_settings(db)
+                settings.mx_api_key = "test-key"
+                db.commit()
+
+            result = execution_runner_service.retry_action(action_id)
+
+        ers.mx_skill_service.execute_tool = original_execute
+
+        assert result["ok"] is True
+        assert result["status"] == "completed"
+        assert result["attempt_no"] == 2  # 第 2 次尝试
+
+        # 动作状态更新 + 尝试记录
+        with session_scope() as db:
+            action = db.get(StrategyRunAction, action_id)
+            assert action.status == "completed"
+            assert len(action.results) == 2
+            # run 重新汇总：全部完成 → completed
+            run = db.get(StrategyRun, run_id)
+            assert run.status == "completed"
+            assert run.error_message is None
+            # 交易委托落库
+            from app.db.models import TradeOrder
+
+            orders = (
+                db.query(TradeOrder).filter(TradeOrder.run_id == run_id).all()
+            )
+            assert len(orders) == 1
+            assert orders[0].symbol == "600519"
+            assert orders[0].response_payload == {"orderID": "RETRY-1"}
+    finally:
+        _reset_db_state()
+
+
+def test_retry_action_rejects_non_failed(monkeypatch, tmp_path) -> None:
+    """仅失败动作可重试（completed/planned/executing 拒绝）。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        from app.db.models import StrategyRun, StrategyRunAction
+
+        with session_scope() as db:
+            run = StrategyRun(
+                trigger_source="schedule",
+                run_type="trade",
+                status="completed",
+                started_at=datetime.now(timezone.utc),
+            )
+            db.add(run)
+            db.flush()
+            for status in ("completed", "planned", "executing"):
+                db.add(
+                    StrategyRunAction(
+                        run_id=run.id,
+                        sequence_no=1,
+                        phase="planned",
+                        tool_name="mx_moni_trade",
+                        action_type="BUY",
+                        status=status,
+                    )
+                )
+            db.flush()
+            action_ids = db.scalars(
+                select(StrategyRunAction.id).where(
+                    StrategyRunAction.run_id == run.id
+                )
+            ).all()
+
+        for aid in action_ids:
+            with pytest.raises(RuntimeError, match="仅失败动作"):
+                execution_runner_service.retry_action(aid)
+    finally:
+        _reset_db_state()
+
+
+def test_retry_action_failure_records_attempt(monkeypatch, tmp_path) -> None:
+    """重试再次失败：记录尝试，动作回到 failed_terminal（可再次手动重试）。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        from app.db.models import StrategyRun, StrategyRunAction
+
+        with session_scope() as db:
+            run = StrategyRun(
+                trigger_source="schedule",
+                run_type="trade",
+                status="failed",
+                error_message="执行计划未完全落地",
+                started_at=datetime.now(timezone.utc),
+            )
+            db.add(run)
+            db.flush()
+            db.add(
+                StrategyRunAction(
+                    run_id=run.id,
+                    sequence_no=1,
+                    phase="planned",
+                    tool_name="mx_moni_trade",
+                    action_type="BUY",
+                    status="failed_terminal",
+                    arguments_payload={"action": "BUY", "symbol": "600519"},
+                )
+            )
+            db.flush()
+            action_id = db.scalars(
+                select(StrategyRunAction.id).where(
+                    StrategyRunAction.run_id == run.id
+                )
+            ).all()[0]
+
+        from app.services import execution_runner_service as ers
+
+        def _mock_execute(*, client, app_settings, tool_name, arguments, run_id=None):
+            del client, app_settings, tool_name, arguments, run_id
+            return {"ok": False, "tool_name": "mx_moni_trade", "error": "重试仍失败"}
+
+        ers.mx_skill_service.execute_tool = _mock_execute
+        from unittest.mock import patch
+
+        with patch(
+            "skills.mx_core.client.MXClient.__init__", return_value=None
+        ), patch("skills.mx_core.client.MXClient.close", return_value=None):
+            with session_scope() as db:
+                from app.services.aniu_service import aniu_service
+
+                settings = aniu_service.get_or_create_settings(db)
+                settings.mx_api_key = "test-key"
+                db.commit()
+
+            result = execution_runner_service.retry_action(action_id)
+
+        assert result["ok"] is False
+        assert result["status"] == "failed_terminal"
+        assert result["attempt_no"] == 1  # 无历史尝试 → 第 1 次
+        with session_scope() as db:
+            action = db.get(StrategyRunAction, action_id)
+            assert action.status == "failed_terminal"
+            assert "重试仍失败" in str(action.error_message)
+    finally:
+        _reset_db_state()
+
+
+def test_retry_action_atomic_claim(monkeypatch, tmp_path) -> None:
+    """并发抢占：动作被置为 executing 后，第二次重试被拒绝。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        from app.db.models import StrategyRun, StrategyRunAction
+
+        with session_scope() as db:
+            run = StrategyRun(
+                trigger_source="schedule",
+                run_type="trade",
+                status="failed",
+                started_at=datetime.now(timezone.utc),
+            )
+            db.add(run)
+            db.flush()
+            db.add(
+                StrategyRunAction(
+                    run_id=run.id,
+                    sequence_no=1,
+                    phase="planned",
+                    tool_name="mx_moni_trade",
+                    action_type="BUY",
+                    status="failed_terminal",
+                )
+            )
+            db.flush()
+            action_id = db.scalars(
+                select(StrategyRunAction.id).where(
+                    StrategyRunAction.run_id == run.id
+                )
+            ).all()[0]
+
+        # 第一次重试成功（抢占 → executing → completed）
+        from app.services import execution_runner_service as ers
+
+        def _mock_execute(*, client, app_settings, tool_name, arguments, run_id=None):
+            del client, app_settings, tool_name, arguments, run_id
+            return {
+                "ok": True,
+                "tool_name": "mx_moni_trade",
+                "summary": "成功",
+                "executed_action": {"action": "BUY", "symbol": "600519", "quantity": 100},
+            }
+
+        ers.mx_skill_service.execute_tool = _mock_execute
+        from unittest.mock import patch
+
+        with patch(
+            "skills.mx_core.client.MXClient.__init__", return_value=None
+        ), patch("skills.mx_core.client.MXClient.close", return_value=None):
+            with session_scope() as db:
+                from app.services.aniu_service import aniu_service
+
+                settings = aniu_service.get_or_create_settings(db)
+                settings.mx_api_key = "test-key"
+                db.commit()
+
+            r1 = execution_runner_service.retry_action(action_id)
+            assert r1["ok"] is True
+            assert r1["status"] == "completed"
+
+            # 第二次重试：动作已 completed → 拒绝
+            with pytest.raises(RuntimeError, match="仅失败动作"):
+                execution_runner_service.retry_action(action_id)
     finally:
         _reset_db_state()

@@ -498,9 +498,21 @@
                             </div>
                           </div>
                         </div>
-                        <span class="execution-action-status" :class="`tone-${action.tone}`">
-                          {{ action.statusText }}
-                        </span>
+                        <div class="execution-action-status-group">
+                          <span class="execution-action-status" :class="`tone-${action.tone}`">
+                            {{ action.statusText }}
+                          </span>
+                          <button
+                            v-if="action.status === 'failed_terminal' || action.status === 'failed_retryable'"
+                            class="button ghost small execution-retry-button"
+                            type="button"
+                            :disabled="retryingActionIds.has(action.id)"
+                            title="重新执行该工具调用（会重新经过全部安全检查）"
+                            @click="handleRetryAction(action)"
+                          >
+                            {{ retryingActionIds.has(action.id) ? '重试中…' : '重试' }}
+                          </button>
+                        </div>
                       </div>
 
                       <div v-if="action.plannedText || action.executedText || action.argumentsText" class="execution-action-payloads">
@@ -985,6 +997,31 @@ const reportOverallBadgeClass = computed(() => {
   if (tone === 'error' || tone === 'warning') return 'warning'
   return 'neutral'
 })
+
+const retryingActionIds = ref(new Set<number>())
+
+async function handleRetryAction(action: { id: number }): Promise<void> {
+  if (retryingActionIds.value.has(action.id)) return
+  retryingActionIds.value = new Set(retryingActionIds.value).add(action.id)
+  try {
+    const result = await api.retryRunAction(action.id)
+    if (result.ok) {
+      store.notice = `工具重试成功：${result.summary ?? ''}`
+    } else {
+      store.notice = `工具重试失败：${result.error ?? '未知错误'}`
+    }
+    // 重试后刷新运行详情（动作状态/尝试记录/运行汇总已更新）
+    if (selectedRun.value) {
+      await store.loadRunDetail(selectedRun.value.id, { force: true })
+    }
+  } catch (error) {
+    store.notice = `重试请求失败：${(error as Error).message}`
+  } finally {
+    const next = new Set(retryingActionIds.value)
+    next.delete(action.id)
+    retryingActionIds.value = next
+  }
+}
 
 const displayRunActions = computed(() => selectedRun.value?.runActions ?? [])
 
@@ -1914,6 +1951,19 @@ onBeforeUnmount(() => {
 }
 
 .execution-overview-badge,
+.execution-action-status-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.execution-retry-button {
+  min-height: 24px;
+  padding: 0 10px;
+  font-size: 11px;
+}
+
 .execution-action-status,
 .execution-attempt-status,
 .execution-status-chip {

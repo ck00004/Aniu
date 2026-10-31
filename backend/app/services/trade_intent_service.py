@@ -595,7 +595,7 @@ class TradeIntentService:
                             row
                             for row in symbol_rows
                             if row_str(
-                                row, "orderID", "orderId", "order_id", "entrustNo"
+                                row, "id", "orderID", "orderId", "order_id", "entrustNo"
                             )
                             == str(intent.provider_order_id)
                         ),
@@ -681,7 +681,7 @@ class TradeIntentService:
             return []
 
         def _row_order_id(row: dict[str, Any]) -> str:
-            return row_str(row, "orderID", "orderId", "order_id", "entrustNo")
+            return row_str(row, "id", "orderID", "orderId", "order_id", "entrustNo")
 
         with session_scope() as db:
             open_cancels = list(
@@ -710,7 +710,11 @@ class TradeIntentService:
                     )
                 else:
                     terminal = order_terminal_status(matched)
-                    if terminal in ("canceled", "canceled_partial"):
+                    if terminal == "failed":
+                        # 9=废单：原委托被拒绝从未生效，撤单无需进行
+                        intent.status = "verified"
+                        intent.note = f"原委托 {order_id} 为废单（被拒绝），从未生效，无需撤销"
+                    elif terminal in ("canceled", "canceled_partial"):
                         intent.status = "verified"
                         if terminal == "canceled_partial":
                             intent.note = (

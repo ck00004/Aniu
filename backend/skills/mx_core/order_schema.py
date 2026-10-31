@@ -29,9 +29,19 @@ _LIST_ROW_KEYS = (
 )
 
 # 待处理状态码（已报/未成交/处理中）
-PENDING_ORDER_STATUSES = {"1", "2", "8", "100"}
-# 已知终局状态码白名单（撤单/废单/已结）——未知码一律不可判定
-CANCELED_ORDER_STATUSES = {"3", "4", "5", "6", "9", "-1"}
+# 妙想委托状态码官方定义（2026-10-31 用户提供，权威来源）：
+#   1=未报  2=已报  3=部成  4=已成  5=部成待撤  6=已报待撤
+#   7=部撤  8=已撤  9=废单  10=撤单失败
+#
+# 在途（仍占用资金/份额，阻塞同标的同方向新委托）：
+#   未报/已报/部成/部成待撤/已报待撤/撤单失败——撤单失败与待撤
+#   在撤销确认前仍视为在途（保守）。
+PENDING_ORDER_STATUSES = {"1", "2", "3", "5", "6", "10"}
+# 终局（不再占用）：部撤/已撤/废单。'4'=已成由 dealt==ordered 优先
+# 判定。此前 '8' 被误列入在途集（观测数据推断错误——3 条零成交的
+# '8' 实为已撤，会错误阻塞同标的合法交易）；'9' 是废单（被拒绝，
+# 从未生效）而非"已撤"。
+CANCELED_ORDER_STATUSES = {"7", "8", "9"}
 
 # 解析结果四态
 ROWS_VALID_DATA = "VALID_DATA"
@@ -166,13 +176,17 @@ def parse_order_snapshot(payload: Any) -> tuple[list[dict[str, Any]], str]:
 
 
 def order_terminal_status(row: dict[str, Any]) -> str:
-    """按委托行计算意图终态（第七轮复审 P0-2：终态优先于部分成交）。
+    """按委托行计算意图终态（官方状态码语义，2026-10-31 修正）。
 
-    filled / partially_filled / submitted / canceled / canceled_partial /
-    unknown。关键顺序：**终态状态码优先于 dealt>0**——部分成交 400 股
-    后剩余 600 股撤销成功（状态码 3）必须是 canceled_partial（终态），
-    而不是 partially_filled（会被当作剩余仍在途，撤单意图永久卡在
-    CANCEL_PENDING）。
+    状态映射（1=未报 2=已报 3=部成 4=已成 5=部成待撤 6=已报待撤
+    7=部撤 8=已撤 9=废单 10=撤单失败）：
+    - dealt==ordered → filled（4=已成，任何码全成交）
+    - 9=废单 → failed（被拒绝从未生效，意图可重试不消耗分批档位）
+    - 8=已撤 → canceled（终态，按保守分批规则计数）
+    - 7=部撤 → canceled_partial（部分成交已形成持仓变化）
+    - 1/2/3/5/6/10 在途 → submitted / partially_filled
+    - 语义矛盾（如 8=已撤却有成交、7=部撤却零成交）→ unknown 阻塞
+    - 未知码 → unknown 阻塞
     """
     ordered, dealt = get_order_quantities(row)
     status = get_order_status(row) or "0"
@@ -182,9 +196,12 @@ def order_terminal_status(row: dict[str, Any]) -> str:
         return "unknown"
     if dealt == ordered:
         return "filled"
-    # 终态状态码优先：剩余部分已撤销/废单，委托不再在途
-    if status in CANCELED_ORDER_STATUSES:
-        return "canceled_partial" if dealt > 0 else "canceled"
-    if status in PENDING_ORDER_STATUSES:
+    if status == "9":  # 废单：被拒绝，从未生效
+        return "failed" if dealt == 0 else "unknown"
+    if status == "8":  # 已撤：全部撤销（有成交应为 7=部撤，矛盾→unknown）
+        return "canceled" if dealt == 0 else "unknown"
+    if status == "7":  # 部撤：部分成交+剩余撤销（零成交矛盾→unknown）
+        return "canceled_partial" if dealt > 0 else "unknown"
+    if status in PENDING_ORDER_STATUSES:  # 1/2/3/5/6/10 在途
         return "partially_filled" if dealt > 0 else "submitted"
     return "unknown"

@@ -608,6 +608,27 @@ def list_runs_feed(
     )
 
 
+@router.post("/runs/actions/{action_id}/retry", response_model=dict[str, Any])
+def retry_run_action(
+    action_id: int,
+    _user: str = Depends(get_current_user),
+) -> dict[str, Any]:
+    """手动重试失败的执行动作（走全部安全挡板）。
+
+    仅 failed_terminal / failed_retryable 状态的动作可重试；重试会
+    重新经过意图注册、交易预检、开市门禁等全部检查——失败原因未
+    消除时会再次被拦截。成功后更新动作状态、落库交易委托并重新
+    汇总运行状态。
+    """
+    from app.services.execution_runner_service import execution_runner_service
+
+    try:
+        result = execution_runner_service.retry_action(action_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return result
+
+
 @router.get("/runs/{run_id}", response_model=RunDetailRead)
 def get_run(
     run_id: int,
