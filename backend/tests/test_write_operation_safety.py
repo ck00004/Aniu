@@ -4213,6 +4213,8 @@ def test_retry_action_failure_records_attempt(monkeypatch, tmp_path) -> None:
 
         from app.services import execution_runner_service as ers
 
+        original_execute = ers.mx_skill_service.execute_tool
+
         def _mock_execute(*, client, app_settings, tool_name, arguments, run_id=None):
             del client, app_settings, tool_name, arguments, run_id
             return {"ok": False, "tool_name": "mx_moni_trade", "error": "重试仍失败"}
@@ -4220,17 +4222,20 @@ def test_retry_action_failure_records_attempt(monkeypatch, tmp_path) -> None:
         ers.mx_skill_service.execute_tool = _mock_execute
         from unittest.mock import patch
 
-        with patch(
-            "skills.mx_core.client.MXClient.__init__", return_value=None
-        ), patch("skills.mx_core.client.MXClient.close", return_value=None):
-            with session_scope() as db:
-                from app.services.aniu_service import aniu_service
+        try:
+            with patch(
+                "skills.mx_core.client.MXClient.__init__", return_value=None
+            ), patch("skills.mx_core.client.MXClient.close", return_value=None):
+                with session_scope() as db:
+                    from app.services.aniu_service import aniu_service
 
-                settings = aniu_service.get_or_create_settings(db)
-                settings.mx_api_key = "test-key"
-                db.commit()
+                    settings = aniu_service.get_or_create_settings(db)
+                    settings.mx_api_key = "test-key"
+                    db.commit()
 
-            result = execution_runner_service.retry_action(action_id)
+                result = execution_runner_service.retry_action(action_id)
+        finally:
+            ers.mx_skill_service.execute_tool = original_execute
 
         assert result["ok"] is False
         assert result["status"] == "failed_terminal"
@@ -4279,6 +4284,8 @@ def test_retry_action_atomic_claim(monkeypatch, tmp_path) -> None:
         # 第一次重试成功（抢占 → executing → completed）
         from app.services import execution_runner_service as ers
 
+        original_execute = ers.mx_skill_service.execute_tool
+
         def _mock_execute(*, client, app_settings, tool_name, arguments, run_id=None):
             del client, app_settings, tool_name, arguments, run_id
             return {
@@ -4291,22 +4298,112 @@ def test_retry_action_atomic_claim(monkeypatch, tmp_path) -> None:
         ers.mx_skill_service.execute_tool = _mock_execute
         from unittest.mock import patch
 
-        with patch(
-            "skills.mx_core.client.MXClient.__init__", return_value=None
-        ), patch("skills.mx_core.client.MXClient.close", return_value=None):
-            with session_scope() as db:
-                from app.services.aniu_service import aniu_service
+        try:
+            with patch(
+                "skills.mx_core.client.MXClient.__init__", return_value=None
+            ), patch("skills.mx_core.client.MXClient.close", return_value=None):
+                with session_scope() as db:
+                    from app.services.aniu_service import aniu_service
 
-                settings = aniu_service.get_or_create_settings(db)
-                settings.mx_api_key = "test-key"
-                db.commit()
+                    settings = aniu_service.get_or_create_settings(db)
+                    settings.mx_api_key = "test-key"
+                    db.commit()
 
-            r1 = execution_runner_service.retry_action(action_id)
-            assert r1["ok"] is True
-            assert r1["status"] == "completed"
+                r1 = execution_runner_service.retry_action(action_id)
+                assert r1["ok"] is True
+                assert r1["status"] == "completed"
 
-            # 第二次重试：动作已 completed → 拒绝
-            with pytest.raises(RuntimeError, match="仅失败动作"):
-                execution_runner_service.retry_action(action_id)
+                # 第二次重试：动作已 completed → 拒绝
+                with pytest.raises(RuntimeError, match="仅失败动作"):
+                    execution_runner_service.retry_action(action_id)
+        finally:
+            ers.mx_skill_service.execute_tool = original_execute
+    finally:
+        _reset_db_state()
+
+
+# ---------------------------------------------------------------------------
+# 生产事故回归（2026-11-01）：REMOVE "把X从自选股列表删除" 模式未命中
+# ---------------------------------------------------------------------------
+
+
+def test_self_select_remove_full_phrase_parsed() -> None:
+    """生产事故：模型用"把X从自选股列表删除"表述，旧模式无法穿过
+    "自选股**列表**删除"中的"列表"——五个模式全部未命中，整个查询串
+    被当作目标名称，REMOVE 被误判"已不在列表"返回 NOOP_VERIFIED，
+    金安国纪连续 4 次删除失败。修正：自选(?:股列表|股|列表)?。"""
+    from skills.mx_core.execution import mx_execution_service
+
+    got = mx_execution_service._parse_self_select_intent(
+        "把金安国纪从自选股列表删除"
+    )
+    assert got == ("REMOVE", "", "金安国纪")
+
+
+def test_self_select_query_forms_matrix() -> None:
+    """生产真实查询形态全覆盖（ADD/REMOVE × 代码/名称 × 表述变体）。"""
+    from skills.mx_core.execution import mx_execution_service
+
+    cases = [
+        ("把金安国纪从自选股列表删除", ("REMOVE", "", "金安国纪")),
+        ("把中际旭创添加到我的自选股列表", ("ADD", "", "中际旭创")),
+        ("将600519从自选股删除", ("REMOVE", "600519", "")),
+        ("把贵州茅台添加到我的自选股列表", ("ADD", "", "贵州茅台")),
+        ("把金安国纪从自选中移除", ("REMOVE", "", "金安国纪")),
+        ("金安国纪从自选股列表删除", ("REMOVE", "", "金安国纪")),
+    ]
+    for query, want in cases:
+        got = mx_execution_service._parse_self_select_intent(query)
+        assert got == want, f"'{query}' → {got}（预期 {want}）"
+
+
+def test_remove_with_correct_target_executes_not_noop(monkeypatch, tmp_path) -> None:
+    """E2E：修正后"把金安国纪从自选股列表删除"在列表有时真实执行删除，
+    不再返回 NOOP_VERIFIED。"""
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    try:
+        from skills.mx_core import execution as mx_execution
+
+        class _RemoveClient:
+            def __init__(self) -> None:
+                self.rows = [
+                    {"SECURITY_CODE": "002636", "SECURITY_SHORT_NAME": "金安国纪"}
+                ]
+                self.manage_calls: list[str] = []
+
+            def get_self_selects(self) -> dict:
+                return {
+                    "data": {
+                        "allResults": {
+                            "result": {
+                                "dataList": [
+                                    {"SECURITY_CODE": r["SECURITY_CODE"],
+                                     "SECURITY_SHORT_NAME": r["SECURITY_SHORT_NAME"]}
+                                    for r in self.rows
+                                ]
+                            }
+                        }
+                    }
+                }
+
+            def manage_self_select(self, query: str) -> dict:
+                self.manage_calls.append(query)
+                self.rows = []  # 真实生效
+                return {"code": "200", "message": "成功"}
+
+        client = _RemoveClient()
+        result = mx_execution.mx_execution_service.execute_tool(
+            client=client,
+            app_settings=None,
+            tool_name="mx_manage_self_select",
+            arguments={"query": "把金安国纪从自选股列表删除"},
+        )
+
+        # 修正后：在列表 → 真实执行删除（不是 NOOP）
+        assert result["ok"] is True
+        assert result.get("executed_action", {}).get("noop") is not True
+        assert "回查确认" in result["summary"]
+        assert len(client.manage_calls) == 1
     finally:
         _reset_db_state()
