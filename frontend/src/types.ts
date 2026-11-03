@@ -160,6 +160,9 @@ export interface TradeDetail {
 export interface RunSummaryPage {
   items: RunSummary[]
   next_before_id: number | null
+  /** 双字段游标 (started_at, id)：与排序键一致，避免漏行/重复。 */
+  next_cursor_started_at?: string | null
+  next_cursor_id?: number | null
   has_more: boolean
 }
 

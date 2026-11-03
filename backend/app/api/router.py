@@ -578,15 +578,23 @@ def list_runs(
     run_date: date | None = Query(default=None, alias="date"),
     status: str | None = Query(default=None),
     before_id: int | None = Query(default=None, ge=1),
+    before_started_at: datetime | None = Query(default=None),
     db: Session = Depends(get_db),
     _user: str = Depends(get_current_user),
 ) -> list[RunSummaryRead]:
-    return aniu_service.list_runs(
+    """运行列表（窄列投影，不读取 LLM 原始载荷）。
+
+    分页优先使用 (before_started_at, before_id) 双字段游标；
+    只传 before_id 时退化为 id 游标（兼容旧客户端）。
+    """
+    return aniu_service.list_run_summaries(
         db,
         limit=limit,
         run_date=run_date,
         status=status,
         before_id=before_id,
+        cursor_started_at=before_started_at,
+        cursor_id=before_id,
     )
 
 
@@ -596,15 +604,19 @@ def list_runs_feed(
     run_date: date | None = Query(default=None, alias="date"),
     status: str | None = Query(default=None),
     before_id: int | None = Query(default=None, ge=1),
+    before_started_at: datetime | None = Query(default=None),
     db: Session = Depends(get_db),
     _user: str = Depends(get_current_user),
 ) -> RunSummaryPageRead:
+    """运行列表分页（窄列投影 + 双字段游标）。"""
     return aniu_service.list_runs_page(
         db,
         limit=limit,
         run_date=run_date,
         status=status,
         before_id=before_id,
+        cursor_started_at=before_started_at,
+        cursor_id=before_id,
     )
 
 

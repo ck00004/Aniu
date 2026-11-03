@@ -40,7 +40,18 @@ def get_engine():
         def _set_sqlite_pragma(dbapi_connection, _connection_record):
             cursor = dbapi_connection.cursor()
             cursor.execute("PRAGMA journal_mode=WAL")
-            cursor.execute("PRAGMA synchronous=NORMAL")
+            # 耐久性/缓存/映射策略走配置：交易库可用 SQLITE_SYNCHRONOUS=FULL。
+            synchronous = str(settings.sqlite_synchronous or "NORMAL").strip().upper()
+            if synchronous not in {"OFF", "NORMAL", "FULL", "EXTRA"}:
+                synchronous = "NORMAL"
+            cursor.execute(f"PRAGMA synchronous={synchronous}")
+            # 外键约束默认关闭，必须逐连接显式开启（阶段 D）。
+            # 开启前已用 PRAGMA foreign_key_check 验证历史数据零违规。
+            cursor.execute("PRAGMA foreign_keys=ON")
+            if settings.sqlite_cache_kib:
+                cursor.execute(f"PRAGMA cache_size={int(settings.sqlite_cache_kib)}")
+            if settings.sqlite_mmap_bytes:
+                cursor.execute(f"PRAGMA mmap_size={int(settings.sqlite_mmap_bytes)}")
             cursor.close()
 
     return _engine
@@ -578,6 +589,13 @@ def _ensure_strategy_run_columns(engine) -> None:
         "response_message_id": "ALTER TABLE strategy_runs ADD COLUMN response_message_id INTEGER",
         "context_summary_version": "ALTER TABLE strategy_runs ADD COLUMN context_summary_version INTEGER",
         "context_tokens_estimate": "ALTER TABLE strategy_runs ADD COLUMN context_tokens_estimate INTEGER",
+        # 运行统计快照列：列表/概览接口只读这些窄列，
+        # 不再为了算 Token 与调用次数加载 llm_request_payload 等大 JSON。
+        "input_tokens": "ALTER TABLE strategy_runs ADD COLUMN input_tokens INTEGER",
+        "output_tokens": "ALTER TABLE strategy_runs ADD COLUMN output_tokens INTEGER",
+        "total_tokens": "ALTER TABLE strategy_runs ADD COLUMN total_tokens INTEGER",
+        "api_call_count": "ALTER TABLE strategy_runs ADD COLUMN api_call_count INTEGER",
+        "executed_trade_count": "ALTER TABLE strategy_runs ADD COLUMN executed_trade_count INTEGER",
     }
 
     with engine.begin() as connection:
@@ -615,6 +633,14 @@ def _ensure_strategy_run_indexes(engine) -> None:
     if "ix_strategy_runs_schedule_id" not in index_names:
         statements.append(
             "CREATE INDEX ix_strategy_runs_schedule_id ON strategy_runs (schedule_id)"
+        )
+    # 状态 + 时间排序的组合索引：原本 status 过滤会退化成
+    # SEARCH(status) + USE TEMP B-TREE FOR ORDER BY。
+    # 注意：首次创建需全表扫描一次（当前库约 4.7GB），属于一次性成本。
+    if "ix_strategy_runs_status_started_id" not in index_names:
+        statements.append(
+            "CREATE INDEX ix_strategy_runs_status_started_id "
+            "ON strategy_runs (status, started_at DESC, id DESC)"
         )
 
     if not statements:
@@ -666,6 +692,13 @@ def _ensure_chat_message_indexes(engine) -> None:
     statements: list[str] = []
     if "ix_chat_messages_run_id" not in index_names:
         statements.append("CREATE INDEX ix_chat_messages_run_id ON chat_messages (run_id)")
+    # 自动化会话历史读取按 (session_id, message_kind, id) 过滤 + 倒序取最近 N 条，
+    # 组合索引让 LIMIT 下推后只读需要的页。
+    if "ix_chat_messages_session_kind_id" not in index_names:
+        statements.append(
+            "CREATE INDEX ix_chat_messages_session_kind_id "
+            "ON chat_messages (session_id, message_kind, id DESC)"
+        )
 
     if not statements:
         return

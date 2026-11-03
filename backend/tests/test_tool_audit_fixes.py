@@ -244,7 +244,21 @@ def test_trade_timeout_reports_unknown_state_and_does_not_resend(
 # ---------------------------------------------------------------------------
 
 
+def _ensure_run_row(db, run_id: int = 1) -> int:
+    """外键开启后，动作必须先有父运行记录（历史上 FK 未生效时可省略）。"""
+    from app.db.models import StrategyRun
+
+    existing = db.get(StrategyRun, run_id)
+    if existing is not None:
+        return int(existing.id)
+    run = StrategyRun(id=run_id, trigger_source="schedule", run_type="trade")
+    db.add(run)
+    db.flush()
+    return int(run.id)
+
+
 def _seed_action(db, *, status: str = "planned", run_id: int = 1) -> int:
+    _ensure_run_row(db, run_id)
     action = StrategyRunAction(
         run_id=run_id,
         sequence_no=1,

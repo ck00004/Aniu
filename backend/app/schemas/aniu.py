@@ -265,7 +265,11 @@ class RunDetailRead(RunSummaryRead):
 
 class RunSummaryPageRead(BaseModel):
     items: list[RunSummaryRead] = Field(default_factory=list)
+    # 兼容旧客户端：只按 id 的游标。
     next_before_id: int | None = None
+    # 双字段游标 (started_at, id)：排序键与游标键一致，避免漏行/重复。
+    next_cursor_started_at: datetime | None = None
+    next_cursor_id: int | None = None
     has_more: bool = False
 
 

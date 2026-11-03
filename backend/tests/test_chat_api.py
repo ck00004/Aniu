@@ -673,8 +673,10 @@ def test_chat_context_tools_list_and_read_run_detail(monkeypatch, tmp_path) -> N
 
 
 def test_runs_endpoint_returns_lightweight_summary(monkeypatch, tmp_path) -> None:
+    """列表接口只读统计快照列，不再为了算指标去解析大 JSON。"""
     with create_test_client(monkeypatch, tmp_path) as client:
         with session_scope() as db:
+            # 模拟 run 收尾时已写入统计快照列（新契约）。
             db.add(
                 StrategyRun(
                     trigger_source="manual",
@@ -683,6 +685,11 @@ def test_runs_endpoint_returns_lightweight_summary(monkeypatch, tmp_path) -> Non
                     status="completed",
                     analysis_summary="摘要",
                     final_answer="详细输出",
+                    api_call_count=1,
+                    executed_trade_count=1,
+                    input_tokens=11,
+                    output_tokens=22,
+                    total_tokens=33,
                     decision_payload={
                         "tool_calls": [
                             {"name": "mx_query_market"},
@@ -699,15 +706,30 @@ def test_runs_endpoint_returns_lightweight_summary(monkeypatch, tmp_path) -> Non
                     },
                 )
             )
+            # 历史行（未回填统计列）：列表返回 0/None，而不是运行时回算。
+            db.add(
+                StrategyRun(
+                    trigger_source="schedule",
+                    run_type="analysis",
+                    schedule_name="午间复盘",
+                    status="completed",
+                    llm_response_payload={
+                        "usage": {
+                            "prompt_tokens": 7,
+                            "completion_tokens": 8,
+                            "total_tokens": 15,
+                        }
+                    },
+                )
+            )
 
         headers = _auth_headers(client)
         response = client.get("/api/aniu/runs?limit=20", headers=headers)
 
     assert response.status_code == 200
     payload = response.json()
-    assert len(payload) == 1
-    run = payload[0]
-    assert run["analysis_summary"] == "摘要"
+    assert len(payload) == 2
+    run = next(item for item in payload if item["analysis_summary"] == "摘要")
     assert run["api_call_count"] == 1
     assert run["executed_trade_count"] == 1
     assert run["input_tokens"] == 11
@@ -716,6 +738,12 @@ def test_runs_endpoint_returns_lightweight_summary(monkeypatch, tmp_path) -> Non
     assert "final_answer" not in run
     assert "decision_payload" not in run
     assert "executed_actions" not in run
+    assert "llm_response_payload" not in run
+
+    legacy = next(item for item in payload if item["analysis_summary"] is None)
+    assert legacy["api_call_count"] == 0
+    assert legacy["executed_trade_count"] == 0
+    assert legacy["input_tokens"] is None
 
     database_module._engine = None
     database_module._session_local = None
@@ -835,6 +863,11 @@ def test_runtime_overview_endpoint_returns_aggregated_stats(monkeypatch, tmp_pat
                         run_type="analysis",
                         status="completed",
                         analysis_summary="today-1",
+                        api_call_count=2,
+                        executed_trade_count=1,
+                        input_tokens=10,
+                        output_tokens=20,
+                        total_tokens=30,
                         decision_payload={
                             "tool_calls": [
                                 {"name": "mx_query_market"},
@@ -858,6 +891,11 @@ def test_runtime_overview_endpoint_returns_aggregated_stats(monkeypatch, tmp_pat
                         run_type="analysis",
                         status="failed",
                         analysis_summary="today-2",
+                        api_call_count=1,
+                        executed_trade_count=0,
+                        input_tokens=5,
+                        output_tokens=6,
+                        total_tokens=11,
                         decision_payload={
                             "tool_calls": [
                                 {"name": "mx_get_balance"},

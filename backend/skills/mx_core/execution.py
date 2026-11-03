@@ -1166,6 +1166,17 @@ class MXExecutionService:
             trade_intent_service,
         )
 
+        if run_id is None:
+            # 审计缺口告警：意图挡板仍生效（去重/阻塞），但没有 run 记录，
+            # 交易无法回溯到某次运行与分析决策。正常路径（定时/手动 run、
+            # 执行计划）都必须带 run_id，缺失说明走的是 chat 直连等旁路。
+            logger.warning(
+                "trade executed without run context: symbol=%s side=%s qty=%s",
+                symbol,
+                action,
+                quantity,
+            )
+
         intent = trade_intent_service.check_and_register_trade_intent(
             client=client,
             symbol=symbol,

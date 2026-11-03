@@ -15,7 +15,7 @@ from types import SimpleNamespace
 from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.auth import create_access_token
@@ -37,6 +37,7 @@ from app.db.models import (
     StrategyRun,
     StrategyRunAction,
     StrategySchedule,
+    TradeIntent,
     TradeOrder,
 )
 from app.schemas.aniu import AppSettingsUpdate, ChatRequest, ScheduleUpdate
@@ -51,6 +52,7 @@ from app.services.cls_news_service import cls_news_service
 from app.services.jin10_news_service import jin10_news_service
 from app.services.llm_service import LLMStreamCancelled, llm_service
 from app.services.run_abort_service import run_abort_registry
+from app.services.run_payload_service import run_payload_service
 from app.services.mx_skill_service import mx_skill_service
 from app.services.mx_service import MXClient
 from app.services.token_estimator import (
@@ -589,16 +591,91 @@ class AniuService:
         )
         return self.list_schedules(db)
 
-    def list_runs(
+    def _resolve_run_type_from_columns(
+        self, run_type: str | None, schedule_name: str | None
+    ) -> str:
+        """不使用大 JSON 的 run_type 判定（列表/概览路径专用）。
+
+        `_infer_run_type` 会回落到 trade_orders / 工具调用名，必须加载
+        llm/skill payload；列表路径不允许付这个代价，改为只看列与任务名。
+        """
+        normalized = str(run_type or "").strip().lower()
+        if normalized in {"analysis", "trade"}:
+            return normalized
+        name = str(schedule_name or "").strip()
+        if name in ANALYSIS_TASK_NAMES:
+            return "analysis"
+        if name.startswith("上午运行") or name.startswith("下午运行"):
+            return "trade"
+        return "analysis"
+
+    def _run_summary_columns(self) -> tuple[Any, ...]:
+        """列表/概览可安全读取的窄列集合（绝不包含四个大 JSON 字段）。"""
+        return (
+            StrategyRun.id,
+            StrategyRun.trigger_source,
+            StrategyRun.run_type,
+            StrategyRun.schedule_id,
+            StrategyRun.schedule_name,
+            StrategyRun.chat_session_id,
+            StrategyRun.prompt_message_id,
+            StrategyRun.response_message_id,
+            StrategyRun.context_summary_version,
+            StrategyRun.context_tokens_estimate,
+            StrategyRun.status,
+            StrategyRun.analysis_summary,
+            StrategyRun.error_message,
+            StrategyRun.input_tokens,
+            StrategyRun.output_tokens,
+            StrategyRun.total_tokens,
+            StrategyRun.api_call_count,
+            StrategyRun.executed_trade_count,
+            StrategyRun.started_at,
+            StrategyRun.finished_at,
+        )
+
+    def _to_naive_utc(self, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+    def _run_summary_from_row(self, row: Any) -> dict[str, Any]:
+        return {
+            "id": int(row["id"]),
+            "trigger_source": str(row["trigger_source"] or "manual"),
+            "run_type": self._resolve_run_type_from_columns(
+                row["run_type"], row["schedule_name"]
+            ),
+            "schedule_id": row["schedule_id"],
+            "schedule_name": row["schedule_name"],
+            "chat_session_id": row["chat_session_id"],
+            "prompt_message_id": row["prompt_message_id"],
+            "response_message_id": row["response_message_id"],
+            "context_summary_version": row["context_summary_version"],
+            "context_tokens_estimate": row["context_tokens_estimate"],
+            "status": str(row["status"] or ""),
+            "analysis_summary": row["analysis_summary"],
+            "error_message": row["error_message"],
+            # 历史行尚未回填时保持 0/None，绝不在请求内运行时补算。
+            "api_call_count": int(row["api_call_count"] or 0),
+            "executed_trade_count": int(row["executed_trade_count"] or 0),
+            "input_tokens": row["input_tokens"],
+            "output_tokens": row["output_tokens"],
+            "total_tokens": row["total_tokens"],
+            "started_at": _assume_utc(row["started_at"]),
+            "finished_at": _assume_utc(row["finished_at"]),
+        }
+
+    def _apply_run_filters(
         self,
-        db: Session,
-        limit: int = 20,
+        stmt: Any,
+        *,
         run_date: date | None = None,
         status: str | None = None,
         before_id: int | None = None,
-    ) -> list[StrategyRun]:
-        stmt = select(StrategyRun)
-
+        cursor_started_at: datetime | None = None,
+        cursor_id: int | None = None,
+    ) -> Any:
         if run_date is not None:
             # run_date 是用户选择的上海日历日；started_at 存储为 naive UTC，
             # 因此先把上海日界换算成 UTC 再比较，避免凌晨 0-8 点的运行归错日期。
@@ -617,16 +694,72 @@ class AniuService:
         if normalized_status:
             stmt = stmt.where(StrategyRun.status == normalized_status)
 
-        if before_id is not None:
+        # 游标分页：排序键 (started_at DESC, id DESC)，游标必须同键比较，
+        # 否则时间戳与 id 顺序不一致时会漏行/重复（旧实现只按 id < before_id）。
+        if cursor_started_at is not None and cursor_id is not None:
+            cursor_naive = self._to_naive_utc(cursor_started_at)
+            stmt = stmt.where(
+                or_(
+                    StrategyRun.started_at < cursor_naive,
+                    and_(
+                        StrategyRun.started_at == cursor_naive,
+                        StrategyRun.id < int(cursor_id),
+                    ),
+                )
+            )
+        elif before_id is not None:
             stmt = stmt.where(StrategyRun.id < before_id)
 
-        stmt = stmt.order_by(StrategyRun.started_at.desc(), StrategyRun.id.desc()).limit(
-            limit
+        return stmt
+
+    def list_run_summaries(
+        self,
+        db: Session,
+        limit: int = 20,
+        run_date: date | None = None,
+        status: str | None = None,
+        before_id: int | None = None,
+        cursor_started_at: datetime | None = None,
+        cursor_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """运行列表的轻量查询：只读窄列，不加载任何原始载荷字段。"""
+        stmt = self._apply_run_filters(
+            select(*self._run_summary_columns()),
+            run_date=run_date,
+            status=status,
+            before_id=before_id,
+            cursor_started_at=cursor_started_at,
+            cursor_id=cursor_id,
         )
-        runs = list(db.scalars(stmt).all())
-        for run in runs:
-            self._hydrate_run_datetimes(run, include_display_fields=False)
-        return runs
+        stmt = stmt.order_by(StrategyRun.started_at.desc(), StrategyRun.id.desc()).limit(
+            max(1, int(limit))
+        )
+        rows = db.execute(stmt).mappings().all()
+        return [self._run_summary_from_row(row) for row in rows]
+
+    def list_runs(
+        self,
+        db: Session,
+        limit: int = 20,
+        run_date: date | None = None,
+        status: str | None = None,
+        before_id: int | None = None,
+        cursor_started_at: datetime | None = None,
+        cursor_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """兼容旧调用名：等同 list_run_summaries（不再返回重量级 ORM 对象）。
+
+        需要完整载荷的调用方必须显式走 get_run() / 专用查询。
+        """
+        return self.list_run_summaries(
+            db,
+            limit=limit,
+            run_date=run_date,
+            status=status,
+            before_id=before_id,
+            cursor_started_at=cursor_started_at,
+            cursor_id=cursor_id,
+        )
 
     def list_runs_page(
         self,
@@ -635,21 +768,27 @@ class AniuService:
         run_date: date | None = None,
         status: str | None = None,
         before_id: int | None = None,
+        cursor_started_at: datetime | None = None,
+        cursor_id: int | None = None,
     ) -> dict[str, Any]:
         page_size = max(1, limit)
-        runs = self.list_runs(
+        items = self.list_run_summaries(
             db,
             limit=page_size + 1,
             run_date=run_date,
             status=status,
             before_id=before_id,
+            cursor_started_at=cursor_started_at,
+            cursor_id=cursor_id,
         )
-        has_more = len(runs) > page_size
-        items = runs[:page_size]
-        next_before_id = items[-1].id if has_more and items else None
+        has_more = len(items) > page_size
+        items = items[:page_size]
+        next_item = items[-1] if has_more and items else None
         return {
             "items": items,
-            "next_before_id": next_before_id,
+            "next_before_id": int(next_item["id"]) if next_item else None,
+            "next_cursor_started_at": next_item["started_at"] if next_item else None,
+            "next_cursor_id": int(next_item["id"]) if next_item else None,
             "has_more": has_more,
         }
 
@@ -657,18 +796,47 @@ class AniuService:
         # 按时间窗口查询而非"最近 100 条"：默认调度密度（交易日每 30 分钟）
         # 下 3 个交易日即可超过 100 条，内存子集过滤会让近 3/7 天统计
         # 系统性偏低。
+        #
+        # 这里只取窄列（状态/时间/统计快照列），不再加载四个大 JSON：
+        # 旧实现一次请求最多物化 1000 条完整 StrategyRun。
         window_start = (
             now_utc() - timedelta(days=7)
         ).replace(tzinfo=None)
         stmt = (
-            select(StrategyRun)
+            select(
+                StrategyRun.id,
+                StrategyRun.status,
+                StrategyRun.run_type,
+                StrategyRun.schedule_name,
+                StrategyRun.started_at,
+                StrategyRun.finished_at,
+                StrategyRun.input_tokens,
+                StrategyRun.output_tokens,
+                StrategyRun.total_tokens,
+                StrategyRun.api_call_count,
+                StrategyRun.executed_trade_count,
+            )
             .where(StrategyRun.started_at >= window_start)
             .order_by(StrategyRun.started_at.desc(), StrategyRun.id.desc())
             .limit(1000)
         )
-        runs = list(db.scalars(stmt).all())
-        for run in runs:
-            self._hydrate_run_datetimes(run, include_display_fields=False)
+        runs = [
+            SimpleNamespace(
+                id=int(row["id"]),
+                status=str(row["status"] or ""),
+                run_type=self._resolve_run_type_from_columns(
+                    row["run_type"], row["schedule_name"]
+                ),
+                started_at=_assume_utc(row["started_at"]),
+                finished_at=_assume_utc(row["finished_at"]),
+                input_tokens=row["input_tokens"],
+                output_tokens=row["output_tokens"],
+                total_tokens=row["total_tokens"],
+                api_call_count=row["api_call_count"],
+                executed_trade_count=row["executed_trade_count"],
+            )
+            for row in db.execute(stmt).mappings().all()
+        ]
         latest_run = runs[0] if runs else None
         return {
             "last_run": self._build_runtime_last_run(latest_run),
@@ -752,6 +920,14 @@ class AniuService:
         )
         run = db.scalar(stmt)
         if run is not None:
+            # 阶段 C：热表旧字段可能已被清空，用冷表补齐后再做展示字段派生。
+            # 冷表也拿不到时保持 None（前端显示"无原始载荷"），不阻断详情。
+            try:
+                run_payload_service.hydrate_run(db, run)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "hydrate_run payloads failed: run_id=%s err=%s", run_id, exc
+                )
             self._hydrate_run_datetimes(run, include_display_fields=True)
         return run
 
@@ -889,8 +1065,35 @@ class AniuService:
             if self._run_lock.locked():
                 raise RuntimeError("当前仍有任务正在执行，暂不能强制删除，请稍后重试。")
 
+        # 阶段 D：交易意图是审计记录，删除运行会解除它与意图的关联。
+        # 不静默处理——除非调用方显式 force，否则要求人工确认。
+        intent_count = int(
+            db.scalar(
+                select(func.count(TradeIntent.id)).where(TradeIntent.run_id == run_id)
+            )
+            or 0
+        )
+        if intent_count > 0 and not force:
+            raise RuntimeError(
+                f"该运行存在 {intent_count} 条交易意图（交易审计记录），"
+                "默认不允许删除。确认要删除请传 force=true，"
+                "届时意图记录会保留，但与本次运行/动作的关联会被解除。"
+            )
+
         related_session_id = run.chat_session_id
         db.execute(delete(ChatMessageRecord).where(ChatMessageRecord.run_id == run_id))
+        if intent_count > 0:
+            # 显式解除关联（外键 ON DELETE SET NULL 的等价语义，且留痕）
+            db.execute(
+                TradeIntent.__table__.update()
+                .where(TradeIntent.run_id == run_id)
+                .values(run_id=None, action_id=None)
+            )
+            logger.warning(
+                "run deleted with %s trade intents (linkage cleared): run_id=%s",
+                intent_count,
+                run_id,
+            )
         db.delete(run)
 
         if related_session_id is not None:
@@ -935,6 +1138,57 @@ class AniuService:
         run.input_tokens = token_usage["input"]
         run.output_tokens = token_usage["output"]
         run.total_tokens = token_usage["total"]
+
+    def _warn_on_unregistered_trade_intents(
+        self, db: Session, *, run_id: int, executed_actions: Any
+    ) -> None:
+        """安全网：真实买卖动作必须有对应的 trade_intents 记录。
+
+        交易意图挡板挂在 `skills/mx_core/execution.py::_handle_moni_trade`
+        上（真实下单的唯一出口）。一旦出现"执行了买卖却没有意图行"，
+        说明该路径绕过了挡板（例如未来新增的执行入口），必须立刻可见。
+        这里是只读检查 + 告警，不改变运行状态。
+        """
+        actions = executed_actions if isinstance(executed_actions, list) else []
+        trade_actions = [
+            item
+            for item in actions
+            if isinstance(item, dict)
+            and str(item.get("action") or "").upper() in {"BUY", "SELL", "CANCEL"}
+        ]
+        if not trade_actions:
+            return
+        try:
+            registered = int(
+                db.scalar(
+                    select(func.count(TradeIntent.id)).where(
+                        TradeIntent.run_id == run_id
+                    )
+                )
+                or 0
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "trade intent safety-net check failed: run_id=%s err=%s", run_id, exc
+            )
+            return
+        if registered >= len(trade_actions):
+            return
+        logger.warning(
+            "trade executed without registered intent: run_id=%s trades=%s intents=%s "
+            "actions=%s",
+            run_id,
+            len(trade_actions),
+            registered,
+            [
+                {
+                    "action": item.get("action"),
+                    "symbol": item.get("symbol"),
+                    "intent_id": item.get("intent_id"),
+                }
+                for item in trade_actions
+            ],
+        )
 
     def _hydrate_run_display_fields(self, run: StrategyRun) -> None:
         run.output_markdown = (
@@ -992,7 +1246,7 @@ class AniuService:
             return local_started.date() == local_now.date()
         return now - timestamp <= timedelta(days=days)
 
-    def _build_runtime_last_run(self, run: StrategyRun | None) -> dict[str, Any]:
+    def _build_runtime_last_run(self, run: Any) -> dict[str, Any]:
         if run is None:
             return {
                 "start_time": "--",
@@ -1017,7 +1271,7 @@ class AniuService:
         }
 
     def _build_runtime_summary_section(
-        self, runs: list[StrategyRun]
+        self, runs: list[Any]
     ) -> dict[str, Any]:
         analysis_count = len(runs)
         success_count = sum(1 for run in runs if run.status == "completed")
@@ -1597,24 +1851,46 @@ class AniuService:
 
         with session_scope() as db:
             settings = self.get_or_create_settings(db)
-            cached_balance_result, cached_positions_result, cached_orders_result = (
-                self._get_recent_account_snapshot(db)
+
+        # 历史任务快照是"远端接口失败时的兜底数据"，旧实现在每次 /account
+        # 请求里无条件扫描最近 20 条完整 StrategyRun（每条约 5-9MB 载荷），
+        # 属于纯浪费。改为惰性加载：只有真正需要兜底时才读一次。
+        cached_snapshot: dict[str, Any] = {}
+
+        def _load_cached_snapshot() -> tuple[
+            dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None
+        ]:
+            if not cached_snapshot:
+                with session_scope() as snap_db:
+                    balance, positions, orders = self._get_recent_account_snapshot(
+                        snap_db
+                    )
+                cached_snapshot["balance"] = balance
+                cached_snapshot["positions"] = positions
+                cached_snapshot["orders"] = orders
+            return (
+                cached_snapshot.get("balance"),
+                cached_snapshot.get("positions"),
+                cached_snapshot.get("orders"),
             )
 
         errors: list[str] = []
-        balance_result = cached_balance_result
-        positions_result = cached_positions_result
-        orders_result = cached_orders_result
+        balance_result: dict[str, Any] | None = None
+        positions_result: dict[str, Any] | None = None
+        orders_result: dict[str, Any] | None = None
         client: MXClient | None = None
 
         if settings.mx_api_key:
             try:
                 client = MXClient(api_key=settings.mx_api_key)
             except Exception as exc:
+                cached_balance_result, cached_positions_result, cached_orders_result = (
+                    _load_cached_snapshot()
+                )
                 if (
-                    balance_result is None
-                    and positions_result is None
-                    and orders_result is None
+                    cached_balance_result is None
+                    and cached_positions_result is None
+                    and cached_orders_result is None
                 ):
                     return self._build_account_response(
                         balance_result=None,
@@ -1626,9 +1902,9 @@ class AniuService:
 
                 errors.append(f"{str(exc)}，当前展示最近一次任务缓存的账户数据。")
                 overview = self._build_account_response(
-                    balance_result=balance_result,
-                    positions_result=positions_result,
-                    orders_result=orders_result,
+                    balance_result=cached_balance_result,
+                    positions_result=cached_positions_result,
+                    orders_result=cached_orders_result,
                     errors=errors,
                     include_raw=include_raw,
                 )
@@ -1640,6 +1916,9 @@ class AniuService:
 
                 balance_payload = live_payloads["balance"]
                 if not balance_payload.get("ok"):
+                    cached_balance_result, cached_positions_result, cached_orders_result = (
+                        _load_cached_snapshot()
+                    )
                     if cached_balance_result is not None:
                         balance_result = cached_balance_result
                         errors.append(
@@ -1655,6 +1934,9 @@ class AniuService:
 
                 positions_payload = live_payloads["positions"]
                 if not positions_payload.get("ok"):
+                    cached_balance_result, cached_positions_result, cached_orders_result = (
+                        _load_cached_snapshot()
+                    )
                     if cached_positions_result is not None:
                         positions_result = cached_positions_result
                         errors.append(
@@ -1670,6 +1952,9 @@ class AniuService:
 
                 orders_payload = live_payloads["orders"]
                 if not orders_payload.get("ok"):
+                    cached_balance_result, cached_positions_result, cached_orders_result = (
+                        _load_cached_snapshot()
+                    )
                     if cached_orders_result is not None:
                         orders_result = cached_orders_result
                         errors.append(
@@ -1682,19 +1967,26 @@ class AniuService:
                         )
                 else:
                     orders_result = orders_payload.get("result")
-            elif (
-                balance_result is None
-                and positions_result is None
-                and orders_result is None
-            ):
-                return self._build_account_response(
-                    balance_result=None,
-                    positions_result=None,
-                    orders_result=None,
-                    errors=errors
-                    or ["未配置 MX API Key，且没有可用缓存账户数据。"],
-                    include_raw=include_raw,
-                )
+            else:
+                # 没有 MX API Key：只能退回最近一次任务缓存。
+                (
+                    balance_result,
+                    positions_result,
+                    orders_result,
+                ) = _load_cached_snapshot()
+                if (
+                    balance_result is None
+                    and positions_result is None
+                    and orders_result is None
+                ):
+                    return self._build_account_response(
+                        balance_result=None,
+                        positions_result=None,
+                        orders_result=None,
+                        errors=errors
+                        or ["未配置 MX API Key，且没有可用缓存账户数据。"],
+                        include_raw=include_raw,
+                    )
         finally:
             if client is not None:
                 client.close()
@@ -2697,6 +2989,7 @@ class AniuService:
         *,
         settings: Any,
         client: MXClient,
+        run_id: int | None = None,
     ) -> Any:
         """构建"变更工具只生成计划、不直接执行"的工具执行器。
 
@@ -2722,6 +3015,8 @@ class AniuService:
                     "client": client,
                     "app_settings": settings,
                     "run_type": run_type,
+                    # 透传 run_id：交易意图与执行动作回填都依赖它建立追溯链。
+                    "run_id": run_id,
                 },
                 sequence_no=next_sequence,
             )
@@ -2804,6 +3099,7 @@ class AniuService:
                 _planning_tool_executor = self._build_planning_tool_executor(
                     settings=settings,
                     client=client,
+                    run_id=run_id,
                 )
 
                 decision, llm_request, llm_response, runtime_trace = (
@@ -3047,9 +3343,24 @@ class AniuService:
                 )
                 run.error_message = run_error_message
                 run.executed_actions = executed_actions
+                # 统计快照写入窄列：列表/概览接口后续只读这些列，
+                # 不再为了算 Token 与调用次数去解析大 JSON。
+                self._hydrate_run_summary_metrics(run)
+                # 阶段 C：原始载荷双写冷表（gzip），读取优先冷表。
+                try:
+                    run_payload_service.store_run_payloads(db, run)
+                except Exception as exc:  # noqa: BLE001
+                    # 冷表写入失败绝不能影响运行收尾（交易已完成）
+                    logger.warning(
+                        "store_run_payloads failed: run_id=%s err=%s", run_id, exc
+                    )
                 run.status = "completed" if not run_error_message else "failed"
                 run.finished_at = completed_at
                 db.add(run)
+
+                self._warn_on_unregistered_trade_intents(
+                    db, run_id=run_id, executed_actions=executed_actions
+                )
 
                 for action in executed_actions:
                     if str(action.get("action") or "") not in {"BUY", "SELL"}:
@@ -3181,6 +3492,7 @@ class AniuService:
                     run.status = "failed"
                     run.error_message = abort_message
                     run.final_answer = None
+                    self._hydrate_run_summary_metrics(run)
                     run.finished_at = now_utc()
                     db.add(run)
                     if schedule_id:
@@ -3223,6 +3535,7 @@ class AniuService:
                     run.status = "failed"
                     run.error_message = str(exc)
                     run.final_answer = None
+                    self._hydrate_run_summary_metrics(run)
                     run.finished_at = now_utc()
                     db.add(run)
                     if session_context is not None:
@@ -3434,13 +3747,41 @@ class AniuService:
         dict[str, Any] | None,
         dict[str, Any] | None,
     ]:
-        stmt = select(StrategyRun).order_by(StrategyRun.started_at.desc()).limit(20)
+        # 只取 id 列先定位候选运行（不整行物化），再逐条按需取载荷：
+        # 原始载荷优先从冷表解压（阶段 C），未回填的历史行回退热表旧字段。
+        stmt = (
+            select(StrategyRun.id)
+            .order_by(StrategyRun.started_at.desc(), StrategyRun.id.desc())
+            .limit(12)
+        )
 
         balance_result: dict[str, Any] | None = None
         positions_result: dict[str, Any] | None = None
         orders_result: dict[str, Any] | None = None
 
-        for run in db.scalars(stmt).all():
+        for candidate in db.execute(stmt).mappings().all():
+            run_id = int(candidate["id"])
+            legacy = db.execute(
+                select(
+                    StrategyRun.skill_payloads,
+                    StrategyRun.decision_payload,
+                ).where(StrategyRun.id == run_id)
+            ).mappings().first()
+            skill_payloads = legacy["skill_payloads"] if legacy is not None else None
+            decision_payload = (
+                legacy["decision_payload"] if legacy is not None else None
+            )
+            if skill_payloads is None:
+                cold = run_payload_service.load_run_payloads(
+                    db, run_id, payload_types=("skill", "decision")
+                )
+                skill_payloads = cold.get("skill")
+                decision_payload = cold.get("decision")
+            run = SimpleNamespace(
+                id=run_id,
+                skill_payloads=skill_payloads,
+                decision_payload=decision_payload,
+            )
             tool_calls = self._get_run_tool_calls(run)
             if not tool_calls:
                 continue
@@ -5990,19 +6331,21 @@ class AniuService:
         recent_limit: int,
     ) -> list[ChatMessageRecord]:
         limit = max(4, int(recent_limit or AUTOMATION_DEFAULT_RECENT_MESSAGE_LIMIT))
-        records = self._list_unarchived_persistent_session_records(
+        # 直接下推 LIMIT：旧实现先取全部未归档消息再在 Python 里切片，
+        # 最坏会话有近 2000 条 live_turn，每次构建上下文都全量读取。
+        return self._list_unarchived_persistent_session_records(
             db=db,
             session_id=session_id,
+            limit=limit,
         )
-        if len(records) <= limit:
-            return records
-        return records[-limit:]
 
     def _list_unarchived_persistent_session_records(
         self,
         *,
         db: Session,
         session_id: int,
+        limit: int | None = None,
+        oldest_first: bool = False,
     ) -> list[ChatMessageRecord]:
         session = db.get(ChatSession, session_id)
         last_compacted_message_id = int(
@@ -6014,13 +6357,37 @@ class AniuService:
                 ChatMessageRecord.session_id == session_id,
                 ChatMessageRecord.message_kind == "live_turn",
             )
-            .order_by(ChatMessageRecord.id.desc())
+            .order_by(
+                ChatMessageRecord.id.asc() if oldest_first else ChatMessageRecord.id.desc()
+            )
         )
         if last_compacted_message_id > 0:
             stmt = stmt.where(ChatMessageRecord.id > last_compacted_message_id)
-        records = db.execute(stmt).scalars().all()
+        if limit is not None:
+            stmt = stmt.limit(max(0, int(limit)))
+        records = list(db.execute(stmt).scalars().all())
+        if oldest_first:
+            return records
         records.reverse()
         return records
+
+    def _count_unarchived_persistent_session_records(
+        self,
+        *,
+        db: Session,
+        session_id: int,
+    ) -> int:
+        session = db.get(ChatSession, session_id)
+        last_compacted_message_id = int(
+            getattr(session, "last_compacted_message_id", 0) or 0
+        )
+        stmt = select(func.count(ChatMessageRecord.id)).where(
+            ChatMessageRecord.session_id == session_id,
+            ChatMessageRecord.message_kind == "live_turn",
+        )
+        if last_compacted_message_id > 0:
+            stmt = stmt.where(ChatMessageRecord.id > last_compacted_message_id)
+        return int(db.scalar(stmt) or 0)
 
     def _build_persistent_session_history_messages(
         self, records: list[ChatMessageRecord]
@@ -6176,7 +6543,7 @@ class AniuService:
         self,
         *,
         session: ChatSession,
-        records: list[ChatMessageRecord],
+        active_count: int,
         settings: Any,
         estimated_tokens: int,
     ) -> bool:
@@ -6186,7 +6553,7 @@ class AniuService:
             getattr(settings, "automation_recent_message_limit", 0)
             or AUTOMATION_DEFAULT_RECENT_MESSAGE_LIMIT
         )
-        if len(records) > recent_limit:
+        if active_count > recent_limit:
             return True
         if estimated_tokens > self._safe_prompt_budget(settings):
             return True
@@ -6208,13 +6575,14 @@ class AniuService:
         settings: Any,
         estimated_tokens: int,
     ) -> tuple[str | None, int | None]:
-        active_records = self._list_unarchived_persistent_session_records(
+        # 只取计数做判定：旧实现为了判断"是否超限"先全量加载未归档消息。
+        active_count = self._count_unarchived_persistent_session_records(
             db=db,
             session_id=session.id,
         )
         if not self._should_compact_automation_session(
             session=session,
-            records=active_records,
+            active_count=active_count,
             settings=settings,
             estimated_tokens=estimated_tokens,
         ):
@@ -6228,12 +6596,21 @@ class AniuService:
             )
             // 2,
         )
-        compact_cutoff = max(0, len(active_records) - recent_limit)
-        compact_candidates = active_records[:compact_cutoff]
-        if len(compact_candidates) < 2:
+        compact_cutoff = max(0, active_count - recent_limit)
+        if compact_cutoff < 2:
             return session.archived_summary, session.summary_revision
-        if len(compact_candidates) % 2 == 1:
-            compact_candidates = compact_candidates[:-1]
+        if compact_cutoff % 2 == 1:
+            # 保持成对压缩（user/assistant 一轮两条），避免切在半个回合上。
+            compact_cutoff -= 1
+        if compact_cutoff < 2:
+            return session.archived_summary, session.summary_revision
+        # 只取要压缩的最旧一批（升序），不再先全量加载再切片。
+        compact_candidates = self._list_unarchived_persistent_session_records(
+            db=db,
+            session_id=session.id,
+            limit=compact_cutoff,
+            oldest_first=True,
+        )
         if len(compact_candidates) < 2:
             return session.archived_summary, session.summary_revision
 

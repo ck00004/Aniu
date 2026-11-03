@@ -28,12 +28,18 @@ class Skill(BaseSkill):
     def handle(self, *, tool_name, arguments, context):
         app_settings = context.get("app_settings")
         client = context.get("client")
+        # run_id 必须一路透传：交易意图、执行动作回填都要靠它把"这一次运行"
+        # 和真实委托关联起来。通用 skill 路径（chat / 非计划执行）过去丢掉了
+        # run_id，导致意图的 run_id 为 NULL、审计链断开。
+        run_id = context.get("run_id")
+        run_id = int(run_id) if isinstance(run_id, int) and run_id > 0 else None
         if client is not None:
             return mx_execution_service.execute_tool(
                 tool_name=tool_name,
                 arguments=arguments,
                 client=client,
                 app_settings=app_settings,
+                run_id=run_id,
             )
 
         with MXClient(api_key=getattr(app_settings, "mx_api_key", None)) as runtime_client:
@@ -42,6 +48,7 @@ class Skill(BaseSkill):
                 arguments=arguments,
                 client=runtime_client,
                 app_settings=app_settings,
+                run_id=run_id,
             )
 
 

@@ -10,12 +10,16 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
+
+from sqlalchemy import select
 
 from app.db.database import session_scope
-from app.db.models import StrategyRun
-from app.services.aniu_service import aniu_service, now_shanghai
+from app.db.models import StrategyRun, TradeOrder
+from app.services.aniu_service import now_shanghai
+from app.services.run_payload_service import run_payload_service
 
 _REQUIRED_EVIDENCE_LIMIT = 2000
 _QUERY_EVIDENCE_LIMITS = (4000, 512)
@@ -117,15 +121,100 @@ def apply_evidence_budget(
     return budgeted, omissions
 
 
-def _run_tool_calls(run: StrategyRun) -> list[dict[str, Any]]:
-    payload = run.skill_payloads if isinstance(run.skill_payloads, dict) else {}
+def _run_tool_calls(run: Any) -> list[dict[str, Any]]:
+    skill_payloads = run["skill_payloads"]
+    payload = skill_payloads if isinstance(skill_payloads, dict) else {}
     tool_calls = payload.get("tool_calls")
     if not isinstance(tool_calls, list):
         return []
     return [call for call in tool_calls if isinstance(call, dict)]
 
 
-def _run_section(run: StrategyRun) -> dict[str, Any]:
+def _list_run_rows_for_report(db: Any, target: date) -> list[Any]:
+    """当日运行记录的窄列投影（不含 LLM 原始载荷）。"""
+    shanghai = ZoneInfo("Asia/Shanghai")
+    start_of_day = (
+        datetime.combine(target, datetime.min.time(), tzinfo=shanghai)
+        .astimezone(timezone.utc)
+        .replace(tzinfo=None)
+    )
+    end_of_day = start_of_day + timedelta(days=1)
+    stmt = (
+        select(
+            StrategyRun.id,
+            StrategyRun.run_type,
+            StrategyRun.status,
+            StrategyRun.started_at,
+            StrategyRun.finished_at,
+            StrategyRun.final_answer,
+            StrategyRun.error_message,
+        )
+        .where(
+            StrategyRun.started_at >= start_of_day,
+            StrategyRun.started_at < end_of_day,
+        )
+        .order_by(StrategyRun.started_at.desc(), StrategyRun.id.desc())
+        .limit(50)
+    )
+    rows = db.execute(stmt).mappings().all()
+    run_ids = [int(row["id"]) for row in rows]
+
+    # 证据预算需要 skill 载荷：优先冷表（gzip 压缩，读取量约为原始的 1/8），
+    # 未回填的历史行再批量回退热表旧字段。
+    cold_payloads = run_payload_service.load_payloads_for_runs(
+        db, run_ids, payload_types=("skill",)
+    )
+    missing = [
+        run_id
+        for run_id in run_ids
+        if "skill" not in (cold_payloads.get(run_id) or {})
+    ]
+    legacy_payloads: dict[int, Any] = {}
+    if missing:
+        legacy_rows = db.execute(
+            select(StrategyRun.id, StrategyRun.skill_payloads).where(
+                StrategyRun.id.in_(missing)
+            )
+        ).mappings().all()
+        legacy_payloads = {
+            int(row["id"]): row["skill_payloads"]
+            for row in legacy_rows
+            if row["skill_payloads"] is not None
+        }
+
+    merged: list[dict[str, Any]] = []
+    for row in rows:
+        run_id = int(row["id"])
+        payload = dict(row)
+        payload["skill_payloads"] = (cold_payloads.get(run_id) or {}).get(
+            "skill"
+        ) or legacy_payloads.get(run_id)
+        merged.append(payload)
+    return merged
+
+
+def _load_trade_orders_by_run(db: Any, run_ids: list[int]) -> dict[int, list[Any]]:
+    """一次批量取回所有运行的交易记录，避免逐条 run 懒加载（N+1）。"""
+    if not run_ids:
+        return {}
+    stmt = (
+        select(TradeOrder)
+        .where(TradeOrder.run_id.in_(run_ids))
+        .order_by(TradeOrder.run_id.asc(), TradeOrder.id.asc())
+    )
+    grouped: dict[int, list[Any]] = {}
+    for order in db.execute(stmt).scalars().all():
+        grouped.setdefault(int(order.run_id), []).append(order)
+    return grouped
+
+
+def _run_section(run: Any, orders: list[Any]) -> dict[str, Any]:
+    """单次运行的报告片段。
+
+    run 现在是窄列投影的行（不是完整 ORM 对象），交易记录由调用方批量
+    预取后传入——旧实现对 50 条 run 逐条触发 `run.trade_orders` 懒加载，
+    形成 1 + 50 次查询的 N+1。
+    """
     tool_calls = _run_tool_calls(run)
     evidence, omissions = apply_evidence_budget(tool_calls)
 
@@ -138,40 +227,47 @@ def _run_section(run: StrategyRun) -> dict[str, Any]:
             "price": order.price,
             "status": order.status,
         }
-        for order in run.trade_orders
+        for order in orders
     ]
 
+    started_at = run["started_at"]
+    finished_at = run["finished_at"]
     return {
-        "run_id": run.id,
-        "run_type": run.run_type,
-        "status": run.status,
-        "started_at": run.started_at.isoformat() if run.started_at else None,
-        "finished_at": run.finished_at.isoformat() if run.finished_at else None,
-        "final_answer": _truncate(run.final_answer, _FINAL_ANSWER_LIMIT),
+        "run_id": int(run["id"]),
+        "run_type": run["run_type"],
+        "status": run["status"],
+        "started_at": started_at.isoformat() if started_at else None,
+        "finished_at": finished_at.isoformat() if finished_at else None,
+        "final_answer": _truncate(run["final_answer"], _FINAL_ANSWER_LIMIT),
         "trades": trades,
         "evidence": evidence,
         "omissions": omissions,
-        "error_message": _truncate(run.error_message, 500) or None,
+        "error_message": _truncate(run["error_message"], 500) or None,
     }
 
 
 class DailyReportService:
     def build_daily_report(self, db: Any, *, target_date: date | None = None) -> dict[str, Any]:
         effective_date = target_date or now_shanghai().date()
-        runs = aniu_service.list_runs(db, limit=50, run_date=effective_date)
+        # 只投影报告真正需要的列（含 skill_payloads 用于证据预算），
+        # 不读取 llm_request/response 等大载荷。
+        runs = _list_run_rows_for_report(db, effective_date)
+        orders_by_run = _load_trade_orders_by_run(
+            db, [int(row["id"]) for row in runs]
+        )
 
         sections = []
         all_trades: list[dict[str, Any]] = []
         all_omissions: list[str] = []
         for run in runs:
-            section = _run_section(run)
+            section = _run_section(run, orders_by_run.get(int(run["id"]), []))
             sections.append(section)
             for trade in section["trades"]:
-                all_trades.append({"run_id": run.id, **trade})
+                all_trades.append({"run_id": int(run["id"]), **trade})
             all_omissions.extend(section["omissions"])
 
-        completed = sum(1 for run in runs if run.status == "completed")
-        failed = sum(1 for run in runs if run.status == "failed")
+        completed = sum(1 for run in runs if run["status"] == "completed")
+        failed = sum(1 for run in runs if run["status"] == "failed")
 
         return {
             "date": effective_date.isoformat(),

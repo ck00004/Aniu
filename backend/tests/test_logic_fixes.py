@@ -280,9 +280,9 @@ def test_list_runs_date_filter_uses_shanghai_day_boundary(
 
     with session_scope() as db:
         runs = aniu_service.list_runs(db, run_date=date(2026, 10, 15))
-        assert {run.id for run in runs} == {early_run.id, mid_run.id}
+        assert {run["id"] for run in runs} == {early_run.id, mid_run.id}
         runs_prev = aniu_service.list_runs(db, run_date=date(2026, 10, 14))
-        assert all(run.id not in {early_run.id, mid_run.id} for run in runs_prev)
+        assert all(run["id"] not in {early_run.id, mid_run.id} for run in runs_prev)
 
     reset_db_state()
 

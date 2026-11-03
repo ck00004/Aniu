@@ -26,6 +26,13 @@ class Settings(BaseSettings):
     sqlite_db_path: Path = Field(
         default=Path("./data/aniu.sqlite3"), alias="SQLITE_DB_PATH"
     )
+    # 提交耐久性：NORMAL 性能更好，FULL 在断电/系统崩溃时也不会丢已提交事务。
+    # 存有交易意图与委托编号，建议在压测后切 FULL（见 db_maintenance 脚本）。
+    sqlite_synchronous: str = Field(default="NORMAL", alias="SQLITE_SYNCHRONOUS")
+    # 页面缓存（负数表示 KiB）：默认沿用 SQLite 的 2MB，压测后再按需上调。
+    sqlite_cache_kib: int = Field(default=-2000, alias="SQLITE_CACHE_KIB")
+    # mmap 读取窗口，0 表示关闭（内存在 8GB 以内的小机器建议先保持 0）。
+    sqlite_mmap_bytes: int = Field(default=0, alias="SQLITE_MMAP_BYTES")
 
     mx_apikey: str | None = Field(default=None, alias="MX_APIKEY")
     mx_api_url: str = Field(

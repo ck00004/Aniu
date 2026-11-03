@@ -115,6 +115,8 @@ interface ListRunsOptions {
   date?: string
   status?: string
   beforeId?: number
+  /** 与 beforeId 一起构成 (started_at, id) 双字段游标。 */
+  beforeStartedAt?: string
 }
 
 interface ListChatMessagesOptions {
@@ -407,6 +409,9 @@ export const api = {
     }
     if (typeof options.beforeId === 'number') {
       params.set('before_id', String(options.beforeId))
+    }
+    if (options.beforeStartedAt) {
+      params.set('before_started_at', options.beforeStartedAt)
     }
     return request<RunSummaryPage>(`${API_PREFIX}/runs-feed?${params.toString()}`)
   },

@@ -3,7 +3,19 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Any
 
-from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import (
+    Boolean,
+    Date,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    LargeBinary,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
 
@@ -133,6 +145,14 @@ class StrategyRun(Base):
     analysis_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     final_answer: Mapped[str | None] = mapped_column(Text, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 运行结束时的统计快照：列表/概览接口只读这些窄列，不再为了算 Token
+    # 与调用次数去加载 llm_request_payload / skill_payloads 等大 JSON。
+    # 历史行可能为 NULL（尚未回填），读取侧禁止在请求内运行时补算。
+    input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    api_call_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    executed_trade_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     llm_request_payload: Mapped[dict[str, Any] | None] = mapped_column(
         JSON, nullable=True
     )
@@ -157,6 +177,42 @@ class StrategyRun(Base):
         back_populates="run",
         cascade="all, delete-orphan",
         order_by="StrategyRunAction.sequence_no, StrategyRunAction.id",
+    )
+
+
+class StrategyRunPayload(Base):
+    """运行原始载荷冷表（阶段 C）。
+
+    `strategy_runs` 里的四个大 JSON（llm_request / llm_response / skill /
+    decision）单条 5~9MB，把整张热表撑到 GB 级，列表与统计查询因此被拖垮。
+    这里把原始载荷搬进独立表并做 gzip 压缩：
+
+    * 热表只保留元数据 + 统计快照 + 结论摘要；
+    * 详情/审阅时按需从本表解压读取；
+    * 生命周期可独立管理（按年龄清理，不影响运行记录与交易事实）。
+
+    写入是"双写"：收尾时同时写热表旧字段与本表，读取优先本表、回退旧字段；
+    等历史行回填校验完成后再用脚本清空热表旧字段（`--clear-legacy`）。
+    """
+
+    __tablename__ = "strategy_run_payloads"
+    __table_args__ = (
+        UniqueConstraint("run_id", "payload_type", name="uq_run_payload_type"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_runs.id", ondelete="CASCADE"), index=True
+    )
+    # llm_request / llm_response / skill / decision
+    payload_type: Mapped[str] = mapped_column(String(32))
+    payload_data: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    compression: Mapped[str] = mapped_column(String(16), default="gzip")
+    original_size: Mapped[int] = mapped_column(Integer, default=0)
+    compressed_size: Mapped[int] = mapped_column(Integer, default=0)
+    sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), index=True
     )
 
 
