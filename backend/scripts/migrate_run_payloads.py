@@ -31,7 +31,7 @@ import logging
 import time
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, text
 
 from app.db.database import init_db, session_scope
 from app.db.models import StrategyRun, StrategyRunPayload
@@ -182,10 +182,135 @@ def verify(batch_size: int, sleep_seconds: float) -> int:
                     )
         time.sleep(max(0.0, sleep_seconds))
     logger.info("校验完成：检查 %d 行，异常 %d 行", checked, mismatched)
+    mismatched += verify_legacy_coverage()
     return mismatched
 
 
+def verify_legacy_coverage() -> int:
+    """检查"旧字段非空但没有对应冷表行"的缺口（verify 本身不覆盖这一项）。"""
+    gaps = 0
+    checked = 0
+    last_id = 0
+    per_field: dict[str, int] = {field: 0 for field in _LEGACY_FIELDS}
+    while True:
+        with session_scope() as db:
+            rows = list(
+                db.scalars(
+                    select(StrategyRun)
+                    .where(
+                        StrategyRun.id > last_id,
+                        _legacy_not_null_condition(),
+                    )
+                    .order_by(StrategyRun.id.asc())
+                    .limit(200)
+                ).all()
+            )
+            if not rows:
+                break
+            last_id = int(rows[-1].id)
+            for run in rows:
+                checked += 1
+                cold_types = {
+                    row.payload_type
+                    for row in db.scalars(
+                        select(StrategyRunPayload).where(
+                            StrategyRunPayload.run_id == run.id
+                        )
+                    ).all()
+                }
+                for field, payload_type in FIELD_TO_PAYLOAD_TYPE.items():
+                    if getattr(run, field, None) is None:
+                        continue
+                    if payload_type in cold_types:
+                        continue
+                    gaps += 1
+                    per_field[field] += 1
+    logger.info(
+        "旧字段覆盖度：检查 %d 条仍有旧字段的运行，缺少冷表记录 %d 处 %s",
+        checked,
+        gaps,
+        {k: v for k, v in per_field.items() if v},
+    )
+    if gaps:
+        logger.error("存在未回填的旧字段，禁止执行 clear-legacy")
+    return gaps
+
+
+def inspect() -> None:
+    """迁移进度体检：剩余旧字段、冷表行数、压缩效果、覆盖缺口。"""
+    with session_scope() as db:
+        total_runs = int(db.scalar(select(func.count(StrategyRun.id))) or 0)
+        remaining = {
+            field: int(
+                db.scalar(
+                    select(func.count(StrategyRun.id)).where(
+                        getattr(StrategyRun, field).is_not(None)
+                    )
+                )
+                or 0
+            )
+            for field in _LEGACY_FIELDS
+        }
+        payload_rows = int(
+            db.scalar(select(func.count(StrategyRunPayload.id))) or 0
+        )
+        payload_runs = int(
+            db.scalar(
+                select(func.count(func.distinct(StrategyRunPayload.run_id)))
+            )
+            or 0
+        )
+        original = int(
+            db.scalar(select(func.sum(StrategyRunPayload.original_size))) or 0
+        )
+        compressed = int(
+            db.scalar(select(func.sum(StrategyRunPayload.compressed_size))) or 0
+        )
+    logger.info("运行记录总数：%d", total_runs)
+    logger.info("仍带旧字段的运行数：%s", remaining)
+    logger.info("冷表：%d 行 / %d 个运行", payload_rows, payload_runs)
+    if original:
+        logger.info(
+            "压缩效果：原始 %.1fMB → 压缩后 %.1fMB（%.1f%%）",
+            original / 1e6,
+            compressed / 1e6,
+            100 * compressed / original,
+        )
+    if payload_runs < total_runs:
+        logger.info(
+            "尚未有冷表载荷的运行数：%d（可能从未产生载荷，或还没回填）",
+            total_runs - payload_runs,
+        )
+
+
+def nullify_json_null_literals() -> int:
+    """把历史遗留的 JSON 文本 "null" 收敛成 SQL NULL。
+
+    JSON 列默认 none_as_null=False，早期代码写 None 时会落成 4 字节的
+    `null` 文本：ORM 读出来是 None，但 `IS NOT NULL` 为真，会让
+    "旧字段是否清空"的判断一直显示未清空。这里一次性收敛。
+    """
+    total = 0
+    fields = (*_LEGACY_FIELDS, "executed_actions")
+    with session_scope() as db:
+        for field in fields:
+            result = db.execute(
+                text(
+                    f"UPDATE strategy_runs SET {field} = NULL "
+                    f"WHERE CAST({field} AS TEXT) = 'null'"
+                )
+            )
+            count = int(result.rowcount or 0)
+            if count:
+                logger.info("清理 %s 的 JSON null 文本：%d 行", field, count)
+            total += count
+    if total:
+        logger.info("JSON null 文本收敛完成：共 %d 处", total)
+    return total
+
+
 def clear_legacy(batch_size: int, sleep_seconds: float, max_batches: int) -> int:
+    nullify_json_null_literals()
     cleared = 0
     batches = 0
     last_id = 0
@@ -281,10 +406,14 @@ def main() -> int:
         "command",
         nargs="?",
         default="all",
-        choices=["backfill", "verify", "clear-legacy", "purge", "all"],
+        choices=["inspect", "backfill", "verify", "clear-legacy", "purge", "all"],
     )
-    parser.add_argument("--batch-size", type=int, default=20)
-    parser.add_argument("--sleep", type=float, default=0.2)
+    parser.add_argument(
+        "--batch-size", type=int, default=5, help="每批读取的 run 数量（默认 5）"
+    )
+    parser.add_argument(
+        "--sleep", type=float, default=1.0, help="每批之间休眠秒数（默认 1.0）"
+    )
     parser.add_argument("--max-batches", type=int, default=0)
     parser.add_argument("--keep-days", type=int, default=180)
     args = parser.parse_args()
@@ -294,6 +423,8 @@ def main() -> int:
     )
     init_db()
 
+    if args.command == "inspect":
+        inspect()
     if args.command in {"backfill", "all"}:
         backfill(args.batch_size, args.sleep, args.max_batches)
     if args.command in {"verify", "all"}:

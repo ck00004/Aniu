@@ -43,90 +43,135 @@ executed_trade_count`）：运行收尾时写入，历史行用脚本回填。
 - **双读**：详情/报告/账户兜底优先冷表，未回填行回退旧字段；
 - 冷表行带 `original_size / compressed_size / sha256`，可离线校验。
 
-线上实测压缩率（5 条样本，真实载荷）：**原始 27.4MB → gzip 4.7MB（17.2%，约 5.8 倍）**。
+线上实测压缩率（5 条真实载荷样本）：**原始 27.4MB → gzip 4.7MB（17.2%，约 5.8 倍）**。
 按此推算，4.7GB 主库迁移 + 清空旧字段 + VACUUM 后约 **0.8–1.2GB**。
-
-执行顺序（低峰期；每步可中断、可重复）：
-
-```bash
-cd /home/test/Aniu-main/backend
-
-# 0) 先备份 + 体检
-.venv/bin/python -m scripts.migrate_db backup
-.venv/bin/python -m scripts.db_maintenance report
-
-# 1) 回填冷表（读 4GB 老数据，分批 + 批间休眠，避免卡住 WAL）
-.venv/bin/python -m scripts.migrate_run_payloads backfill --batch-size 20 --sleep 0.2
-
-# 2) 校验（sha256 / 大小 / JSON 一致性，异常会返回非 0 并中止）
-.venv/bin/python -m scripts.migrate_run_payloads verify
-
-# 3) 清空热表旧字段（逐行比对一致才清；不一致会跳过并告警）
-.venv/bin/python -m scripts.migrate_run_payloads clear-legacy --batch-size 20 --sleep 0.2
-
-# 4) 回收磁盘（WAL 模式下 VACUUM 后必须 checkpoint，脚本已内置）
-.venv/bin/python -m scripts.db_maintenance vacuum --yes
-```
 
 ## 阶段 D：完整性与耐久性（代码已完成，需执行一次表重建）
 
-1. **外键默认开启**：连接事件里 `PRAGMA foreign_keys=ON`（已用
-   `foreign_key_check` 验证历史数据零违规）。
+1. **外键默认开启**：连接事件 `PRAGMA foreign_keys=ON`（`foreign_key_check` 已验证零违规）。
 2. **补外键**：`trade_intents.run_id/action_id`、`self_select_intents.run_id`
-   原本是裸 INTEGER。SQLite 不支持 `ADD CONSTRAINT`，需要重建表：
+   原本是裸 INTEGER；ORM 模型已同步声明 `ForeignKey(..., ondelete="SET NULL")`，
+   但**线上库**需要重建表才能补上约束：
 
-```bash
-.venv/bin/python -m scripts.migrate_db rebuild-intent-fks    # 自动备份 + 行数校验 + foreign_key_check
-```
+   ```bash
+   .venv/bin/python -m scripts.migrate_db rebuild-intent-fks   # 默认自动备份
+   ```
 
-外键用 `ON DELETE SET NULL`：删除运行时意图记录必须保留（标的/方向/数量/
-远端单号/状态是交易事实），只解除关联；应用层 `delete_run` 另加确认门槛——
-存在意图时默认拒绝删除，必须显式 `force=true`，并记 warn 日志。
+   重建脚本：读原 DDL → 末尾补 FK 子句 → 建新表 → 拷数据 → 行数校验 →
+   换名 → 重建原索引 → `foreign_key_check`，失败即 ROLLBACK。
+   `--skip-backup` 才会跳过备份（危险，正常不要用）。
 
 3. **提交耐久性**：`SQLITE_SYNCHRONOUS=NORMAL|FULL`（默认 NORMAL）。
-   交易意图 + 远端单号属于关键写入，建议在压测后切 `FULL`：
-
-```bash
-SQLITE_SYNCHRONOUS=FULL   # .env
-```
-
-4. **迁移版本化**：`schema_meta.schema_version` 记录结构版本
-   （`scripts.migrate_db status` 可查）。目前是"幂等脚本 + 版本标记"的
-   轻量方案，不用 Alembic 也能追溯；后续若要引入 Alembic，这张表可直接
-   作为 baseline。
+   交易意图 + 远端单号是关键的断电敏感写入，建议压测后切 `FULL`。
+4. **迁移版本化**：`schema_meta.schema_version`（`scripts.migrate_db status` 可查）。
 
 ## 阶段 E：维护与生命周期（脚本已完成）
 
 ```bash
-# 统计信息（让查询计划准确；建索引/大批写入后跑一次）
-.venv/bin/python -m scripts.db_maintenance analyze
-
-# WAL 收敛
-.venv/bin/python -m scripts.db_maintenance checkpoint
-
-# 体检报告：各表行数、冷表压缩率、复合索引覆盖提示
-.venv/bin/python -m scripts.db_maintenance report
-
-# 保留策略（默认 dry-run，确认后加 --apply）
+.venv/bin/python -m scripts.db_maintenance analyze      # ANALYZE + PRAGMA optimize
+.venv/bin/python -m scripts.db_maintenance checkpoint   # WAL 收敛
+.venv/bin/python -m scripts.db_maintenance report       # 行数/压缩率/索引覆盖提示
 .venv/bin/python -m scripts.db_maintenance retention \
-    --payload-days 180 --tool-log-days 90 --memory-activity-days 365
+    --payload-days 180 --tool-log-days 90 --memory-activity-days 365   # 默认 dry-run
+.venv/bin/python -m scripts.db_maintenance vacuum --yes # 备份 + checkpoint + VACUUM
 ```
 
-保留策略**只**清理：冷表原始载荷、工具调用日志、记忆活动日志。
-交易事实（`trade_orders` / `trade_intents` / `self_select_intents`）、运行结论
-（`analysis_summary` / `final_answer`）、执行动作与交易记录**永不**进入清理。
+保留策略**只**清理：冷表载荷、工具日志、记忆活动日志。交易事实
+（`trade_orders` / `trade_intents` / `self_select_intents`）、运行结论
+（`analysis_summary` / `final_answer`）、执行动作与交易记录**永不**清理。
 
 ### 索引复核
 
-`report` 会列出"单列索引已被复合索引前缀覆盖"的候选：
+`report` 会列出"单列索引已被复合索引前缀覆盖"的候选，删除前必须用
+`EXPLAIN QUERY PLAN` 复核实际查询是否仍走覆盖索引。
 
-```
-strategy_runs.ix_strategy_runs_status  ← ix_strategy_runs_status_started_id(status, started_at, id)
-strategy_run_actions.ix_strategy_run_actions_run_id ← (run_id, sequence_no) / (run_id, status)
+## 完整执行清单（按此顺序，失败即停）
+
+```bash
+cd /home/test/Aniu-main
+git status --short && git pull --ff-only && git rev-parse HEAD   # 记录 SHA
+
+# ── 阶段 0：停服（screen 会话里 Ctrl+C，确认调度线程退出、无第二个实例）
+cd backend
+set -Eeuo pipefail
+
+# ── 阶段 1：基线 + 备份
+.venv/bin/python -m scripts.migrate_db status
+.venv/bin/python -m scripts.migrate_db backup
+.venv/bin/python -m scripts.db_maintenance report
+df -h .                                  # 需要 ≥ 3 份备份的空间（约 15GB）
+
+# ── 阶段 2：显式应用结构（加列 + 组合索引 + 冷表），不必靠启动 uvicorn
+.venv/bin/python -m scripts.migrate_db apply
+
+# ── 阶段 3：载荷迁移（5 条/批、批间 1 秒，8GB 机器别用 20/0.2）
+.venv/bin/python -m scripts.migrate_run_payloads backfill --batch-size 5 --sleep 1
+.venv/bin/python -m scripts.migrate_run_payloads verify     # 含"旧字段覆盖度"检查
+.venv/bin/python -m scripts.migrate_run_payloads inspect
+
+# ── 阶段 4：历史指标回填（必须在 clear-legacy 之前！）
+.venv/bin/python -m scripts.backfill_run_metrics --batch-size 5 --sleep 1
+
+# ── 阶段 5：清空热表旧字段（逐字段比对一致才清）
+.venv/bin/python -m scripts.migrate_run_payloads clear-legacy --batch-size 5 --sleep 1
+
+# ── 阶段 6：意图外键重建（自动备份）
+.venv/bin/python -m scripts.migrate_db rebuild-intent-fks
+
+# ── 阶段 7：统计信息 + 空间回收
+.venv/bin/python -m scripts.db_maintenance analyze
+.venv/bin/python -m scripts.db_maintenance vacuum --yes
+.venv/bin/python -m scripts.db_maintenance checkpoint
+
+# ── 阶段 8：迁移后体检，然后才启动 uvicorn
+.venv/bin/python -m scripts.migrate_db status
+.venv/bin/python -m scripts.db_maintenance report
 ```
 
-删除前必须用实际查询做 `EXPLAIN QUERY PLAN` 复核（例如"只按 status 过滤"
-是否仍走覆盖索引）。不要为了省几十 KB 盲删索引。
+**顺序红线**：`backfill_run_metrics` 在 `clear-legacy` 之前；`vacuum` 在
+`clear-legacy` 之后；`vacuum` 期间不得有生产读写；迁移全程不启动 uvicorn。
+
+## 迁移后验收 SQL
+
+```sql
+-- 1) 旧 JSON 是否真的清空（四个 remaining 期望为 0）
+--    注意必须用 CASE 转成整数：sqlite3 CLI 里 SUM(布尔) 可能显示成 True/False
+SELECT COUNT(*) AS total_runs,
+       SUM(CASE WHEN llm_request_payload  IS NOT NULL THEN 1 ELSE 0 END) AS request_remaining,
+       SUM(CASE WHEN llm_response_payload IS NOT NULL THEN 1 ELSE 0 END) AS response_remaining,
+       SUM(CASE WHEN skill_payloads       IS NOT NULL THEN 1 ELSE 0 END) AS skill_remaining,
+       SUM(CASE WHEN decision_payload     IS NOT NULL THEN 1 ELSE 0 END) AS decision_remaining
+FROM strategy_runs;
+
+-- 2) 冷表压缩效果
+SELECT payload_type, COUNT(*) records,
+       ROUND(SUM(original_size)/1048576.0, 2)   AS original_mb,
+       ROUND(SUM(compressed_size)/1048576.0, 2) AS compressed_mb
+FROM strategy_run_payloads GROUP BY payload_type;
+
+-- 3) 指标回填情况（NULL 要区分"本来没有"与"回填失败"）
+SELECT COUNT(*) total_runs,
+       SUM(CASE WHEN input_tokens  IS NULL THEN 1 ELSE 0 END) missing_input_tokens,
+       SUM(CASE WHEN output_tokens IS NULL THEN 1 ELSE 0 END) missing_output_tokens,
+       SUM(CASE WHEN total_tokens  IS NULL THEN 1 ELSE 0 END) missing_total_tokens,
+       SUM(CASE WHEN api_call_count IS NULL THEN 1 ELSE 0 END) missing_api_calls,
+       SUM(CASE WHEN executed_trade_count IS NULL THEN 1 ELSE 0 END) missing_trades
+FROM strategy_runs;
+
+-- 4) 外键
+PRAGMA foreign_key_list(trade_intents);       -- 期望 2 条
+PRAGMA foreign_key_list(self_select_intents); -- 期望 1 条
+PRAGMA foreign_key_check;                     -- 期望空
+
+-- 5) 完整性（低负载窗口，不要与迁移同时跑）
+PRAGMA integrity_check;
+```
+
+补充：查看运行详情是**只读**的（冷表补全用 `set_committed_value`，不产生
+UPDATE），所以上面第 1 项在有人浏览过详情之后仍然应为 0。
+
+注意：`sqlite3` CLI 新连接的 `PRAGMA foreign_keys` 恒为 0（连接级设置），
+验证应用连接要用 SQLAlchemy 连接查，别用 CLI 结果判断是否生效。
 
 ## 交易意图链路（安全相关，独立小节）
 

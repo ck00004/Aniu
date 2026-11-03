@@ -20,6 +20,7 @@ from typing import Any, Iterable
 
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import set_committed_value
 
 from app.db.models import StrategyRun, StrategyRunPayload
 
@@ -173,7 +174,12 @@ class RunPayloadService:
         return grouped
 
     def hydrate_run(self, db: Session, run: StrategyRun) -> bool:
-        """用冷表补全热表里已被清空的大字段。返回是否有字段被补齐。"""
+        """用冷表补全热表里已被清空的大字段。返回是否有字段被补齐。
+
+        关键：用 `set_committed_value` 而不是普通赋值。直接 setattr 会把对象
+        标脏，调用方（例如 skill 路由里的 session_scope）一提交就把几 MB 的
+        载荷写回 `strategy_runs`，把 clear-legacy 当场撤销、热表重新膨胀。
+        """
         missing = [
             field
             for field in FIELD_TO_PAYLOAD_TYPE
@@ -190,7 +196,8 @@ class RunPayloadService:
             field = PAYLOAD_TYPE_TO_FIELD.get(payload_type)
             if field is None:
                 continue
-            setattr(run, field, value)
+            # 只写入会话内的对象，不产生 UPDATE
+            set_committed_value(run, field, value)
             hydrated = True
         return hydrated
 

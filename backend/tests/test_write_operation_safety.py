@@ -43,6 +43,38 @@ def _use_temp_db(monkeypatch, tmp_path) -> None:
     database_module._session_local = None
 
 
+def _ensure_intent_parents(db, *, run_ids=(1,), action_ids=(101,)) -> None:
+    """外键生效后，意图的父运行/父动作必须先存在（历史测试直接写 run_id=1）。"""
+    from app.db.models import StrategyRun, StrategyRunAction
+
+    created_runs = []
+    for run_id in run_ids:
+        run = db.get(StrategyRun, run_id)
+        if run is None:
+            run = StrategyRun(
+                id=run_id, trigger_source="schedule", run_type="trade"
+            )
+            db.add(run)
+            db.flush()
+        created_runs.append(run_id)
+    for action_id in action_ids:
+        if db.get(StrategyRunAction, action_id) is not None:
+            continue
+        db.add(
+            StrategyRunAction(
+                id=action_id,
+                run_id=created_runs[0],
+                sequence_no=1,
+                phase="execution",
+                tool_name="mx_moni_trade",
+                action_type="BUY",
+                status="succeeded",
+            )
+        )
+        db.flush()
+
+
+
 def _reset_db_state() -> None:
     database_module._engine = None
     database_module._session_local = None
@@ -1432,6 +1464,7 @@ def test_action_id_backfill_requires_intent_id(monkeypatch, tmp_path) -> None:
     try:
         today = datetime.now(SHANGHAI_TZ).date().isoformat()
         with session_scope() as db:
+            _ensure_intent_parents(db, run_ids=(1,), action_ids=(101,))
             db.add(
                 TradeIntent(
                     signal_date=today,
@@ -1569,6 +1602,7 @@ def test_intent_id_precise_association(monkeypatch, tmp_path) -> None:
     try:
         today = datetime.now(SHANGHAI_TZ).date().isoformat()
         with session_scope() as db:
+            _ensure_intent_parents(db, run_ids=(1,), action_ids=(201, 202))
             db.add_all(
                 [
                     TradeIntent(
@@ -2224,6 +2258,7 @@ def test_action_id_rejects_cross_run_intent(monkeypatch, tmp_path) -> None:
     try:
         today = datetime.now(SHANGHAI_TZ).date().isoformat()
         with session_scope() as db:
+            _ensure_intent_parents(db, run_ids=(1, 2, 99), action_ids=(101,))
             db.add(
                 TradeIntent(
                     signal_date=today,
@@ -3731,6 +3766,10 @@ def test_run_id_persisted_to_self_select_intent(monkeypatch, tmp_path) -> None:
             def manage_self_select(self, query: str) -> dict:
                 self.manage_calls.append(query)
                 return {"code": "200", "message": "成功"}
+
+        # 外键生效：run_id=42 的父运行必须先存在
+        with session_scope() as db:
+            _ensure_intent_parents(db, run_ids=(42,), action_ids=())
 
         result = mx_execution.mx_execution_service.execute_tool(
             client=_AddClient(),

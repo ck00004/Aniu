@@ -153,16 +153,23 @@ class StrategyRun(Base):
     total_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     api_call_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     executed_trade_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # none_as_null=True：写 None 时落 SQL NULL，而不是 JSON 文本 "null"。
+    # 否则 clear-legacy 之后 `IS NOT NULL` 仍为真（列里是 4 字节的 "null"），
+    # 迁移校验、旧字段统计、冷表覆盖度判断都会失真。
     llm_request_payload: Mapped[dict[str, Any] | None] = mapped_column(
-        JSON, nullable=True
+        JSON(none_as_null=True), nullable=True
     )
     llm_response_payload: Mapped[dict[str, Any] | None] = mapped_column(
-        JSON, nullable=True
+        JSON(none_as_null=True), nullable=True
     )
-    skill_payloads: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
-    decision_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    skill_payloads: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON(none_as_null=True), nullable=True
+    )
+    decision_payload: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON(none_as_null=True), nullable=True
+    )
     executed_actions: Mapped[list[dict[str, Any]] | None] = mapped_column(
-        JSON, nullable=True
+        JSON(none_as_null=True), nullable=True
     )
     started_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), index=True
@@ -467,8 +474,18 @@ class TradeIntent(Base):
     side: Mapped[str] = mapped_column(String(8), index=True)
     tranche_id: Mapped[int] = mapped_column(Integer, default=1)
     intent_key: Mapped[str] = mapped_column(String(64), unique=True, index=True)
-    run_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
-    action_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 外键用 ON DELETE SET NULL：删除运行/动作时意图记录必须保留
+    #（标的/方向/数量/远端单号/状态是交易事实），只解除关联。
+    # 与 scripts/migrate_db.py 的 rebuild-intent-fks 保持一致，避免新库缺外键。
+    run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("strategy_runs.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    action_id: Mapped[int | None] = mapped_column(
+        ForeignKey("strategy_run_actions.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     provider_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     quantity: Mapped[int] = mapped_column(Integer, default=0)
     # PLANNED / EXECUTING / SUBMITTED / UNKNOWN / FILLED / PARTIALLY_FILLED
@@ -504,7 +521,11 @@ class SelfSelectIntent(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     symbol: Mapped[str] = mapped_column(String(16), index=True)
     operation: Mapped[str] = mapped_column(String(8), index=True)  # ADD/REMOVE
-    run_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("strategy_runs.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     # executing / submitted / verified / noop / unknown / failed
     status: Mapped[str] = mapped_column(String(16), default="executing", index=True)
     note: Mapped[str | None] = mapped_column(Text, nullable=True)

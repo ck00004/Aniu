@@ -11,8 +11,10 @@
     # 应用迁移：补列 + 补索引（幂等，等价于 init_db 的结构部分）
     .venv/bin/python -m scripts.migrate_db apply
 
-    # 给交易意图/自选股意图补外键（SQLite 需要重建表，默认先备份）
-    .venv/bin/python -m scripts.migrate_db rebuild-intent-fks --yes
+    # 给交易意图/自选股意图补外键（SQLite 需要重建表，默认先自动备份）
+    .venv/bin/python -m scripts.migrate_db rebuild-intent-fks
+    # 只有明确知道已有最新备份时才跳过自动备份（危险）
+    .venv/bin/python -m scripts.migrate_db rebuild-intent-fks --skip-backup
 
 为什么需要重建表：SQLite 不支持 `ALTER TABLE ... ADD CONSTRAINT`，
 只能"建新表 → 拷数据 → 换名 → 重建索引"。本脚本会：
@@ -227,7 +229,11 @@ def main() -> int:
         "command",
         choices=["status", "backup", "apply", "rebuild-intent-fks"],
     )
-    parser.add_argument("--yes", action="store_true", help="rebuild 前不自动备份")
+    parser.add_argument(
+        "--skip-backup",
+        action="store_true",
+        help="跳过自动备份（仅在你已确认有最新备份时使用，危险）",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -240,7 +246,7 @@ def main() -> int:
     elif args.command == "apply":
         apply_structure()
     else:
-        rebuild_intent_fks(skip_backup=args.yes)
+        rebuild_intent_fks(skip_backup=args.skip_backup)
     return 0
 
 

@@ -197,3 +197,101 @@ def test_delete_run_requires_force_when_intents_reference_it(db_env) -> None:
         intent = db.scalars(select(TradeIntent)).one()
         assert intent.run_id is None
         assert db.get(StrategyRun, run_id) is None
+
+
+def test_metrics_backfill_can_restore_from_cold_table(db_env) -> None:
+    """清空旧字段之后再回填指标，必须能从冷表恢复，而不是写假 0。"""
+    from scripts.backfill_run_metrics import _hydrate_payloads_from_cold_table
+
+    run_id = _make_run()
+    with session_scope() as db:
+        run_payload_service.store_run_payloads(db, db.get(StrategyRun, run_id))
+    with session_scope() as db:
+        run = db.get(StrategyRun, run_id)
+        run.llm_request_payload = None
+        run.llm_response_payload = None
+        run.skill_payloads = None
+        run.decision_payload = None
+
+        source = _hydrate_payloads_from_cold_table(db, run)
+        assert source == "cold"
+        assert run.llm_response_payload is not None
+        assert run.skill_payloads is not None
+
+        aniu_service._hydrate_run_summary_metrics(run)
+        assert run.api_call_count == 1
+        assert run.input_tokens == 5
+        assert run.output_tokens == 6
+        assert run.total_tokens == 11
+
+
+def test_metrics_backfill_skips_runs_without_payload(db_env) -> None:
+    from scripts.backfill_run_metrics import _hydrate_payloads_from_cold_table
+
+    run_id = _make_run(status="failed")
+    with session_scope() as db:
+        run = db.get(StrategyRun, run_id)
+        run.llm_request_payload = None
+        run.llm_response_payload = None
+        run.skill_payloads = None
+        run.decision_payload = None
+        assert _hydrate_payloads_from_cold_table(db, run) is None
+
+
+def test_get_run_does_not_write_payloads_back_to_hot_table(db_env) -> None:
+    """冷表补全必须是"只读"的：提交后热表旧字段仍为空。
+
+    历史缺陷：hydrate 用 setattr 会把对象标脏，skill 路由的 session_scope
+    一提交就把几 MB 载荷写回 strategy_runs，等于撤销 clear-legacy。
+    """
+    run_id = _make_run()
+    with session_scope() as db:
+        run_payload_service.store_run_payloads(db, db.get(StrategyRun, run_id))
+    with session_scope() as db:
+        run = db.get(StrategyRun, run_id)
+        run.llm_request_payload = None
+        run.llm_response_payload = None
+        run.skill_payloads = None
+        run.decision_payload = None
+        db.add(run)
+
+    # 会提交的调用路径（等价 skill handler 里的 session_scope）
+    with session_scope() as db:
+        hydrated = aniu_service.get_run(db, run_id)
+        assert hydrated.skill_payloads is not None
+
+    with session_scope() as db:
+        run = db.get(StrategyRun, run_id)
+        assert run.llm_request_payload is None
+        assert run.llm_response_payload is None
+        assert run.skill_payloads is None
+        assert run.decision_payload is None
+
+
+def test_cleared_legacy_columns_are_sql_null(db_env) -> None:
+    """clear-legacy 必须写 SQL NULL，而不是 JSON 文本 "null"。
+
+    历史缺陷：JSON 列默认 none_as_null=False，写 None 会落 4 字节的 "null"，
+    导致 `IS NOT NULL` 仍为真，迁移校验/旧字段统计全部失真。
+    """
+    from sqlalchemy import text
+
+    run_id = _make_run()
+    with session_scope() as db:
+        run_payload_service.store_run_payloads(db, db.get(StrategyRun, run_id))
+    with session_scope() as db:
+        run = db.get(StrategyRun, run_id)
+        run.llm_request_payload = None
+        run.llm_response_payload = None
+        run.skill_payloads = None
+        run.decision_payload = None
+
+    with session_scope() as db:
+        remaining = db.execute(
+            text(
+                "SELECT SUM(CASE WHEN llm_request_payload IS NOT NULL THEN 1 ELSE 0 END),"
+                " SUM(CASE WHEN skill_payloads IS NOT NULL THEN 1 ELSE 0 END) "
+                "FROM strategy_runs"
+            )
+        ).one()
+    assert tuple(remaining) == (0, 0)
