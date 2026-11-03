@@ -49,6 +49,23 @@ executed_trade_count`）：运行收尾时写入，历史行用脚本回填。
   时真正的 INSERT 发生在 commit。若与运行收尾共用事务，收尾提交失败会连带
   回滚冷表，而热表又已被跳过 → 原始载荷两边都没有。独立事务后：
   冷表失败 → 热表兜底；冷表成功但运行状态提交失败 → 冷表载荷仍在。
+
+  冷表写入校验（DB-10）：四类载荷齐全、`compressed_size == len(BLOB)`、
+  `original_size == 解压后长度`、`sha256` 必填且必须匹配——任何一项不过即
+  判定失败走兜底。
+
+- **收尾失败 ≠ 业务失败（DB-08）**：冷表提交成功后，若运行状态/结论/交易
+  记录那次事务提交失败，运行会被 park 成 `finalization_pending`，**不标
+  failed、不计入调度重试**（避免重复委托），并在启动时由
+  `recover_finalization_pending_runs()` 从冷表还原指标、补齐 `trade_orders`、
+  收敛状态。归档标记（`payload_storage`/`metrics_status`/指标/`executed_actions`）
+  在冷表提交后由一个独立小事务先行落库，保证上述恢复有据可依。
+
+> 兜底边界（必须明确）：冷表与热表在**同一个 SQLite 文件**里。因此热表兜底
+> 只覆盖"冷表这次写失败、数据库整体仍可写"的情况（触发器/约束/单条语句
+> 错误等）。若整个磁盘写满、文件系统只读或磁盘 I/O 故障，热表兜底同样会
+> 失败，此时载荷无法保存——这是当前架构的已知边界，不在本次改造范围内
+> （真要覆盖需要独立磁盘上的 spool 目录）。
 - **双读**：详情/报告/账户兜底优先冷表，未回填的历史行回退旧字段；
 - 冷表行带 `original_size / compressed_size / sha256`，可离线校验。
 
@@ -92,6 +109,18 @@ executed_trade_count`）：运行收尾时写入，历史行用脚本回填。
 （`trade_orders` / `trade_intents` / `self_select_intents`）、运行结论
 （`analysis_summary` / `final_answer`）、执行动作与交易记录**永不**清理。
 
+### 运行状态口径
+
+| 状态 | 含义 | 处置 |
+|---|---|---|
+| `completed` / `failed` | 正常收尾 | — |
+| `finalization_pending` | 收尾事务提交失败（外部交易与冷表载荷可能已保存） | 下次启动自动恢复；也可手动查 `inspect` |
+
+```sql
+SELECT id, started_at, error_message FROM strategy_runs
+WHERE status = 'finalization_pending';
+```
+
 ### 兜底行的复查与重新迁移
 
 正常运行时热表保持 NULL；只有冷表写入失败才会出现 `payload_storage='hot_fallback'`：
@@ -128,7 +157,7 @@ set -Eeuo pipefail
 .venv/bin/python -m scripts.db_maintenance report
 df -h .                                  # 需要 ≥ 3 份备份的空间（约 15GB）
 
-# ── 阶段 2：显式应用结构（加列 + 组合索引 + 冷表），不必靠启动 uvicorn
+# ── 阶段 2：应用结构（加列 + 冷表）。重索引**不在这里建**，见阶段 7
 .venv/bin/python -m scripts.migrate_db apply
 
 # ── 阶段 3：载荷迁移（5 条/批、批间 1 秒，8GB 机器别用 20/0.2）
@@ -145,18 +174,33 @@ df -h .                                  # 需要 ≥ 3 份备份的空间（约
 # ── 阶段 6：意图外键重建（自动备份）
 .venv/bin/python -m scripts.migrate_db rebuild-intent-fks
 
-# ── 阶段 7：统计信息 + 空间回收
+# ── 阶段 7：瘦身完成后才建重索引（此时表只剩几 MB，秒级）
+.venv/bin/python -m scripts.migrate_db indexes
+
+# ── 阶段 8：统计信息 + 空间回收
 .venv/bin/python -m scripts.db_maintenance analyze
 .venv/bin/python -m scripts.db_maintenance vacuum --yes
 .venv/bin/python -m scripts.db_maintenance checkpoint
 
-# ── 阶段 8：迁移后体检，然后才启动 uvicorn
+# ── 阶段 9：迁移后体检，然后才启动 uvicorn
 .venv/bin/python -m scripts.migrate_db status
 .venv/bin/python -m scripts.db_maintenance report
 ```
 
 > 注意：`migrate_run_payloads all` 只等于"载荷回填 + 校验 + 清空旧字段"，
 > **不包含** `backfill_run_metrics`。完整 A–E 迁移必须按下面逐条执行。
+
+**为什么重索引要放最后（重要）**：`ix_strategy_runs_status_started_id` 是
+`(status, started_at DESC, id DESC)` 复合索引，创建时要全表扫一遍。
+
+* 未瘦身的 4.7GB 表：实测只有 **~2.5MB/s**（虚拟盘小 I/O 延迟受限，同期
+  `dd` 顺序读能有 111MB/s），单次 **20~30 分钟**；
+* `clear-legacy` + `VACUUM` 之后：表只剩几 MB，**秒级**完成。
+
+因此 `database.py` 做了自动判断：表里还有未压缩载荷时**自动延后**建该索引
+（启动只打一条 warning），迁移脚本里也默认 `ANIU_SKIP_HEAVY_INDEXES=1`；
+瘦身后用 `scripts.migrate_db indexes` 显式创建。这样无论是迁移中途重启
+uvicorn，还是脚本反复调 `init_db()`，都不会再卡在索引构建上。
 
 **顺序红线**：`backfill_run_metrics` 在 `clear-legacy` 之前；`vacuum` 在
 `clear-legacy` 之后；`vacuum` 期间不得有生产读写；迁移全程不启动 uvicorn。
@@ -200,6 +244,9 @@ SELECT COUNT(*) total_runs,
        SUM(CASE WHEN api_call_count IS NULL THEN 1 ELSE 0 END) missing_api_calls,
        SUM(CASE WHEN executed_trade_count IS NULL THEN 1 ELSE 0 END) missing_trades
 FROM strategy_runs;
+
+-- 3a) 是否有卡在收尾阶段的运行（期望 0）
+SELECT COUNT(*) FROM strategy_runs WHERE status = 'finalization_pending';
 
 -- 3b) 载荷去向与指标口径
 SELECT COALESCE(payload_storage,'(未标记)') storage, COUNT(*) FROM strategy_runs GROUP BY 1;

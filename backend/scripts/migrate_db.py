@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -117,10 +118,60 @@ def status() -> None:
         conn.close()
 
 
-def apply_structure() -> None:
+def apply_structure(*, skip_heavy_indexes: bool = False) -> None:
     """补列 + 补索引（幂等；与启动时 init_db 的结构部分一致）。"""
+    if skip_heavy_indexes:
+        os.environ["ANIU_SKIP_HEAVY_INDEXES"] = "1"
+        logger.info("已跳过 heavy index（瘦身前建它会全表扫 4.7GB，极慢）")
     init_db()
     logger.info("结构迁移完成（列 + 索引）")
+
+
+def create_indexes() -> None:
+    """单独创建 strategy_runs 的复合索引（应在 clear-legacy + VACUUM 之后跑）。
+
+    瘦身后表只剩几 MB，建索引是秒级；在 4.7GB 的原始表上实测只有
+    2~3MB/s，需要 20~30 分钟，所以从迁移脚本里拆出来。
+    """
+    import time
+
+    db_path = _db_path()
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    try:
+        conn.execute("PRAGMA busy_timeout=30000")
+        existing = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            ).fetchall()
+        }
+        targets = (
+            (
+                "ix_strategy_runs_status_started_id",
+                "CREATE INDEX ix_strategy_runs_status_started_id "
+                "ON strategy_runs (status, started_at DESC, id DESC)",
+            ),
+            (
+                "ix_chat_messages_session_kind_id",
+                "CREATE INDEX ix_chat_messages_session_kind_id "
+                "ON chat_messages (session_id, message_kind, id DESC)",
+            ),
+        )
+        for name, sql in targets:
+            if name in existing:
+                logger.info("%s 已存在，跳过", name)
+                continue
+            started = time.monotonic()
+            size_mb = db_path.stat().st_size / 1e6
+            logger.info("创建 %s（当前库 %.0fMB）…", name, size_mb)
+            conn.execute(sql)
+            logger.info(
+                "%s 创建完成，用时 %.1fs", name, time.monotonic() - started
+            )
+        conn.execute("ANALYZE")
+        logger.info("索引创建完成，已执行 ANALYZE")
+    finally:
+        conn.close()
 
 
 def _fk_clause(column: str, ref_table: str, ref_column: str, on_delete: str) -> str:
@@ -227,7 +278,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="数据库结构迁移与检查（阶段 D）")
     parser.add_argument(
         "command",
-        choices=["status", "backup", "apply", "rebuild-intent-fks"],
+        choices=["status", "backup", "apply", "indexes", "rebuild-intent-fks"],
+    )
+    parser.add_argument(
+        "--skip-heavy-indexes",
+        action="store_true",
+        help="apply 时跳过 strategy_runs 复合索引（瘦身前建它极慢，建议迁移后再建）",
     )
     parser.add_argument(
         "--skip-backup",
@@ -244,7 +300,9 @@ def main() -> int:
     elif args.command == "backup":
         backup()
     elif args.command == "apply":
-        apply_structure()
+        apply_structure(skip_heavy_indexes=args.skip_heavy_indexes)
+    elif args.command == "indexes":
+        create_indexes()
     else:
         rebuild_intent_fks(skip_backup=args.skip_backup)
     return 0

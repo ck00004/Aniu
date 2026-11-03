@@ -213,12 +213,17 @@ class RunPayloadService:
                     )
                     if restored is None:
                         raise RuntimeError(f"冷表载荷解压失败 {payload_type}")
-                    recomputed = _sha256(
-                        json.dumps(
-                            restored, ensure_ascii=False, separators=(",", ":")
-                        ).encode("utf-8")
-                    )
-                    if row["sha256"] and recomputed != row["sha256"]:
+                    stored_digest = str(row["sha256"] or "").strip()
+                    if not stored_digest:
+                        raise RuntimeError(f"冷表载荷缺少 sha256 {payload_type}")
+                    recomputed_bytes = json.dumps(
+                        restored, ensure_ascii=False, separators=(",", ":")
+                    ).encode("utf-8")
+                    if int(row["original_size"] or -1) != len(recomputed_bytes):
+                        raise RuntimeError(
+                            f"冷表载荷 original_size 与解压长度不一致 {payload_type}"
+                        )
+                    if _sha256(recomputed_bytes) != stored_digest:
                         raise RuntimeError(f"冷表载荷 sha256 校验失败 {payload_type}")
             return True
         except Exception as exc:  # noqa: BLE001

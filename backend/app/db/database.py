@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -611,6 +612,30 @@ def _ensure_strategy_run_columns(engine) -> None:
             connection.execute(text(statement))
 
 
+def _strategy_runs_still_holds_payloads(engine) -> bool:
+    """判断 strategy_runs 里是否还有未压缩的原始载荷（决定能否安全建重索引）。
+
+    有载荷时整行几 MB，建索引要扫数 GB；没有载荷时扫几 MB 即可。
+    查询用 LIMIT 1，瘦身之后最多扫几 MB。
+    """
+    try:
+        with engine.connect() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT 1 FROM strategy_runs "
+                    "WHERE llm_request_payload IS NOT NULL "
+                    "   OR llm_response_payload IS NOT NULL "
+                    "   OR skill_payloads IS NOT NULL "
+                    "   OR decision_payload IS NOT NULL "
+                    "LIMIT 1"
+                )
+            ).first()
+            return row is not None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("payload-presence probe failed, defer heavy index: %s", exc)
+        return True
+
+
 def _ensure_strategy_run_indexes(engine) -> None:
     inspector = inspect(engine)
     table_names = set(inspector.get_table_names())
@@ -638,12 +663,36 @@ def _ensure_strategy_run_indexes(engine) -> None:
         )
     # 状态 + 时间排序的组合索引：原本 status 过滤会退化成
     # SEARCH(status) + USE TEMP B-TREE FOR ORDER BY。
-    # 注意：首次创建需全表扫描一次（当前库约 4.7GB），属于一次性成本。
+    #
+    # 建它会全表扫一遍。在"还没瘦身"的 4.7GB 表上实测只有 ~2.5MB/s
+    # （小 I/O 延迟受限），单次要 20~30 分钟；clear-legacy + VACUUM 之后
+    # 表只剩几 MB，秒级完成。所以这里做了自动判断：
+    #   * ANIU_SKIP_HEAVY_INDEXES=1 → 强制跳过（迁移脚本默认带）；
+    #   * 表里还有未压缩的原始载荷（llm/skill 字段非空）→ 自动延后，
+    #     避免应用启动被索引构建卡住 30 分钟；
+    #   * 否则立刻创建。
     if "ix_strategy_runs_status_started_id" not in index_names:
-        statements.append(
-            "CREATE INDEX ix_strategy_runs_status_started_id "
-            "ON strategy_runs (status, started_at DESC, id DESC)"
-        )
+        if os.environ.get("ANIU_SKIP_HEAVY_INDEXES", "").strip() not in {
+            "",
+            "0",
+            "false",
+        }:
+            logger.warning(
+                "skip heavy index ix_strategy_runs_status_started_id "
+                "(ANIU_SKIP_HEAVY_INDEXES set); run `scripts.migrate_db indexes` "
+                "after slimming the table"
+            )
+        elif _strategy_runs_still_holds_payloads(engine):
+            logger.warning(
+                "defer heavy index ix_strategy_runs_status_started_id: "
+                "strategy_runs still holds raw payloads; run "
+                "`scripts.migrate_db indexes` after clear-legacy + VACUUM"
+            )
+        else:
+            statements.append(
+                "CREATE INDEX ix_strategy_runs_status_started_id "
+                "ON strategy_runs (status, started_at DESC, id DESC)"
+            )
 
     if not statements:
         return

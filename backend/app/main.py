@@ -108,6 +108,11 @@ async def app_lifespan(_app: FastAPI):
                 aniu_service.fail_stale_running_runs(db)
             except Exception as exc:
                 logger.warning("failed to mark stale running runs: %s", exc)
+            # 收尾提交失败被 park 的运行：从冷表恢复指标与交易事实后收敛
+            try:
+                aniu_service.recover_finalization_pending_runs(db)
+            except Exception as exc:
+                logger.warning("failed to recover finalization_pending runs: %s", exc)
             try:
                 memory_dream_service.fail_stale_running_dreams(db)
             except Exception as exc:

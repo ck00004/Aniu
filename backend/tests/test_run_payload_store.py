@@ -499,3 +499,118 @@ def test_cold_payload_survives_when_run_update_commit_fails(db_env) -> None:
         run = db.get(StrategyRun, run_id)
         assert run.status == "running"
         assert run_payload_service.load_run_payloads(db, run_id).get("skill")
+
+
+# ---------------------------------------------------------------------------
+# DB-08：收尾提交失败 ≠ 业务失败
+# ---------------------------------------------------------------------------
+
+
+def test_finalization_guard_parks_run_and_skips_business_failure(db_env) -> None:
+    """冷表已提交后收尾事务失败：park 成 finalization_pending，不标 failed。"""
+    from app.services.aniu_service import RunFinalizationUncommitted
+
+    run_id = _make_bare_run(status="running")
+    with session_scope() as db:
+        run = db.get(StrategyRun, run_id)
+        run.executed_actions = [{"action": "BUY", "symbol": "600000", "quantity": 100}]
+
+    # 冷表独立事务先成功
+    assert run_payload_service.store_run_payloads_isolated(
+        run_id=run_id, payloads=_FAULT_PAYLOADS
+    )
+
+    # 收尾事务被强制失败
+    with session_scope() as db:
+        db.execute(
+            text(
+                "CREATE TRIGGER IF NOT EXISTS fail_run_update2 "
+                "BEFORE UPDATE ON strategy_runs WHEN NEW.status = 'completed' "
+                "BEGIN SELECT RAISE(ABORT, 'forced finalize failure'); END;"
+            )
+        )
+        db.commit()
+    try:
+        with pytest.raises(RunFinalizationUncommitted):
+            with aniu_service._finalization_guard(run_id), session_scope() as db:
+                run = db.get(StrategyRun, run_id)
+                run.status = "completed"
+                db.add(run)
+    finally:
+        with session_scope() as db:
+            db.execute(text("DROP TRIGGER IF EXISTS fail_run_update2"))
+            db.commit()
+
+    with session_scope() as db:
+        run = db.get(StrategyRun, run_id)
+        # 不是 failed —— 这是"收尾失败"，不是"交易失败"
+        assert run.status == "finalization_pending"
+        assert "收尾提交失败" in str(run.error_message)
+        # 冷表载荷仍然存在
+        assert db.scalar(select(func.count(StrategyRunPayload.id))) == 4
+
+
+def test_recovery_converges_pending_run_with_metrics_and_trades(db_env) -> None:
+    """启动恢复：从冷表还原指标、补齐交易事实、收敛状态。"""
+    run_id = _make_bare_run(status="running")
+    with session_scope() as db:
+        run = db.get(StrategyRun, run_id)
+        run.executed_actions = [
+            {"action": "BUY", "symbol": "600000", "quantity": 100, "status": "submitted"}
+        ]
+
+    assert run_payload_service.store_run_payloads_isolated(
+        run_id=run_id, payloads=_FAULT_PAYLOADS
+    )
+    aniu_service._persist_archive_markers(
+        run_id=run_id,
+        payload_storage="cold",
+        metrics_status="complete",
+        metrics={"api_call_count": None, "executed_trade_count": None,
+                 "input_tokens": None, "output_tokens": None, "total_tokens": None},
+        executed_actions=[{"action": "BUY", "symbol": "600000", "quantity": 100}],
+    )
+    aniu_service._park_finalization_pending(run_id, RuntimeError("boom"))
+
+    from app.db.models import TradeOrder
+
+    with session_scope() as db:
+        recovered = aniu_service.recover_finalization_pending_runs(db)
+    assert recovered == 1
+
+    with session_scope() as db:
+        run = db.get(StrategyRun, run_id)
+        assert run.status == "completed"
+        assert run.payload_storage == "cold"
+        # 指标从冷表重算，而不是按空热表算成 0
+        assert run.api_call_count == 1
+        assert run.total_tokens == 11
+        assert run.finished_at is not None
+        orders = db.scalars(
+            select(TradeOrder).where(TradeOrder.run_id == run_id)
+        ).all()
+        assert len(orders) == 1 and orders[0].symbol == "600000"
+    # 恢复过程不得把载荷写回热表
+    assert _hot_remaining() == (0, 0)
+
+
+def test_cold_store_rejects_missing_digest(db_env) -> None:
+    """DB-10：冷表写入后若摘要缺失/损坏，必须判定失败（走热表兜底）。"""
+    run_id = _make_bare_run()
+    payloads = {"llm_request": {"m": ["x"]}}
+
+    # 让写入的 sha256 变成空串（模拟摘要缺失）
+    import app.services.run_payload_service as rps
+
+    original_sha = rps._sha256
+    try:
+        rps._sha256 = lambda raw: ""
+        ok = run_payload_service.store_run_payloads_isolated(
+            run_id=run_id, payloads=payloads
+        )
+    finally:
+        rps._sha256 = original_sha
+
+    assert ok is False
+    with session_scope() as db:
+        assert db.scalar(select(func.count(StrategyRunPayload.id))) == 0

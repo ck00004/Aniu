@@ -8,6 +8,7 @@ import re
 import secrets
 import time
 import traceback
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from threading import Event, Lock, Thread
@@ -301,6 +302,15 @@ def _order_status_text(
     if text == "" and db_status is not None:
         text = str(db_status).strip()
     return mapping.get(text, text or "未知")
+
+
+class RunFinalizationUncommitted(RuntimeError):
+    """运行收尾（状态/结论/交易记录）最终提交失败。
+
+    与"业务执行失败"严格区分：外部交易可能已经发生、冷表载荷可能已经独立
+    提交，此时不能把运行标成 failed，也不能触发调度重试（会造成重复委托）。
+    运行会被 park 成 `finalization_pending`，由启动恢复流程从冷表收敛。
+    """
 
 
 class AniuService:
@@ -1146,6 +1156,190 @@ class AniuService:
         run.input_tokens = token_usage["input"]
         run.output_tokens = token_usage["output"]
         run.total_tokens = token_usage["total"]
+
+    @contextmanager
+    def _finalization_guard(self, run_id: int) -> Iterator[None]:
+        """收尾事务的兜底护栏：失败时 park，不冒充业务失败。
+
+        用法：`with self._finalization_guard(run_id), session_scope() as db:`
+        —— 内层 session_scope 提交失败时异常会冒泡到这里，此处把运行标记成
+        `finalization_pending`（独立小事务，best effort），并抛
+        `RunFinalizationUncommitted` 让外层异常处理器跳过"标 failed + 调度重试"。
+        """
+        try:
+            yield
+        except RunFinalizationUncommitted:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "run finalization commit failed, parking as finalization_pending: "
+                "run_id=%s err=%s",
+                run_id,
+                exc,
+            )
+            self._park_finalization_pending(run_id, exc)
+            raise RunFinalizationUncommitted(str(exc)) from exc
+
+    def _persist_archive_markers(
+        self,
+        *,
+        run_id: int,
+        payload_storage: str,
+        metrics_status: str,
+        metrics: dict[str, Any],
+        executed_actions: Any,
+    ) -> None:
+        """在独立小事务里落"归档标记 + 统计快照 + 已执行动作"。
+
+        这些字段是恢复 `finalization_pending` 运行的依据：即使随后的收尾事务
+        整体失败，也能从冷表 + 这些标记还原指标与交易事实。
+        """
+        try:
+            with session_scope() as db:
+                run = db.get(StrategyRun, run_id)
+                if run is None:
+                    return
+                run.payload_storage = payload_storage
+                run.metrics_status = metrics_status
+                run.api_call_count = metrics.get("api_call_count")
+                run.executed_trade_count = metrics.get("executed_trade_count")
+                run.input_tokens = metrics.get("input_tokens")
+                run.output_tokens = metrics.get("output_tokens")
+                run.total_tokens = metrics.get("total_tokens")
+                if executed_actions is not None:
+                    run.executed_actions = executed_actions
+                db.add(run)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "persist archive markers failed: run_id=%s err=%s", run_id, exc
+            )
+
+    def _park_finalization_pending(self, run_id: int, exc: Exception) -> None:
+        """把运行标记为 `finalization_pending`（独立事务、尽力而为）。"""
+        try:
+            with session_scope() as db:
+                run = db.get(StrategyRun, run_id)
+                if run is None:
+                    return
+                run.status = "finalization_pending"
+                run.error_message = (
+                    "运行收尾提交失败（外部交易与原始载荷可能已保存）："
+                    f"{type(exc).__name__}: {exc}"
+                )
+                db.add(run)
+        except Exception as park_exc:  # noqa: BLE001
+            logger.error(
+                "park finalization_pending failed: run_id=%s err=%s",
+                run_id,
+                park_exc,
+            )
+
+    def recover_finalization_pending_runs(self, db: Session) -> int:
+        """启动恢复：收敛 `finalization_pending` 运行。
+
+        规则：
+        * 指标缺失 → 从冷表解压载荷重算（绝不按"空热表"算成 0）；
+        * `executed_actions` 存在但 `trade_orders` 缺失 → 补齐交易事实；
+        * 运行状态按"是否有执行动作/是否有错误"收敛为 completed 或 failed；
+        * 不改动 `payload_storage`（冷表已提交就保持 cold）。
+        """
+        pending = list(
+            db.scalars(
+                select(StrategyRun).where(StrategyRun.status == "finalization_pending")
+            ).all()
+        )
+        if not pending:
+            return 0
+        recovered = 0
+        for run in pending:
+            try:
+                # 载荷优先从冷表恢复（此时热表字段多半是 NULL）
+                try:
+                    run_payload_service.hydrate_run(db, run)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "recover: hydrate failed run_id=%s err=%s", run.id, exc
+                    )
+                if any(
+                    getattr(run, field, None) is None
+                    for field in (
+                        "api_call_count",
+                        "input_tokens",
+                        "output_tokens",
+                        "total_tokens",
+                    )
+                ):
+                    self._hydrate_run_summary_metrics(run)
+                    if run.metrics_status in {None, "unavailable"}:
+                        run.metrics_status = self._resolve_metrics_status(
+                            llm_request=run.llm_request_payload,
+                            llm_response=run.llm_response_payload,
+                            skill_payloads=run.skill_payloads,
+                            decision=run.decision_payload,
+                        )
+                    # 恢复就是要落库，这里必须保持 dirty（不能用 set_committed_value）
+                    run.api_call_count = int(run.api_call_count or 0)
+                    run.total_tokens = run.total_tokens
+
+                # 补齐交易事实（trade_orders 只在收尾事务里写过，可能缺失）
+                existing_orders = {
+                    (o.symbol, o.action, int(o.quantity or 0))
+                    for o in (run.trade_orders or [])
+                }
+                actions = (
+                    run.executed_actions
+                    if isinstance(run.executed_actions, list)
+                    else []
+                )
+                for action in actions:
+                    if not isinstance(action, dict):
+                        continue
+                    action_name = str(action.get("action") or "")
+                    if action_name not in {"BUY", "SELL"}:
+                        continue
+                    key = (
+                        str(action.get("symbol") or ""),
+                        action_name,
+                        int(action.get("quantity") or 0),
+                    )
+                    if key in existing_orders:
+                        continue
+                    db.add(
+                        TradeOrder(
+                            run_id=run.id,
+                            symbol=key[0],
+                            action=action_name,
+                            quantity=key[2],
+                            price_type=str(action.get("price_type") or "MARKET"),
+                            price=_parse_float(action.get("price")),
+                            status=str(action.get("status") or "submitted"),
+                            response_payload=action.get("response"),
+                        )
+                    )
+                    existing_orders.add(key)
+
+                has_error_note = "提交失败" in str(run.error_message or "")
+                run.status = "completed" if actions or not has_error_note else "failed"
+                run.finished_at = run.finished_at or now_utc()
+                run.error_message = (
+                    f"{run.error_message}（已由启动恢复收敛）"
+                    if run.error_message
+                    else "收尾提交失败，已由启动恢复收敛。"
+                )
+                db.add(run)
+                recovered += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "recover finalization_pending failed: run_id=%s err=%s",
+                    getattr(run, "id", None),
+                    exc,
+                )
+        if recovered:
+            db.commit()
+            logger.warning(
+                "recovered %d finalization_pending runs at startup", recovered
+            )
+        return recovered
 
     def _apply_run_payload_storage(
         self,
@@ -3403,8 +3597,28 @@ class AniuService:
             cold_stored = run_payload_service.store_run_payloads_isolated(
                 run_id=run_id, payloads=payloads
             )
+            # 与收尾事务解耦：先把归档标记、统计快照、已执行动作独立提交。
+            # 万一下面的收尾事务提交失败，恢复流程仍能从冷表 + 这些字段还原。
+            self._persist_archive_markers(
+                run_id=run_id,
+                payload_storage="cold" if cold_stored else "hot_fallback",
+                metrics_status=self._resolve_metrics_status(
+                    llm_request=llm_request,
+                    llm_response=llm_response,
+                    skill_payloads=skill_payloads,
+                    decision=decision,
+                ),
+                metrics={
+                    "api_call_count": metrics_source.api_call_count,
+                    "executed_trade_count": metrics_source.executed_trade_count,
+                    "input_tokens": metrics_source.input_tokens,
+                    "output_tokens": metrics_source.output_tokens,
+                    "total_tokens": metrics_source.total_tokens,
+                },
+                executed_actions=executed_actions,
+            )
 
-            with session_scope() as db:
+            with self._finalization_guard(run_id), session_scope() as db:
                 run = db.get(StrategyRun, run_id)
                 if run is None:
                     raise RuntimeError("运行记录不存在。")
@@ -3593,6 +3807,34 @@ class AniuService:
                             )
                             db.add(schedule)
             _emit("failed", message=abort_message)
+            raise
+        except RunFinalizationUncommitted as exc:
+            # 收尾提交失败 ≠ 业务执行失败：外部交易可能已完成、冷表载荷已提交。
+            # 因此不标 failed、不增加调度 retry（避免重复委托），只推进调度时间。
+            logger.error(
+                "run finalization uncommitted (parked, no retry): run_id=%s err=%s",
+                run_id,
+                exc,
+            )
+            with session_scope() as db:
+                if schedule_id:
+                    schedule = db.get(StrategySchedule, schedule_id)
+                    if schedule is not None:
+                        schedule.last_run_at = now_utc()
+                        schedule.next_run_at = self._safe_compute_next_run_at(
+                            schedule,
+                            from_time=now_shanghai(),
+                        )
+                        schedule.retry_count = max(int(schedule.retry_count or 0), 0)
+                        schedule.retry_after_at = None
+                        db.add(schedule)
+            _emit(
+                "failed",
+                message=(
+                    "运行收尾写入失败，结果已归档为待恢复状态；"
+                    "不会自动重试以避免重复委托。"
+                ),
+            )
             raise
         except Exception as exc:
             logger.error(

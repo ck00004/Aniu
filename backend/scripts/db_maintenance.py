@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
@@ -40,6 +41,11 @@ from app.db.models import (
 )
 
 logger = logging.getLogger("db_maintenance")
+
+# 迁移/维护脚本不走服务启动路径：跳过 strategy_runs 复合索引，
+# 否则每次 init_db() 都会在 4.7GB 表上全表扫描建索引（实测 20~30 分钟）。
+# 瘦身后用 `scripts.migrate_db indexes` 单独创建。
+os.environ.setdefault("ANIU_SKIP_HEAVY_INDEXES", "1")
 
 
 def _db_path():

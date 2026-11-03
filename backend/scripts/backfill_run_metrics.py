@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import time
 
 from sqlalchemy import and_, or_, select
@@ -56,6 +57,11 @@ from app.services.run_payload_service import (
 
 logger = logging.getLogger("backfill_run_metrics")
 
+# 迁移/维护脚本不走服务启动路径：跳过 strategy_runs 复合索引，
+# 否则每次 init_db() 都会在 4.7GB 表上全表扫描建索引（实测 20~30 分钟）。
+# 瘦身后用 `scripts.migrate_db indexes` 单独创建。
+os.environ.setdefault("ANIU_SKIP_HEAVY_INDEXES", "1")
+
 _LEGACY_FIELDS = tuple(FIELD_TO_PAYLOAD_TYPE.keys())
 _METRIC_FIELDS = (
     "api_call_count",
@@ -67,9 +73,17 @@ _METRIC_FIELDS = (
 
 
 def _pending_condition():
+    """待处理条件。
+
+    * 指标列有 NULL 的行要处理；
+    * `metrics_status` 为空的历史行也要处理（哪怕指标已经在，也要补标记）；
+    * 已确认 `unavailable` 且指标已补过标记的行不再重复扫描。
+    """
     return and_(
-        or_(*[getattr(StrategyRun, field).is_(None) for field in _METRIC_FIELDS]),
-        # 已确认"完全没有载荷"的行不再重复扫描（指标保持 NULL，不伪造 0）
+        or_(
+            or_(*[getattr(StrategyRun, field).is_(None) for field in _METRIC_FIELDS]),
+            StrategyRun.metrics_status.is_(None),
+        ),
         or_(
             StrategyRun.metrics_status.is_(None),
             StrategyRun.metrics_status != "unavailable",
@@ -179,11 +193,18 @@ def main() -> int:
                 source = _hydrate_payloads_from_cold_table(db, run)
                 if source is None:
                     # 既没有旧字段也没有冷表载荷：可能是启动即失败的运行。
-                    # 不写 0（避免伪造统计），但标记 unavailable，避免每次重扫。
-                    run.metrics_status = "unavailable"
-                    db.add(run)
+                    # 不写 0（避免伪造统计），但要打标记，避免每次重扫：
+                    # * 指标已有值 → partial（数值来源无法再用载荷复核）；
+                    # * 指标也为空 → unavailable。
+                    has_metrics = any(
+                        getattr(run, field, None) is not None
+                        for field in _METRIC_FIELDS
+                    )
+                    mark = "partial" if has_metrics else "unavailable"
+                    if run.metrics_status != mark:
+                        run.metrics_status = mark
+                        db.add(run)
                     skipped_no_payload += 1
-                    logger.debug("skip run_id=%s: no payload available", run.id)
                     continue
                 if source in {"cold", "mixed"}:
                     from_cold += 1
@@ -211,7 +232,7 @@ def main() -> int:
         time.sleep(max(0.0, args.sleep))
 
     logger.info(
-        "完成：回填 %d 条（其中从冷表恢复 %d 条），跳过无载荷 %d 条",
+        "完成：回填 %d 条（其中从冷表恢复 %d 条），无载荷已标记 %d 条",
         total,
         from_cold,
         skipped_no_payload,

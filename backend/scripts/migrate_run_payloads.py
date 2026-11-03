@@ -28,6 +28,7 @@ import gzip
 import hashlib
 import json
 import logging
+import os
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -43,6 +44,11 @@ from app.services.run_payload_service import (
 )
 
 logger = logging.getLogger("migrate_run_payloads")
+
+# 迁移/维护脚本不走服务启动路径：跳过 strategy_runs 复合索引，
+# 否则每次 init_db() 都会在 4.7GB 表上全表扫描建索引（实测 20~30 分钟）。
+# 瘦身后用 `scripts.migrate_db indexes` 单独创建。
+os.environ.setdefault("ANIU_SKIP_HEAVY_INDEXES", "1")
 
 _LEGACY_FIELDS = tuple(FIELD_TO_PAYLOAD_TYPE.keys())
 

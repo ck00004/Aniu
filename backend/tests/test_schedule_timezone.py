@@ -769,8 +769,22 @@ def test_execute_run_rolls_back_partial_trade_orders_when_order_persist_fails(
         _reset_db_state()
 
     assert len(runs) == 1
-    assert runs[0].status == "failed"
+    # DB-08：收尾阶段的持久化故障 ≠ 业务执行失败。
+    # 部分 trade_orders 随收尾事务回滚（这是对的），但运行不能被标成 failed，
+    # 也不能进入调度重试（否则可能重复委托），而是 park 成待恢复状态。
+    assert runs[0].status == "finalization_pending"
+    assert "收尾提交失败" in str(runs[0].error_message)
     assert orders == []
+
+    # 启动恢复：从冷表/已执行动作补齐交易事实并收敛状态
+    with session_scope() as db:
+        recovered = aniu_service.recover_finalization_pending_runs(db)
+    with session_scope() as db:
+        run = db.get(StrategyRun, runs[0].id)
+        restored_orders = db.query(TradeOrder).all()
+    assert recovered == 1
+    assert run.status in {"completed", "failed"}
+    assert len(restored_orders) == 2
 
 
 def test_trading_calendar_service_can_fill_missing_year(monkeypatch, tmp_path) -> None:
