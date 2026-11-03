@@ -206,6 +206,7 @@ def test_metrics_backfill_can_restore_from_cold_table(db_env) -> None:
     run_id = _make_run()
     with session_scope() as db:
         run_payload_service.store_run_payloads(db, db.get(StrategyRun, run_id))
+    # 先提交"旧字段已清空"的状态（真实迁移里 clear-legacy 是独立事务）
     with session_scope() as db:
         run = db.get(StrategyRun, run_id)
         run.llm_request_payload = None
@@ -213,6 +214,8 @@ def test_metrics_backfill_can_restore_from_cold_table(db_env) -> None:
         run.skill_payloads = None
         run.decision_payload = None
 
+    with session_scope() as db:
+        run = db.get(StrategyRun, run_id)
         source = _hydrate_payloads_from_cold_table(db, run)
         assert source == "cold"
         assert run.llm_response_payload is not None
@@ -223,6 +226,9 @@ def test_metrics_backfill_can_restore_from_cold_table(db_env) -> None:
         assert run.input_tokens == 5
         assert run.output_tokens == 6
         assert run.total_tokens == 11
+
+    # DB-02：冷表恢复必须只写会话视图，提交后热表仍然是 NULL
+    assert _hot_remaining() == (0, 0), "指标回填把载荷写回了热表"
 
 
 def test_metrics_backfill_skips_runs_without_payload(db_env) -> None:
@@ -295,3 +301,96 @@ def test_cleared_legacy_columns_are_sql_null(db_env) -> None:
             )
         ).one()
     assert tuple(remaining) == (0, 0)
+
+
+def _make_bare_run(**kwargs) -> int:
+    """创建一条"载荷还在内存里"的运行（模拟收尾前的状态）。"""
+    payload = {
+        "status": "running",
+        "run_type": "analysis",
+        "executed_actions": [{"action": "BUY", "symbol": "600000"}],
+        "started_at": datetime(2026, 11, 3, 1, 0),
+    }
+    payload.update(kwargs)
+    with session_scope() as db:
+        run = StrategyRun(**payload)
+        db.add(run)
+        db.flush()
+        return int(run.id)
+
+
+def _assign_payloads_in_memory(run) -> None:
+    run.llm_request_payload = {"messages": [{"role": "user", "content": "x" * 1000}]}
+    run.llm_response_payload = {"usage": {"prompt_tokens": 5, "completion_tokens": 6, "total_tokens": 11}}
+    run.skill_payloads = {"tool_calls": [{"name": "mx_get_balance", "result": {"ok": True}}]}
+    run.decision_payload = {"final_answer": "结论"}
+
+
+def _hot_remaining() -> tuple[int, int]:
+    from sqlalchemy import text
+
+    with session_scope() as db:
+        row = db.execute(
+            text(
+                "SELECT SUM(CASE WHEN llm_request_payload IS NOT NULL THEN 1 ELSE 0 END),"
+                " SUM(CASE WHEN skill_payloads IS NOT NULL THEN 1 ELSE 0 END) "
+                "FROM strategy_runs"
+            )
+        ).one()
+    return int(row[0] or 0), int(row[1] or 0)
+
+
+def test_finalize_writes_payloads_to_cold_table_only(db_env) -> None:
+    """DB-01：运行收尾后热表四个大字段必须是 SQL NULL，载荷只在冷表。"""
+    run_id = _make_bare_run()
+    with session_scope() as db:
+        run = db.get(StrategyRun, run_id)
+        _assign_payloads_in_memory(run)
+        aniu_service._hydrate_run_summary_metrics(run)
+        aniu_service._persist_run_payloads(db, run, run_id=run_id)
+        run.status = "completed"
+
+    assert _hot_remaining() == (0, 0), "热表仍在持久化原始载荷"
+    with session_scope() as db:
+        assert db.scalar(select(func.count(StrategyRunPayload.id))) == 4
+        run = db.get(StrategyRun, run_id)
+        # 指标仍写入窄列
+        assert run.api_call_count == 1
+        assert run.total_tokens == 11
+    # 详情仍可完整恢复
+    with session_scope() as db:
+        hydrated = aniu_service.get_run(db, run_id)
+        assert hydrated.skill_payloads is not None
+        assert hydrated.llm_request_payload is not None
+
+
+def test_finalize_keeps_hot_copy_when_cold_store_fails(db_env, monkeypatch) -> None:
+    """DB-01：冷表写入异常时必须保留热表副本，绝不丢审计载荷。"""
+    run_id = _make_bare_run()
+
+    def _boom(db, run):
+        raise RuntimeError("cold store down")
+
+    monkeypatch.setattr(run_payload_service, "store_run_payloads", _boom)
+    with session_scope() as db:
+        run = db.get(StrategyRun, run_id)
+        _assign_payloads_in_memory(run)
+        aniu_service._hydrate_run_summary_metrics(run)
+        aniu_service._persist_run_payloads(db, run, run_id=run_id)
+        run.status = "completed"
+
+    remaining = _hot_remaining()
+    assert remaining == (1, 1), f"冷表失败时热表副本被丢弃：{remaining}"
+
+
+def test_finalize_keeps_hot_copy_when_cold_store_incomplete(db_env, monkeypatch) -> None:
+    run_id = _make_bare_run()
+    monkeypatch.setattr(
+        run_payload_service, "store_run_payloads", lambda db, run: 2
+    )
+    with session_scope() as db:
+        run = db.get(StrategyRun, run_id)
+        _assign_payloads_in_memory(run)
+        aniu_service._persist_run_payloads(db, run, run_id=run_id)
+
+    assert _hot_remaining() == (1, 1), "冷表写入不完整时不应清空热表"

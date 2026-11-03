@@ -145,6 +145,12 @@ def checkpoint() -> None:
         logger.info("PASSIVE → busy=%s log=%s checkpointed=%s", *passive)
         truncated = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
         logger.info("TRUNCATE → busy=%s log=%s checkpointed=%s", *truncated)
+        # DB-05：busy 非零说明还有活跃读事务没能让 WAL 回写，命令退出码要能反映
+        if int(truncated[0] or 0) != 0:
+            raise RuntimeError(
+                "WAL checkpoint 未完成（仍有活跃读写事务）："
+                f"busy={truncated[0]} log={truncated[1]} checkpointed={truncated[2]}"
+            )
     finally:
         conn.close()
 
@@ -170,6 +176,11 @@ def vacuum(assume_yes: bool) -> None:
         conn.execute("VACUUM")
         checkpoint = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
         logger.info("VACUUM 后 checkpoint：busy=%s log=%s checkpointed=%s", *checkpoint)
+        if int(checkpoint[0] or 0) != 0:
+            raise RuntimeError(
+                "VACUUM 后的 checkpoint 未完成（仍有活跃读写事务）："
+                f"busy={checkpoint[0]}；主文件可能尚未真正缩小"
+            )
         freelist = conn.execute("PRAGMA freelist_count").fetchone()[0]
         page_count = conn.execute("PRAGMA page_count").fetchone()[0]
         logger.info("页统计：page_count=%s freelist=%s", page_count, freelist)

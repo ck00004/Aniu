@@ -39,9 +39,16 @@ executed_trade_count`）：运行收尾时写入，历史行用脚本回填。
 新表 `strategy_run_payloads(run_id, payload_type, payload_data BLOB, ...)`，
 四个大字段（`llm_request / llm_response / skill / decision`）压缩后存这里：
 
-- **双写**：运行收尾时同时写热表旧字段与冷表；
-- **双读**：详情/报告/账户兜底优先冷表，未回填行回退旧字段；
+- **冷表是唯一持久化位置（DB-01）**：运行收尾时载荷只在内存里用于算
+  统计，随即写入冷表；写完整之后用 `set_committed_value` 把内存视图置空，
+  **热表四个字段保持 SQL NULL，不再双写**。冷表写入异常/不完整时则保留
+  热表副本兜底（宁可热表变大，也不丢审计载荷），且冷表插入与热表字段在
+  同一个事务里，失败一起回滚。
+- **双读**：详情/报告/账户兜底优先冷表，未回填的历史行回退旧字段；
 - 冷表行带 `original_size / compressed_size / sha256`，可离线校验。
+
+> 这一点是"长期不复发"的关键：如果继续双写，历史迁移做完之后热表仍会以
+> 约 130MB/天、3.9GB/月 的速度重新膨胀，本次瘦身只是短期收益。
 
 线上实测压缩率（5 条真实载荷样本）：**原始 27.4MB → gzip 4.7MB（17.2%，约 5.8 倍）**。
 按此推算，4.7GB 主库迁移 + 清空旧字段 + VACUUM 后约 **0.8–1.2GB**。
@@ -130,6 +137,19 @@ df -h .                                  # 需要 ≥ 3 份备份的空间（约
 
 **顺序红线**：`backfill_run_metrics` 在 `clear-legacy` 之前；`vacuum` 在
 `clear-legacy` 之后；`vacuum` 期间不得有生产读写；迁移全程不启动 uvicorn。
+
+### 重启后先做一次手动分析，再恢复调度
+
+不要一次性恢复 23 条定时任务。先起服务 + 只跑一次手动分析，确认：
+
+1. 新运行只写冷表：`SELECT SUM(CASE WHEN llm_request_payload IS NOT NULL THEN 1 ELSE 0 END) FROM strategy_runs WHERE id > <迁移前最大 id>;` → 期望 **0**；
+2. 该运行的冷表有 4 类载荷、压缩率正常（`inspect` 可看）；
+3. 运行列表秒开、详情能从冷表完整恢复（含工具明细/API 明细）；
+4. Token、API 调用次数、交易次数显示正确（来自统计快照列）；
+5. WAL 能正常 checkpoint（`db_maintenance checkpoint` 无 busy）；
+6. 观察 RSS：空闲 / 一次运行后 / 连续 10 次后 / 打开 100 条列表 / 看一次详情。
+
+全部通过再恢复调度。
 
 ## 迁移后验收 SQL
 

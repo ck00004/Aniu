@@ -2,14 +2,14 @@
 
 子命令（可组合，默认全部顺序执行）：
 
-    # 1) 回填（压缩写冷表），分批可中断
-    .venv/bin/python -m scripts.migrate_run_payloads backfill --batch-size 20 --sleep 0.2
+    # 1) 回填（压缩写冷表），分批可中断（默认 5 条/批、批间 1 秒）
+    .venv/bin/python -m scripts.migrate_run_payloads backfill
 
     # 2) 校验（重算 sha256 / 大小 / JSON 一致性）
     .venv/bin/python -m scripts.migrate_run_payloads verify
 
     # 3) 清空热表旧字段（只清"已回填且校验一致"的行）
-    .venv/bin/python -m scripts.migrate_run_payloads clear-legacy --batch-size 20
+    .venv/bin/python -m scripts.migrate_run_payloads clear-legacy
 
     # 4) 按保留窗口清理冷表载荷（run_id < 某个边界）
     .venv/bin/python -m scripts.migrate_run_payloads purge --keep-days 180
@@ -187,47 +187,36 @@ def verify(batch_size: int, sleep_seconds: float) -> int:
 
 
 def verify_legacy_coverage() -> int:
-    """检查"旧字段非空但没有对应冷表行"的缺口（verify 本身不覆盖这一项）。"""
+    """检查"旧字段非空但没有对应冷表行"的缺口。
+
+    第 17 轮审计 DB-04：旧实现按批 `select(StrategyRun)` 加载整行 ORM 对象，
+    每批 200 条 × 6MB ≈ 1.2GB 原始 JSON 进内存，在 8GB 机器上纯属浪费。
+    这里改成纯 SQL：只判断"字段非空 + 冷表无对应行"，不反序列化 JSON。
+    """
     gaps = 0
-    checked = 0
-    last_id = 0
-    per_field: dict[str, int] = {field: 0 for field in _LEGACY_FIELDS}
-    while True:
-        with session_scope() as db:
-            rows = list(
-                db.scalars(
-                    select(StrategyRun)
-                    .where(
-                        StrategyRun.id > last_id,
-                        _legacy_not_null_condition(),
-                    )
-                    .order_by(StrategyRun.id.asc())
-                    .limit(200)
-                ).all()
+    per_field: dict[str, int] = {}
+    with session_scope() as db:
+        for field, payload_type in FIELD_TO_PAYLOAD_TYPE.items():
+            # CAST(...) != 'null' 兜住历史遗留的 JSON 文本 null
+            count = int(
+                db.scalar(
+                    text(
+                        f"SELECT COUNT(*) FROM strategy_runs AS r "
+                        f"WHERE r.{field} IS NOT NULL "
+                        f"AND CAST(r.{field} AS TEXT) != 'null' "
+                        f"AND NOT EXISTS ("
+                        f"  SELECT 1 FROM strategy_run_payloads AS p "
+                        f"  WHERE p.run_id = r.id AND p.payload_type = :ptype"
+                        f")"
+                    ),
+                    {"ptype": payload_type},
+                )
+                or 0
             )
-            if not rows:
-                break
-            last_id = int(rows[-1].id)
-            for run in rows:
-                checked += 1
-                cold_types = {
-                    row.payload_type
-                    for row in db.scalars(
-                        select(StrategyRunPayload).where(
-                            StrategyRunPayload.run_id == run.id
-                        )
-                    ).all()
-                }
-                for field, payload_type in FIELD_TO_PAYLOAD_TYPE.items():
-                    if getattr(run, field, None) is None:
-                        continue
-                    if payload_type in cold_types:
-                        continue
-                    gaps += 1
-                    per_field[field] += 1
+            per_field[field] = count
+            gaps += count
     logger.info(
-        "旧字段覆盖度：检查 %d 条仍有旧字段的运行，缺少冷表记录 %d 处 %s",
-        checked,
+        "旧字段覆盖度（SQL 检查）：缺少冷表记录 %d 处 %s",
         gaps,
         {k: v for k, v in per_field.items() if v},
     )

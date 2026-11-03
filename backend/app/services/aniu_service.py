@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm.attributes import set_committed_value
 
 from app.core.auth import create_access_token
 from app.core.config import get_settings
@@ -1138,6 +1139,65 @@ class AniuService:
         run.input_tokens = token_usage["input"]
         run.output_tokens = token_usage["output"]
         run.total_tokens = token_usage["total"]
+
+    def _persist_run_payloads(
+        self, db: Session, run: StrategyRun, *, run_id: int
+    ) -> None:
+        """把原始载荷写入冷表；写入完整才清空热表字段（同一事务）。
+
+        历史教训（第 17 轮审计 DB-01）：此前是"双写"——冷表写一份、
+        热表也保留一份，于是历史迁移做完之后每次运行又往热表塞 5~9MB，
+        库仍以 ~130MB/天重新膨胀。现在的语义是：
+
+        1. `store_run_payloads` 先写冷表（与本次 run 收尾同一事务）；
+        2. 冷表行数与内存里的非空载荷数一致，才用 `set_committed_value`
+           把热表字段置空 —— 这一步**不产生 UPDATE**，热表列保持 NULL；
+        3. 冷表写入失败/不完整：不清空，保留热表原始数据兜底（宁可热表
+           变大，也不能丢审计载荷）；
+        4. 事务失败时冷表插入与热表清空一起回滚，不会出现"两边都没有"。
+        """
+        expected_types = [
+            field
+            for field in (
+                "llm_request_payload",
+                "llm_response_payload",
+                "skill_payloads",
+                "decision_payload",
+            )
+            if getattr(run, field, None) is not None
+        ]
+        if not expected_types:
+            return
+
+        stored = 0
+        try:
+            stored = run_payload_service.store_run_payloads(db, run)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "store_run_payloads failed, keeping hot-table copy: run_id=%s err=%s",
+                run_id,
+                exc,
+            )
+            return
+
+        if stored < len(expected_types):
+            logger.error(
+                "cold payload store incomplete, keeping hot-table copy: "
+                "run_id=%s stored=%s expected=%s",
+                run_id,
+                stored,
+                len(expected_types),
+            )
+            return
+
+        for field in expected_types:
+            # 只清内存视图，不落盘：DB 里这些列本来就是 NULL
+            set_committed_value(run, field, None)
+        logger.debug(
+            "run payloads stored to cold table: run_id=%s types=%s",
+            run_id,
+            len(expected_types),
+        )
 
     def _warn_on_unregistered_trade_intents(
         self, db: Session, *, run_id: int, executed_actions: Any
@@ -3330,6 +3390,8 @@ class AniuService:
                 run.context_tokens_estimate = (
                     session_context.context_tokens_estimate if session_context else None
                 )
+                # 原始载荷只在内存里挂到 run 上，用于计算统计快照与写冷表；
+                # 绝不持久化进 strategy_runs（见下方 _persist_run_payloads）。
                 run.skill_payloads = skill_payloads
                 run.llm_request_payload = llm_request
                 run.llm_response_payload = llm_response
@@ -3346,14 +3408,8 @@ class AniuService:
                 # 统计快照写入窄列：列表/概览接口后续只读这些列，
                 # 不再为了算 Token 与调用次数去解析大 JSON。
                 self._hydrate_run_summary_metrics(run)
-                # 阶段 C：原始载荷双写冷表（gzip），读取优先冷表。
-                try:
-                    run_payload_service.store_run_payloads(db, run)
-                except Exception as exc:  # noqa: BLE001
-                    # 冷表写入失败绝不能影响运行收尾（交易已完成）
-                    logger.warning(
-                        "store_run_payloads failed: run_id=%s err=%s", run_id, exc
-                    )
+                # 阶段 C（DB-01）：载荷只落冷表；冷表写不完整时保留热表兜底。
+                self._persist_run_payloads(db, run, run_id=run_id)
                 run.status = "completed" if not run_error_message else "failed"
                 run.finished_at = completed_at
                 db.add(run)

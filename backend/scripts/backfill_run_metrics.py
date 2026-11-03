@@ -43,12 +43,14 @@ import logging
 import time
 
 from sqlalchemy import or_, select
+from sqlalchemy.orm.attributes import set_committed_value
 
 from app.db.database import init_db, session_scope
 from app.db.models import StrategyRun
 from app.services.aniu_service import aniu_service
 from app.services.run_payload_service import (
     FIELD_TO_PAYLOAD_TYPE,
+    PAYLOAD_TYPE_TO_FIELD,
     run_payload_service,
 )
 
@@ -69,21 +71,44 @@ def _pending_condition():
 
 
 def _hydrate_payloads_from_cold_table(db, run: StrategyRun) -> str | None:
-    """旧字段为空时从冷表恢复。返回恢复来源说明，None 表示拿不到数据。"""
-    if any(getattr(run, field, None) is not None for field in _LEGACY_FIELDS):
+    """按字段补齐载荷：已有的用热表值，缺失的从冷表补。
+
+    两个约束（第 17 轮审计 DB-02 / DB-03）：
+    * 冷表补全必须用 `set_committed_value` —— 普通 setattr 会把对象标脏，
+      提交时把几 MB 原始 JSON 又 UPDATE 回 `strategy_runs`，等于撤销
+      clear-legacy；
+    * 不能"只要有一个旧字段存在就认为全部来自热表"，要逐字段合并。
+
+    返回值：`"legacy"` / `"cold"` / `"mixed"` 表示来源，None 表示完全没有载荷。
+    """
+    missing_fields = [
+        field for field in _LEGACY_FIELDS if getattr(run, field, None) is None
+    ]
+    has_legacy = len(missing_fields) < len(_LEGACY_FIELDS)
+    if not missing_fields:
         return "legacy"
     try:
-        loaded = run_payload_service.load_run_payloads(db, int(run.id))
+        loaded = run_payload_service.load_run_payloads(
+            db,
+            int(run.id),
+            payload_types=[
+                FIELD_TO_PAYLOAD_TYPE[field] for field in missing_fields
+            ],
+        )
     except Exception as exc:  # noqa: BLE001
         logger.warning("读取冷表失败 run_id=%s: %s", run.id, exc)
-        return None
-    if not loaded:
-        return None
+        return "legacy" if has_legacy else None
+    restored = 0
     for payload_type, value in loaded.items():
-        field = {v: k for k, v in FIELD_TO_PAYLOAD_TYPE.items()}.get(payload_type)
-        if field:
-            setattr(run, field, value)
-    return "cold"
+        field = PAYLOAD_TYPE_TO_FIELD.get(payload_type)
+        if field is None or getattr(run, field, None) is not None:
+            continue
+        # 只填会话内视图，绝不写回热表
+        set_committed_value(run, field, value)
+        restored += 1
+    if restored == 0:
+        return "legacy" if has_legacy else None
+    return "mixed" if has_legacy else "cold"
 
 
 def main() -> int:
@@ -151,7 +176,7 @@ def main() -> int:
                     skipped_no_payload += 1
                     logger.debug("skip run_id=%s: no payload available", run.id)
                     continue
-                if source == "cold":
+                if source in {"cold", "mixed"}:
                     from_cold += 1
                 aniu_service._hydrate_run_summary_metrics(run)
                 db.add(run)

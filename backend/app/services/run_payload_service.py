@@ -3,8 +3,9 @@
 把 `strategy_runs` 里四个大 JSON 字段搬到 `strategy_run_payloads`，用 gzip
 压缩后按需读取。设计约束：
 
-* **双写过渡**：运行收尾时同时写热表旧字段与冷表，读取优先冷表、
-  回退旧字段，因此任何时刻都不会丢数据；
+* **冷表是唯一持久化位置**：运行收尾只写冷表，热表字段保持 SQL NULL；
+  冷表写入失败/不完整时才保留热表副本兜底（宁可热表变大也不丢审计载荷）；
+* 读取优先冷表，历史行回退旧字段，因此迁移过渡期任何时刻都不会丢数据；
 * 冷表行带 `original_size / compressed_size / sha256`，可离线校验；
 * 压缩只用标准库 gzip（`mtime=0` 保证同输入稳定输出，便于比对）；
 * 解压失败不能炸掉接口：返回 None 并记日志，让上层回落旧字段。
@@ -79,9 +80,11 @@ class RunPayloadService:
     # -- 写入 -------------------------------------------------------------
 
     def store_run_payloads(self, db: Session, run: StrategyRun) -> int:
-        """把 run 当前的热表大字段（双写）写入冷表，返回写入/更新行数。
+        """把 run 上内存里的载荷写入冷表，返回写入/更新的行数。
 
         `None` 字段跳过（不产生空行）；已存在的行按 run_id + type 更新。
+        调用方（`aniu_service._persist_run_payloads`）据此判断"是否完整"——
+        只有返回条数等于内存里的非空载荷数，才允许清空热表字段。
         """
         stored = 0
         for field, payload_type in FIELD_TO_PAYLOAD_TYPE.items():
