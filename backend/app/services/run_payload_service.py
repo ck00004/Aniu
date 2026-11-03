@@ -23,6 +23,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import set_committed_value
 
+from app.db.database import session_scope
 from app.db.models import StrategyRun, StrategyRunPayload
 
 logger = logging.getLogger(__name__)
@@ -125,6 +126,108 @@ class RunPayloadService:
                 db.add(existing)
             stored += 1
         return stored
+
+    def store_run_payloads_isolated(
+        self, *, run_id: int, payloads: dict[str, Any]
+    ) -> bool:
+        """在**独立事务**里把载荷写进冷表并提交，返回是否真正持久化成功。
+
+        为什么必须独立事务（第 18 轮审计 DB-07）：`db.add()` 只是把对象放入
+        Session，`autoflush=False` 时真正 INSERT 发生在 commit；如果复用运行
+        收尾的那个事务，一旦收尾提交失败（磁盘满 / I/O 错 / 约束冲突），冷表
+        插入会跟着回滚，而热表字段又已经被清空 → 原始载荷两边都没了。
+
+        因此：先独立提交冷表（含 flush + 逐条回读校验 sha256/size），成功
+        之后调用方才允许把热表字段置空；失败则保留热表兜底。
+
+        校验项：
+        * 四类载荷各自都有落库行；
+        * `compressed_size` 与 BLOB 实际长度一致；
+        * 解压后重算 sha256 与原值一致（防截断/损坏）。
+        """
+        wanted = {k: v for k, v in payloads.items() if v is not None}
+        if not wanted:
+            return True
+        try:
+            with session_scope() as db:
+                for payload_type, value in wanted.items():
+                    blob, digest, original_size, compressed_size = compress_json(value)
+                    existing = db.scalar(
+                        select(StrategyRunPayload).where(
+                            StrategyRunPayload.run_id == run_id,
+                            StrategyRunPayload.payload_type == payload_type,
+                        )
+                    )
+                    if existing is None:
+                        db.add(
+                            StrategyRunPayload(
+                                run_id=run_id,
+                                payload_type=payload_type,
+                                payload_data=blob,
+                                compression=COMPRESSION_GZIP,
+                                original_size=original_size,
+                                compressed_size=compressed_size,
+                                sha256=digest,
+                            )
+                        )
+                    else:
+                        existing.payload_data = blob
+                        existing.compression = COMPRESSION_GZIP
+                        existing.original_size = original_size
+                        existing.compressed_size = compressed_size
+                        existing.sha256 = digest
+                        db.add(existing)
+                # flush 让 INSERT/UPDATE 真正打到 SQLite（错误在此暴露）
+                db.flush()
+                rows = (
+                    db.execute(
+                        select(
+                            StrategyRunPayload.payload_type,
+                            StrategyRunPayload.payload_data,
+                            StrategyRunPayload.compression,
+                            StrategyRunPayload.original_size,
+                            StrategyRunPayload.compressed_size,
+                            StrategyRunPayload.sha256,
+                        ).where(
+                            StrategyRunPayload.run_id == run_id,
+                            StrategyRunPayload.payload_type.in_(list(wanted)),
+                        )
+                    )
+                    .mappings()
+                    .all()
+                )
+                found = {row["payload_type"]: row for row in rows}
+                for payload_type in wanted:
+                    row = found.get(payload_type)
+                    if row is None:
+                        raise RuntimeError(f"冷表缺少载荷 {payload_type}")
+                    data = row["payload_data"]
+                    if data is None:
+                        raise RuntimeError(f"冷表载荷为空 {payload_type}")
+                    if int(row["compressed_size"] or -1) != len(data):
+                        raise RuntimeError(
+                            f"冷表载荷 compressed_size 与实际长度不一致 {payload_type}"
+                        )
+                    restored = decompress_json(
+                        data, compression=row["compression"]
+                    )
+                    if restored is None:
+                        raise RuntimeError(f"冷表载荷解压失败 {payload_type}")
+                    recomputed = _sha256(
+                        json.dumps(
+                            restored, ensure_ascii=False, separators=(",", ":")
+                        ).encode("utf-8")
+                    )
+                    if row["sha256"] and recomputed != row["sha256"]:
+                        raise RuntimeError(f"冷表载荷 sha256 校验失败 {payload_type}")
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "cold payload store failed (isolated tx rolled back): run_id=%s err=%s",
+                run_id,
+                exc,
+            )
+            return False
 
     # -- 读取 -------------------------------------------------------------
 

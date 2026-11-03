@@ -596,6 +596,8 @@ def _ensure_strategy_run_columns(engine) -> None:
         "total_tokens": "ALTER TABLE strategy_runs ADD COLUMN total_tokens INTEGER",
         "api_call_count": "ALTER TABLE strategy_runs ADD COLUMN api_call_count INTEGER",
         "executed_trade_count": "ALTER TABLE strategy_runs ADD COLUMN executed_trade_count INTEGER",
+        "payload_storage": "ALTER TABLE strategy_runs ADD COLUMN payload_storage VARCHAR(16)",
+        "metrics_status": "ALTER TABLE strategy_runs ADD COLUMN metrics_status VARCHAR(16)",
     }
 
     with engine.begin() as connection:

@@ -42,7 +42,7 @@ import argparse
 import logging
 import time
 
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm.attributes import set_committed_value
 
 from app.db.database import init_db, session_scope
@@ -67,7 +67,14 @@ _METRIC_FIELDS = (
 
 
 def _pending_condition():
-    return or_(*[getattr(StrategyRun, field).is_(None) for field in _METRIC_FIELDS])
+    return and_(
+        or_(*[getattr(StrategyRun, field).is_(None) for field in _METRIC_FIELDS]),
+        # 已确认"完全没有载荷"的行不再重复扫描（指标保持 NULL，不伪造 0）
+        or_(
+            StrategyRun.metrics_status.is_(None),
+            StrategyRun.metrics_status != "unavailable",
+        ),
+    )
 
 
 def _hydrate_payloads_from_cold_table(db, run: StrategyRun) -> str | None:
@@ -172,13 +179,21 @@ def main() -> int:
                 source = _hydrate_payloads_from_cold_table(db, run)
                 if source is None:
                     # 既没有旧字段也没有冷表载荷：可能是启动即失败的运行。
-                    # 这种情况下不写 0（避免伪造统计），保持 NULL 并在报告里可见。
+                    # 不写 0（避免伪造统计），但标记 unavailable，避免每次重扫。
+                    run.metrics_status = "unavailable"
+                    db.add(run)
                     skipped_no_payload += 1
                     logger.debug("skip run_id=%s: no payload available", run.id)
                     continue
                 if source in {"cold", "mixed"}:
                     from_cold += 1
                 aniu_service._hydrate_run_summary_metrics(run)
+                run.metrics_status = aniu_service._resolve_metrics_status(
+                    llm_request=run.llm_request_payload,
+                    llm_response=run.llm_response_payload,
+                    skill_payloads=run.skill_payloads,
+                    decision=run.decision_payload,
+                )
                 db.add(run)
                 touched += 1
             total += touched

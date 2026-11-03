@@ -39,11 +39,16 @@ executed_trade_count`）：运行收尾时写入，历史行用脚本回填。
 新表 `strategy_run_payloads(run_id, payload_type, payload_data BLOB, ...)`，
 四个大字段（`llm_request / llm_response / skill / decision`）压缩后存这里：
 
-- **冷表是唯一持久化位置（DB-01）**：运行收尾时载荷只在内存里用于算
-  统计，随即写入冷表；写完整之后用 `set_committed_value` 把内存视图置空，
-  **热表四个字段保持 SQL NULL，不再双写**。冷表写入异常/不完整时则保留
-  热表副本兜底（宁可热表变大，也不丢审计载荷），且冷表插入与热表字段在
-  同一个事务里，失败一起回滚。
+- **冷表是唯一持久化位置（DB-01 + DB-07）**：运行收尾时先在**独立事务**
+  里写冷表，`flush` 后逐条回读校验（四类载荷齐全、`compressed_size` 与
+  BLOB 实际长度一致、解压后 sha256 一致），事务提交成功才允许"不写热表"。
+  校验通过 → 热表四个字段保持 SQL NULL；校验失败/提交失败 → 冷表整体回滚，
+  运行收尾改走**热表兜底**并标记 `payload_storage='hot_fallback'`。
+
+  为什么必须独立事务：`db.add()` 只是把对象放进 Session，`autoflush=False`
+  时真正的 INSERT 发生在 commit。若与运行收尾共用事务，收尾提交失败会连带
+  回滚冷表，而热表又已被跳过 → 原始载荷两边都没有。独立事务后：
+  冷表失败 → 热表兜底；冷表成功但运行状态提交失败 → 冷表载荷仍在。
 - **双读**：详情/报告/账户兜底优先冷表，未回填的历史行回退旧字段；
 - 冷表行带 `original_size / compressed_size / sha256`，可离线校验。
 
@@ -86,6 +91,21 @@ executed_trade_count`）：运行收尾时写入，历史行用脚本回填。
 保留策略**只**清理：冷表载荷、工具日志、记忆活动日志。交易事实
 （`trade_orders` / `trade_intents` / `self_select_intents`）、运行结论
 （`analysis_summary` / `final_answer`）、执行动作与交易记录**永不**清理。
+
+### 兜底行的复查与重新迁移
+
+正常运行时热表保持 NULL；只有冷表写入失败才会出现 `payload_storage='hot_fallback'`：
+
+```sql
+-- 兜底行数量（日常应为 0，出现即说明冷表写入异常过）
+SELECT payload_storage, COUNT(*) FROM strategy_runs GROUP BY 1;
+
+-- 指标口径分布：complete / partial / unavailable
+SELECT metrics_status, COUNT(*) FROM strategy_runs GROUP BY 1;
+```
+
+这些行的热表旧字段还在，直接重跑 `migrate_run_payloads backfill` 就会重新
+迁移（`verify` 的覆盖度检查通过后再 `clear-legacy` 就能清掉）。
 
 ### 索引复核
 
@@ -135,6 +155,9 @@ df -h .                                  # 需要 ≥ 3 份备份的空间（约
 .venv/bin/python -m scripts.db_maintenance report
 ```
 
+> 注意：`migrate_run_payloads all` 只等于"载荷回填 + 校验 + 清空旧字段"，
+> **不包含** `backfill_run_metrics`。完整 A–E 迁移必须按下面逐条执行。
+
 **顺序红线**：`backfill_run_metrics` 在 `clear-legacy` 之前；`vacuum` 在
 `clear-legacy` 之后；`vacuum` 期间不得有生产读写；迁移全程不启动 uvicorn。
 
@@ -177,6 +200,10 @@ SELECT COUNT(*) total_runs,
        SUM(CASE WHEN api_call_count IS NULL THEN 1 ELSE 0 END) missing_api_calls,
        SUM(CASE WHEN executed_trade_count IS NULL THEN 1 ELSE 0 END) missing_trades
 FROM strategy_runs;
+
+-- 3b) 载荷去向与指标口径
+SELECT COALESCE(payload_storage,'(未标记)') storage, COUNT(*) FROM strategy_runs GROUP BY 1;
+SELECT COALESCE(metrics_status,'(未标记)') metrics, COUNT(*) FROM strategy_runs GROUP BY 1;
 
 -- 4) 外键
 PRAGMA foreign_key_list(trade_intents);       -- 期望 2 条

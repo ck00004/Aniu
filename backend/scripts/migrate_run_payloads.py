@@ -173,6 +173,13 @@ def verify(batch_size: int, sleep_seconds: float) -> int:
                         row.run_id,
                         row.payload_type,
                     )
+                if len(row.payload_data or b"") != int(row.compressed_size or 0):
+                    mismatched += 1
+                    logger.error(
+                        "payload compressed_size 与实际长度不一致: run_id=%s type=%s",
+                        row.run_id,
+                        row.payload_type,
+                    )
                 if len(recomputed) != int(row.original_size or 0):
                     mismatched += 1
                     logger.error(
@@ -265,6 +272,21 @@ def inspect() -> None:
             compressed / 1e6,
             100 * compressed / original,
         )
+    with session_scope() as db:
+        storage_rows = db.execute(
+            text(
+                "SELECT COALESCE(payload_storage,'(未标记)'), COUNT(*) "
+                "FROM strategy_runs GROUP BY 1 ORDER BY 2 DESC"
+            )
+        ).all()
+        metrics_rows = db.execute(
+            text(
+                "SELECT COALESCE(metrics_status,'(未标记)'), COUNT(*) "
+                "FROM strategy_runs GROUP BY 1 ORDER BY 2 DESC"
+            )
+        ).all()
+    logger.info("payload_storage 分布：%s", [tuple(r) for r in storage_rows])
+    logger.info("metrics_status 分布：%s", [tuple(r) for r in metrics_rows])
     if payload_runs < total_runs:
         logger.info(
             "尚未有冷表载荷的运行数：%d（可能从未产生载荷，或还没回填）",

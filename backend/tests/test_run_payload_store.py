@@ -9,7 +9,7 @@ from pathlib import Path
 import sys
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
@@ -340,57 +340,162 @@ def _hot_remaining() -> tuple[int, int]:
     return int(row[0] or 0), int(row[1] or 0)
 
 
-def test_finalize_writes_payloads_to_cold_table_only(db_env) -> None:
-    """DB-01：运行收尾后热表四个大字段必须是 SQL NULL，载荷只在冷表。"""
-    run_id = _make_bare_run()
+def _simulate_run_finalize(
+    run_id: int,
+    *,
+    payloads: dict,
+    fail_cold_store: bool = False,
+    monkeypatch=None,
+) -> None:
+    """复刻 aniu_service._run_body 的收尾顺序（独立事务写冷表 → 再写运行状态）。"""
+    from types import SimpleNamespace
+
+    if fail_cold_store:
+        # 用真实 SQLite 触发器让 INSERT 失败（不是 mock），验证回滚与兜底
+        with session_scope() as db:
+            db.execute(
+                text(
+                    "CREATE TRIGGER IF NOT EXISTS fail_payload_insert "
+                    "BEFORE INSERT ON strategy_run_payloads "
+                    "BEGIN SELECT RAISE(ABORT, 'forced payload insert failure'); END;"
+                )
+            )
+            db.commit()
+
+    metrics_source = SimpleNamespace(
+        llm_request_payload=payloads.get("llm_request"),
+        llm_response_payload=payloads.get("llm_response"),
+        skill_payloads=payloads.get("skill"),
+        decision_payload=payloads.get("decision"),
+        executed_actions=[{"action": "BUY", "symbol": "600000"}],
+    )
+    aniu_service._hydrate_run_summary_metrics(metrics_source)
+    cold_stored = run_payload_service.store_run_payloads_isolated(
+        run_id=run_id, payloads=payloads
+    )
+
     with session_scope() as db:
         run = db.get(StrategyRun, run_id)
-        _assign_payloads_in_memory(run)
-        aniu_service._hydrate_run_summary_metrics(run)
-        aniu_service._persist_run_payloads(db, run, run_id=run_id)
+        aniu_service._apply_run_payload_storage(
+            run,
+            cold_stored=cold_stored,
+            llm_request=payloads.get("llm_request"),
+            llm_response=payloads.get("llm_response"),
+            skill_payloads=payloads.get("skill"),
+            decision=payloads.get("decision"),
+        )
+        run.api_call_count = metrics_source.api_call_count
+        run.total_tokens = metrics_source.total_tokens
+        run.executed_trade_count = metrics_source.executed_trade_count
         run.status = "completed"
+
+    if fail_cold_store:
+        with session_scope() as db:
+            db.execute(text("DROP TRIGGER IF EXISTS fail_payload_insert"))
+            db.commit()
+
+
+_FAULT_PAYLOADS = {
+    "llm_request": {"messages": [{"role": "user", "content": "x" * 500}]},
+    "llm_response": {"usage": {"prompt_tokens": 5, "completion_tokens": 6, "total_tokens": 11}},
+    "skill": {"tool_calls": [{"name": "mx_get_balance", "result": {"ok": True}}]},
+    "decision": {"final_answer": "结论"},
+}
+
+
+def test_finalize_writes_payloads_to_cold_table_only(db_env) -> None:
+    """DB-01：冷表落盘成功后，热表四个大字段保持 SQL NULL。"""
+    run_id = _make_bare_run()
+    _simulate_run_finalize(run_id, payloads=_FAULT_PAYLOADS)
 
     assert _hot_remaining() == (0, 0), "热表仍在持久化原始载荷"
     with session_scope() as db:
         assert db.scalar(select(func.count(StrategyRunPayload.id))) == 4
         run = db.get(StrategyRun, run_id)
-        # 指标仍写入窄列
+        assert run.payload_storage == "cold"
+        assert run.metrics_status == "complete"
         assert run.api_call_count == 1
         assert run.total_tokens == 11
-    # 详情仍可完整恢复
+        assert run.status == "completed"
     with session_scope() as db:
         hydrated = aniu_service.get_run(db, run_id)
         assert hydrated.skill_payloads is not None
-        assert hydrated.llm_request_payload is not None
 
 
-def test_finalize_keeps_hot_copy_when_cold_store_fails(db_env, monkeypatch) -> None:
-    """DB-01：冷表写入异常时必须保留热表副本，绝不丢审计载荷。"""
+def test_finalize_falls_back_to_hot_table_on_real_insert_failure(db_env) -> None:
+    """DB-07：真实 INSERT 失败（触发器）时，冷表零残留 + 热表兜底提交。"""
     run_id = _make_bare_run()
+    _simulate_run_finalize(run_id, payloads=_FAULT_PAYLOADS, fail_cold_store=True)
 
-    def _boom(db, run):
-        raise RuntimeError("cold store down")
+    with session_scope() as db:
+        # 冷表插入被回滚，不能留下半份数据
+        assert db.scalar(select(func.count(StrategyRunPayload.id))) == 0
+        run = db.get(StrategyRun, run_id)
+        assert run.payload_storage == "hot_fallback"
+        assert run.llm_request_payload is not None
+        assert run.skill_payloads is not None
+        # 运行本身仍然正常完成，交易事实不丢
+        assert run.status == "completed"
+        assert run.api_call_count == 1
+        assert run.total_tokens == 11
 
-    monkeypatch.setattr(run_payload_service, "store_run_payloads", _boom)
+    # 触发器移除后可重新迁移到冷表
     with session_scope() as db:
         run = db.get(StrategyRun, run_id)
-        _assign_payloads_in_memory(run)
-        aniu_service._hydrate_run_summary_metrics(run)
-        aniu_service._persist_run_payloads(db, run, run_id=run_id)
-        run.status = "completed"
+        stored = run_payload_service.store_run_payloads(db, run)
+        run.payload_storage = "cold"
+        run.llm_request_payload = None
+        run.llm_response_payload = None
+        run.skill_payloads = None
+        run.decision_payload = None
+        db.add(run)
+    assert stored == 4
+    assert _hot_remaining() == (0, 0)
 
-    remaining = _hot_remaining()
-    assert remaining == (1, 1), f"冷表失败时热表副本被丢弃：{remaining}"
 
-
-def test_finalize_keeps_hot_copy_when_cold_store_incomplete(db_env, monkeypatch) -> None:
+def test_cold_payload_survives_when_run_update_commit_fails(db_env) -> None:
+    """DB-07 核心收益：冷表已独立提交后，运行状态提交失败也不会丢载荷。"""
     run_id = _make_bare_run()
-    monkeypatch.setattr(
-        run_payload_service, "store_run_payloads", lambda db, run: 2
+    payloads = dict(_FAULT_PAYLOADS)
+
+    # 1) 冷表独立事务：成功提交
+    assert (
+        run_payload_service.store_run_payloads_isolated(
+            run_id=run_id, payloads=payloads
+        )
+        is True
     )
-    with session_scope() as db:
-        run = db.get(StrategyRun, run_id)
-        _assign_payloads_in_memory(run)
-        aniu_service._persist_run_payloads(db, run, run_id=run_id)
 
-    assert _hot_remaining() == (1, 1), "冷表写入不完整时不应清空热表"
+    # 2) 让运行收尾的 UPDATE 必然失败
+    with session_scope() as db:
+        db.execute(
+            text(
+                "CREATE TRIGGER IF NOT EXISTS fail_run_update "
+                "BEFORE UPDATE ON strategy_runs "
+                "BEGIN SELECT RAISE(ABORT, 'forced run update failure'); END;"
+            )
+        )
+        db.commit()
+
+    failed = False
+    try:
+        with session_scope() as db:
+            run = db.get(StrategyRun, run_id)
+            run.status = "completed"
+            run.finished_at = datetime(2026, 11, 3, 2, 0)
+            db.add(run)
+    except Exception:
+        failed = True
+
+    with session_scope() as db:
+        db.execute(text("DROP TRIGGER IF EXISTS fail_run_update"))
+        db.commit()
+
+    assert failed, "故障注入未生效，测试无意义"
+    with session_scope() as db:
+        # 冷表载荷仍在（独立事务已提交）
+        assert db.scalar(select(func.count(StrategyRunPayload.id))) == 4
+        # 运行状态回滚为原值，但载荷可以从冷表恢复
+        run = db.get(StrategyRun, run_id)
+        assert run.status == "running"
+        assert run_payload_service.load_run_payloads(db, run_id).get("skill")

@@ -53,7 +53,10 @@ from app.services.cls_news_service import cls_news_service
 from app.services.jin10_news_service import jin10_news_service
 from app.services.llm_service import LLMStreamCancelled, llm_service
 from app.services.run_abort_service import run_abort_registry
-from app.services.run_payload_service import run_payload_service
+from app.services.run_payload_service import (
+    FIELD_TO_PAYLOAD_TYPE,
+    run_payload_service,
+)
 from app.services.mx_skill_service import mx_skill_service
 from app.services.mx_service import MXClient
 from app.services.token_estimator import (
@@ -631,6 +634,8 @@ class AniuService:
             StrategyRun.total_tokens,
             StrategyRun.api_call_count,
             StrategyRun.executed_trade_count,
+            StrategyRun.payload_storage,
+            StrategyRun.metrics_status,
             StrategyRun.started_at,
             StrategyRun.finished_at,
         )
@@ -663,6 +668,8 @@ class AniuService:
             "input_tokens": row["input_tokens"],
             "output_tokens": row["output_tokens"],
             "total_tokens": row["total_tokens"],
+            "payload_storage": row["payload_storage"],
+            "metrics_status": row["metrics_status"],
             "started_at": _assume_utc(row["started_at"]),
             "finished_at": _assume_utc(row["finished_at"]),
         }
@@ -1140,64 +1147,61 @@ class AniuService:
         run.output_tokens = token_usage["output"]
         run.total_tokens = token_usage["total"]
 
-    def _persist_run_payloads(
-        self, db: Session, run: StrategyRun, *, run_id: int
+    def _apply_run_payload_storage(
+        self,
+        run: StrategyRun,
+        *,
+        cold_stored: bool,
+        llm_request: Any,
+        llm_response: Any,
+        skill_payloads: Any,
+        decision: Any,
     ) -> None:
-        """把原始载荷写入冷表；写入完整才清空热表字段（同一事务）。
+        """根据冷表是否真正落盘，决定"不写热表"还是"热表兜底"。
 
-        历史教训（第 17 轮审计 DB-01）：此前是"双写"——冷表写一份、
-        热表也保留一份，于是历史迁移做完之后每次运行又往热表塞 5~9MB，
-        库仍以 ~130MB/天重新膨胀。现在的语义是：
-
-        1. `store_run_payloads` 先写冷表（与本次 run 收尾同一事务）；
-        2. 冷表行数与内存里的非空载荷数一致，才用 `set_committed_value`
-           把热表字段置空 —— 这一步**不产生 UPDATE**，热表列保持 NULL；
-        3. 冷表写入失败/不完整：不清空，保留热表原始数据兜底（宁可热表
-           变大，也不能丢审计载荷）；
-        4. 事务失败时冷表插入与热表清空一起回滚，不会出现"两边都没有"。
+        `cold_stored=True` 时**不**给 run 赋载荷字段（热表保持 SQL NULL）；
+        False 时把载荷挂回 run，随本次收尾事务写入热表兜底，并标记
+        `payload_storage=hot_fallback` 供后续重新迁移。
         """
-        expected_types = [
-            field
-            for field in (
-                "llm_request_payload",
-                "llm_response_payload",
-                "skill_payloads",
-                "decision_payload",
-            )
-            if getattr(run, field, None) is not None
-        ]
-        if not expected_types:
-            return
-
-        stored = 0
-        try:
-            stored = run_payload_service.store_run_payloads(db, run)
-        except Exception as exc:  # noqa: BLE001
+        if not cold_stored:
+            run.llm_request_payload = llm_request
+            run.llm_response_payload = llm_response
+            run.skill_payloads = skill_payloads
+            run.decision_payload = decision
             logger.error(
-                "store_run_payloads failed, keeping hot-table copy: run_id=%s err=%s",
-                run_id,
-                exc,
+                "run payloads kept in hot table (cold store failed): run_id=%s",
+                getattr(run, "id", None),
             )
-            return
-
-        if stored < len(expected_types):
-            logger.error(
-                "cold payload store incomplete, keeping hot-table copy: "
-                "run_id=%s stored=%s expected=%s",
-                run_id,
-                stored,
-                len(expected_types),
-            )
-            return
-
-        for field in expected_types:
-            # 只清内存视图，不落盘：DB 里这些列本来就是 NULL
-            set_committed_value(run, field, None)
-        logger.debug(
-            "run payloads stored to cold table: run_id=%s types=%s",
-            run_id,
-            len(expected_types),
+        run.payload_storage = "cold" if cold_stored else "hot_fallback"
+        run.metrics_status = self._resolve_metrics_status(
+            llm_request=llm_request,
+            llm_response=llm_response,
+            skill_payloads=skill_payloads,
+            decision=decision,
         )
+
+    def _resolve_metrics_status(
+        self,
+        *,
+        llm_request: Any,
+        llm_response: Any,
+        skill_payloads: Any,
+        decision: Any,
+    ) -> str:
+        """统计快照的完整度口径（避免把"算不出来"当成真实的 0）。
+
+        * complete：skill 载荷 + 至少一份 LLM 载荷在手，Token 与调用次数可信；
+        * partial ：只有部分载荷，指标可能偏小；
+        * unavailable：完全没有载荷（通常是启动即失败的运行）。
+        """
+        has_skill = skill_payloads is not None
+        has_llm = llm_request is not None or llm_response is not None
+        has_decision = decision is not None
+        if has_skill and has_llm:
+            return "complete"
+        if has_skill or has_llm or has_decision:
+            return "partial"
+        return "unavailable"
 
     def _warn_on_unregistered_trade_intents(
         self, db: Session, *, run_id: int, executed_actions: Any
@@ -3376,6 +3380,30 @@ class AniuService:
                     message=f"正在写入交易执行记录（{len(persisted_trade_orders)} 条）",
                 )
 
+            # 阶段 C（DB-07）：原始载荷先在**独立事务**里写冷表并提交，
+            # 只有确认真正落盘后才允许不写热表；失败则退回热表兜底。
+            payloads = {
+                FIELD_TO_PAYLOAD_TYPE[field]: value
+                for field, value in (
+                    ("llm_request_payload", llm_request),
+                    ("llm_response_payload", llm_response),
+                    ("skill_payloads", skill_payloads),
+                    ("decision_payload", decision),
+                )
+                if value is not None
+            }
+            metrics_source = SimpleNamespace(
+                llm_request_payload=llm_request,
+                llm_response_payload=llm_response,
+                skill_payloads=skill_payloads,
+                decision_payload=decision,
+                executed_actions=executed_actions,
+            )
+            self._hydrate_run_summary_metrics(metrics_source)
+            cold_stored = run_payload_service.store_run_payloads_isolated(
+                run_id=run_id, payloads=payloads
+            )
+
             with session_scope() as db:
                 run = db.get(StrategyRun, run_id)
                 if run is None:
@@ -3390,12 +3418,14 @@ class AniuService:
                 run.context_tokens_estimate = (
                     session_context.context_tokens_estimate if session_context else None
                 )
-                # 原始载荷只在内存里挂到 run 上，用于计算统计快照与写冷表；
-                # 绝不持久化进 strategy_runs（见下方 _persist_run_payloads）。
-                run.skill_payloads = skill_payloads
-                run.llm_request_payload = llm_request
-                run.llm_response_payload = llm_response
-                run.decision_payload = decision
+                self._apply_run_payload_storage(
+                    run,
+                    cold_stored=cold_stored,
+                    llm_request=llm_request,
+                    llm_response=llm_response,
+                    skill_payloads=skill_payloads,
+                    decision=decision,
+                )
                 run.analysis_summary = self._build_analysis_summary(
                     finalized_answer,
                     prefetched_context_meta,
@@ -3407,9 +3437,11 @@ class AniuService:
                 run.executed_actions = executed_actions
                 # 统计快照写入窄列：列表/概览接口后续只读这些列，
                 # 不再为了算 Token 与调用次数去解析大 JSON。
-                self._hydrate_run_summary_metrics(run)
-                # 阶段 C（DB-01）：载荷只落冷表；冷表写不完整时保留热表兜底。
-                self._persist_run_payloads(db, run, run_id=run_id)
+                run.api_call_count = metrics_source.api_call_count
+                run.executed_trade_count = metrics_source.executed_trade_count
+                run.input_tokens = metrics_source.input_tokens
+                run.output_tokens = metrics_source.output_tokens
+                run.total_tokens = metrics_source.total_tokens
                 run.status = "completed" if not run_error_message else "failed"
                 run.finished_at = completed_at
                 db.add(run)

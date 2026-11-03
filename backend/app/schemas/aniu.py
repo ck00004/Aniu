@@ -242,6 +242,10 @@ class RunSummaryRead(BaseModel):
     input_tokens: int | None = None
     output_tokens: int | None = None
     total_tokens: int | None = None
+    # 载荷持久化去向：cold / hot_fallback（None = 迁移前的历史行）
+    payload_storage: str | None = None
+    # 统计快照完整度：complete / partial / unavailable
+    metrics_status: str | None = None
     started_at: datetime
     finished_at: datetime | None = None
 

@@ -153,6 +153,10 @@ class StrategyRun(Base):
     total_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     api_call_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     executed_trade_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 载荷持久化去向：cold（正常）/ hot_fallback（冷表写入失败，热表兜底待重迁）
+    payload_storage: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # 统计快照完整度：complete / partial / unavailable
+    metrics_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
     # none_as_null=True：写 None 时落 SQL NULL，而不是 JSON 文本 "null"。
     # 否则 clear-legacy 之后 `IS NOT NULL` 仍为真（列里是 4 字节的 "null"），
     # 迁移校验、旧字段统计、冷表覆盖度判断都会失真。
@@ -198,8 +202,11 @@ class StrategyRunPayload(Base):
     * 详情/审阅时按需从本表解压读取；
     * 生命周期可独立管理（按年龄清理，不影响运行记录与交易事实）。
 
-    写入是"双写"：收尾时同时写热表旧字段与本表，读取优先本表、回退旧字段；
-    等历史行回填校验完成后再用脚本清空热表旧字段（`--clear-legacy`）。
+    新运行正常情况下**只**把原始载荷持久化到本表（冷表唯一），并在同一个
+    独立事务里先提交、校验通过后才不写热表；`strategy_runs` 只保留元数据、
+    统计快照与最终结论。冷表写入失败时退回热表兜底（`payload_storage`
+    标记为 `hot_fallback`），由脚本重新迁移。历史行在回填校验完成后用
+    `clear-legacy` 清空热表旧字段。
     """
 
     __tablename__ = "strategy_run_payloads"
