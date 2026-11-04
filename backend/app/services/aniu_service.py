@@ -97,7 +97,12 @@ _READ_TOOL_PAYLOAD_KEYS: dict[str, tuple[str, ...]] = {
     "mx_get_balance": ("data",),
     "mx_get_positions": ("data", "posList", "rows", "list"),
     "mx_get_orders": ("data", "orders", "orderList", "rows", "list"),
-    "mx_get_self_selects": ("data", "rows", "list"),
+    # 自选清单有两种合法形态（2026-11-04 排查）：
+    #  * 旧的原始妙想载荷：{"data": {...}}；
+    #  * 新的紧凑清单：{"total": 89, "items": [...], "codes": [...]}。
+    # `total` 是整数（0 也代表"空列表"这一有效结果），必须纳入白名单，
+    # 否则工具明明调用成功却会被判成"未拿到有效数据"→ 本轮分析被判不完整。
+    "mx_get_self_selects": ("total", "items", "data", "rows", "list"),
     "mx_search_news": ("data", "rows", "list"),
     "mx_screen_stocks": ("data", "rows", "list"),
 }

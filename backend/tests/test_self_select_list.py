@@ -167,3 +167,45 @@ def test_unparseable_payload_falls_back_to_raw() -> None:
     assert result["ok"] is True
     assert result["result"] == payload
     assert "结构不可解析" in result["summary"]
+
+
+def test_compact_payload_passes_required_tool_gate() -> None:
+    """生产/消费契约：紧凑清单必须被"必需数据工具"门禁识别为有效。
+
+    2026-11-04 线上事故：`mx_get_self_selects` 改成紧凑清单后，门禁白名单仍是
+    ("data","rows","list")，于是工具调用成功却被判 missing：
+    `data_validation_passed=False` → "本轮分析不完整"。这里把生产端与消费端
+    的契约钉在一起，避免再出现"改了产出、忘了白名单"。
+    """
+    from app.services.aniu_service import (
+        _REQUIRED_TOOLS_BY_RUN_TYPE,
+        _tool_result_has_valid_payload,
+    )
+
+    payload = _production_payload()
+    result = mx.mx_execution_service.execute_tool(
+        client=_StubClient(payload),
+        app_settings=None,
+        tool_name="mx_get_self_selects",
+        arguments={},
+    )
+    call = {"name": "mx_get_self_selects", "result": result}
+    assert _tool_result_has_valid_payload(call) is True
+
+    # 空自选也是有效结果（total=0），不能被判缺失
+    empty_payload = {
+        "status": 0,
+        "data": {"title": "我的自选", "allResults": {"result": {"dataList": []}}},
+    }
+    empty = mx.mx_execution_service.execute_tool(
+        client=_StubClient(empty_payload),
+        app_settings=None,
+        tool_name="mx_get_self_selects",
+        arguments={},
+    )
+    assert empty["result"]["total"] == 0
+    assert _tool_result_has_valid_payload({"name": "mx_get_self_selects", "result": empty}) is True
+
+    # 该工具确实在 trade / analysis 的必需清单里
+    assert "mx_get_self_selects" in _REQUIRED_TOOLS_BY_RUN_TYPE["trade"]
+    assert "mx_get_self_selects" in _REQUIRED_TOOLS_BY_RUN_TYPE["analysis"]
