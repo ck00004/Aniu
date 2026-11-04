@@ -137,6 +137,21 @@ def _require_parseable_rows(payload: Any, *, what: str) -> list[dict[str, Any]]:
     return rows
 
 
+class _SelfSelectState(tuple):
+    """(codes, names) 二元组 + 明细行 `items`。
+
+    保持历史解包写法 `codes, names = state` 不变（意图服务与测试依赖），
+    同时让 NOOP 判断能给出"命中哪一行"的证据。
+    """
+
+    items: list[dict[str, str]]
+
+    def __new__(cls, codes: set[str], names: list[str], items: list[dict[str, str]]):
+        obj = super().__new__(cls, (codes, names))
+        obj.items = items
+        return obj
+
+
 def _extract_self_select_rows(payload: Any) -> list[dict[str, Any]] | None:
     """解析自选股列表载荷 → 行列表；结构不可识别返回 None。
 
@@ -822,13 +837,39 @@ class MXExecutionService:
     def _handle_get_self_selects(
         self, *, client: MXClient, app_settings: Any, arguments: dict[str, Any]
     ) -> dict[str, Any]:
+        """返回**完整且紧凑**的自选清单。
+
+        历史缺陷（2026-11-04 排查）：旧实现把 70KB+ 的原始载荷直接丢给模型，
+        其中人类可读的 `data.partialResults` 只有前 10 行（89 只里的 10 只）。
+        于是同一份数据出现两种结论：写操作挡板用 dataList 判定"已在列表"
+        （NOOP_VERIFIED），模型却只看得到 10 行、回答"未见该标的"——用户看到
+        的就是这个自相矛盾的结论。
+        """
         del app_settings, arguments
         result = client.get_self_selects()
+        state = self._parse_state(result)
+        if state is None:
+            # 结构不可识别：保持原样返回，让模型/人工自行核对
+            return {
+                "ok": True,
+                "tool_name": "mx_get_self_selects",
+                "summary": "已查询自选股列表（结构不可解析，返回原始载荷）。",
+                "result": result,
+            }
+        codes, names, items = state
         return {
             "ok": True,
             "tool_name": "mx_get_self_selects",
-            "summary": "已查询自选股列表。",
-            "result": result,
+            "summary": (
+                f"已查询自选股列表：共 {len(items)} 只（完整清单在 result.items，"
+                "按代码/名称精确匹配可判断某标的是否已在自选）。"
+            ),
+            "result": {
+                "total": len(items),
+                "items": items,
+                "codes": sorted(codes),
+                "source": "allResults.result.dataList",
+            },
         }
 
     def _handle_manage_self_select(
@@ -909,10 +950,12 @@ class MXExecutionService:
             current = fresh_state
         # fresh_state 为 None 表示无开放意图——沿用开头的快照即可
 
-        in_list = self._target_in_state(code, name, current)
+        evidence = self._find_in_state(code, name, current)
+        in_list = evidence is not None
         if (operation == "ADD" and in_list) or (
             operation == "REMOVE" and not in_list
         ):
+            matched = dict(evidence or {})
             return {
                 "ok": True,
                 "tool_name": "mx_manage_self_select",
@@ -920,8 +963,18 @@ class MXExecutionService:
                     f"{name or code} 已处于目标状态"
                     f"（{'已在' if operation == 'ADD' else '不在'}自选股列表），"
                     "未发送写请求（NOOP_VERIFIED）。"
+                    + (
+                        f"命中行：{matched.get('code')} {matched.get('name')}。"
+                        if matched
+                        else ""
+                    )
                 ),
-                "result": {"verified": True, "noop": True},
+                "result": {
+                    "verified": True,
+                    "noop": True,
+                    "matched": matched or None,
+                    "list_total": len(current[0]) if current else None,
+                },
                 "executed_action": {
                     "action": "MANAGE_SELF_SELECT",
                     "query": query,
@@ -1047,6 +1100,72 @@ class MXExecutionService:
             return None
         return ("ADD" if has_add else "REMOVE", code, name)
 
+    def _parse_state(
+        self, payload: Any
+    ) -> tuple[set[str], list[str], list[dict[str, str]]] | None:
+        """解析自选载荷 → (代码集合, 名称列表, 明细行)；不可判定返回 None。"""
+        rows = _extract_self_select_rows(payload)
+        if rows is None:
+            return None
+        codes: set[str] = set()
+        names: list[str] = []
+        items: list[dict[str, str]] = []
+        for row in rows:
+            row_code = _normalize_symbol(
+                _row_str(row, "SECURITY_CODE", "stockCode", "code", "secCode")
+            )
+            row_name = _row_str(
+                row,
+                "SECURITY_SHORT_NAME",
+                "stockName",
+                "secName",
+                "name",
+                "stock_name",
+            )
+            # 行级身份校验：既无代码也无名称的行不可判定
+            if not row_code and not row_name:
+                return None
+            if row_code:
+                codes.add(row_code)
+            if row_name:
+                names.append(row_name)
+            items.append(
+                {
+                    "code": row_code,
+                    "name": row_name,
+                    "market": _row_str(row, "MARKET_SHORT_NAME", "market"),
+                }
+            )
+        return codes, names, items
+
+    def _find_in_state(
+        self, code: str, name: str, state: Any
+    ) -> dict[str, str] | None:
+        """在自选清单里定位目标，命中时返回证据行（code/name/market）。
+
+        兼容两种 state：`_SelfSelectState`（带 items 明细）与普通
+        `(codes, names)` 二元组（历史调用方/测试构造的桩）。
+        """
+        if not state:
+            return None
+        codes, names = state[0], state[1]
+        items = getattr(state, "items", None)
+        if items is None:
+            items = [{"code": c, "name": "", "market": ""} for c in sorted(codes)]
+            items.extend({"code": "", "name": n, "market": ""} for n in names)
+        if code:
+            for item in items:
+                if item.get("code") == code:
+                    return item
+            return None
+        if not name:
+            return None
+        normalized = name.strip()
+        for item in items:
+            if str(item.get("name") or "").strip() == normalized:
+                return item
+        return None
+
     def _read_self_select_state(
         self, client: MXClient
     ) -> tuple[set[str], list[str]] | None:
@@ -1070,38 +1189,11 @@ class MXExecutionService:
             payload = client.get_self_selects()
         except Exception:  # noqa: BLE001
             return None
-        rows = _extract_self_select_rows(payload)
-        if rows is None:
+        state = self._parse_state(payload)
+        if state is None:
             return None
-        codes: set[str] = set()
-        names: list[str] = []
-        for row in rows:
-            row_code = _normalize_symbol(
-                _row_str(
-                    row,
-                    "SECURITY_CODE",
-                    "stockCode",
-                    "code",
-                    "secCode",
-                )
-            )
-            row_name = _row_str(
-                row,
-                "SECURITY_SHORT_NAME",
-                "stockName",
-                "secName",
-                "name",
-                "stock_name",
-            )
-            # 行级身份校验：既无代码也无名称的行不可判定（防止把
-            # 结构异常的行静默跳过后误判目标股票不在列表中）
-            if not row_code and not row_name:
-                return None
-            if row_code:
-                codes.add(row_code)
-            if row_name:
-                names.append(row_name)
-        return codes, names
+        codes, names, items = state
+        return _SelfSelectState(codes, names, items)
 
     def _handle_moni_trade(
         self,
