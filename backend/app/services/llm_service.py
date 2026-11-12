@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -33,6 +34,26 @@ _MIMO_THINKING_MODEL_PREFIXES = (
 )
 _DEEPSEEK_THINKING_MODEL_PREFIXES = (
     "deepseek-v4-pro",
+    "deepseek-v4.1-pro",
+)
+
+# 网关返回的模型名普遍带 provider 前缀（如 `cn:deepseek-v4.1-flash`）。
+# 旧实现直接 startswith("deepseek-v4-pro")，带前缀就永远匹配不上 →
+# 思考分支沦为死代码（2026-11 线上排查确认）。这里统一剥离前缀再判断。
+_PROVIDER_PREFIX_RE = re.compile(r"^[A-Za-z]{2,8}\s*:\s*")
+
+# 思考等级白名单；auto 交给"按运行类型默认"处理
+_REASONING_EFFORT_LEVELS = ("off", "low", "medium", "high", "max")
+# auto 时的默认：分析类需要质量 → high；盘中交易轮次强调延迟/成本 → off
+_AUTO_EFFORT_BY_RUN_TYPE = {
+    "analysis": "high",
+    "trade": "off",
+}
+# 已知支持 reasoning 参数的模型前缀（auto 模式下只对这些生效，避免给
+# 不支持的模型塞参数导致 400）
+_REASONING_CAPABLE_PREFIXES = (
+    "deepseek-v4",
+    "mimo-v2",
 )
 _DEEPSEEK_IGNORED_SAMPLING_KEYS = (
     "temperature",
@@ -237,29 +258,57 @@ def _should_fallback_to_non_stream(exc: LLMUpstreamError) -> bool:
     return exc.status_code == 400
 
 
-def _should_enable_mimo_thinking(model: Any) -> bool:
+def _strip_provider_prefix(model: Any) -> str:
+    """剥离网关的 provider 前缀：`cn:deepseek-v4-pro` → `deepseek-v4-pro`。"""
     normalized = str(model or "").strip().lower()
+    return _PROVIDER_PREFIX_RE.sub("", normalized)
+
+
+def _should_enable_mimo_thinking(model: Any) -> bool:
+    normalized = _strip_provider_prefix(model)
     if not normalized:
         return False
     return normalized.startswith(_MIMO_THINKING_MODEL_PREFIXES)
 
 
 def _should_enable_deepseek_thinking(model: Any) -> bool:
-    normalized = str(model or "").strip().lower()
+    normalized = _strip_provider_prefix(model)
     if not normalized:
         return False
     return normalized.startswith(_DEEPSEEK_THINKING_MODEL_PREFIXES)
 
 
+def _supports_reasoning(model: Any) -> bool:
+    """模型是否已知支持 reasoning 参数（auto 模式的守门人）。"""
+    normalized = _strip_provider_prefix(model)
+    if not normalized:
+        return False
+    return normalized.startswith(_REASONING_CAPABLE_PREFIXES)
+
+
 def _normalize_reasoning_effort(value: Any) -> str | None:
+    """归一思考等级；None 表示"未指定"（交给 auto 逻辑）。
+
+    历史实现把 low/medium 一律折叠成 high；但网关实测接受低档，
+    且盘中轮次用 low 能显著省 token，因此改为透传：
+    low/medium/high 原样，xhigh/max → max，off/none/disabled → off。
+    """
     normalized = str(value or "").strip().lower()
     if not normalized:
         return None
-    if normalized in {"low", "medium", "high"}:
-        return "high"
-    if normalized in {"xhigh", "max"}:
+    if normalized in {"off", "none", "disabled", "关闭"}:
+        return "off"
+    if normalized in {"xhigh", "max", "最高"}:
         return "max"
+    if normalized in {"low", "medium", "high"}:
+        return normalized
     return None
+
+
+def _auto_effort_for_run_type(run_type: str | None) -> str:
+    """auto 模式下按运行类型取默认等级（分析类 high、盘中 off）。"""
+    normalized = str(run_type or "").strip().lower()
+    return _AUTO_EFFORT_BY_RUN_TYPE.get(normalized, "high")
 
 
 def _default_deepseek_reasoning_effort(payload: dict[str, Any]) -> str:
@@ -269,30 +318,51 @@ def _default_deepseek_reasoning_effort(payload: dict[str, Any]) -> str:
     return "high"
 
 
-def _apply_reasoning_options(payload: dict[str, Any]) -> dict[str, Any]:
-    adjusted = dict(payload)
-    if _should_enable_deepseek_thinking(adjusted.get("model")):
-        thinking_payload = adjusted.get("thinking")
-        thinking_type = "enabled"
-        if isinstance(thinking_payload, dict):
-            normalized_type = str(thinking_payload.get("type") or "").strip().lower()
-            if normalized_type in {"enabled", "disabled"}:
-                thinking_type = normalized_type
-        adjusted["thinking"] = {"type": thinking_type}
+def _apply_reasoning_options(
+    payload: dict[str, Any],
+    *,
+    effort: Any = None,
+    run_type: str | None = None,
+) -> dict[str, Any]:
+    """按设置给请求体加上思维链参数。
 
-        reasoning_effort = _normalize_reasoning_effort(adjusted.get("reasoning_effort"))
-        if thinking_type == "enabled":
-            adjusted["reasoning_effort"] = (
-                reasoning_effort or _default_deepseek_reasoning_effort(adjusted)
-            )
-            for key in _DEEPSEEK_IGNORED_SAMPLING_KEYS:
-                adjusted.pop(key, None)
-        else:
-            adjusted.pop("reasoning_effort", None)
+    优先级：`effort`（来自 app_settings.llm_reasoning_effort）
+      * `off`            → 显式关闭，剔除 thinking/reasoning_effort；
+      * low/medium/high/max → 强制开启并指定等级（对任意模型生效，
+        若上游不支持由 400 回退兜底，见 `_call_llm_stream`）；
+      * `auto`/None      → 按运行类型默认（analysis→high、trade→off），
+        且只对已知支持 reasoning 的模型生效，避免给其它模型塞参数。
+    """
+    adjusted = dict(payload)
+    requested = _normalize_reasoning_effort(effort)
+
+    if requested == "off":
+        adjusted.pop("thinking", None)
+        adjusted.pop("reasoning_effort", None)
         return adjusted
 
+    if requested in _REASONING_EFFORT_LEVELS:  # low/medium/high/max
+        adjusted["reasoning_effort"] = requested
+        if _should_enable_deepseek_thinking(adjusted.get("model")):
+            adjusted["thinking"] = {"type": "enabled"}
+            for key in _DEEPSEEK_IGNORED_SAMPLING_KEYS:
+                adjusted.pop(key, None)
+        return adjusted
+
+    # ---- auto ----
+    auto_effort = _auto_effort_for_run_type(run_type)
+    if auto_effort == "off" or not _supports_reasoning(adjusted.get("model")):
+        adjusted.pop("thinking", None)
+        adjusted.pop("reasoning_effort", None)
+        return adjusted
+
+    adjusted["reasoning_effort"] = auto_effort
     if _should_enable_mimo_thinking(adjusted.get("model")):
         adjusted["thinking"] = {"type": "enabled"}
+    if _should_enable_deepseek_thinking(adjusted.get("model")):
+        adjusted["thinking"] = {"type": "enabled"}
+        for key in _DEEPSEEK_IGNORED_SAMPLING_KEYS:
+            adjusted.pop(key, None)
     return adjusted
 
 
@@ -762,6 +832,7 @@ class LLMService:
         run_type: str | None = None,
         emit: Any = None,
         cancel_event: threading.Event | None = None,
+        reasoning_effort: Any = None,
     ) -> tuple[str, dict[str, Any], dict[str, Any]]:
         payload_messages: list[dict[str, Any]] = []
         effective_system_prompt = self._augment_system_prompt(
@@ -775,11 +846,15 @@ class LLMService:
             )
         payload_messages.extend(dict(message) for message in messages)
 
-        payload = _apply_reasoning_options({
-            "model": model,
-            "temperature": _LLM_TEMPERATURE,
-            "messages": payload_messages,
-        })
+        payload = _apply_reasoning_options(
+            {
+                "model": model,
+                "temperature": _LLM_TEMPERATURE,
+                "messages": payload_messages,
+            },
+            effort=reasoning_effort,
+            run_type=run_type,
+        )
         response_payload = self._call_llm_stream(
             base_url=base_url,
             api_key=api_key,
@@ -800,16 +875,20 @@ class LLMService:
             run_type=run_type,
             prompt_templates=getattr(app_settings, "prompt_templates", None),
         )
-        return _apply_reasoning_options({
-            "model": app_settings.llm_model,
-            "temperature": _LLM_TEMPERATURE,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": getattr(app_settings, "task_prompt", "")},
-            ],
-            "tools": skill_stack_service.runtime.build_tools(run_type=run_type),
-            "tool_choice": "auto",
-        })
+        return _apply_reasoning_options(
+            {
+                "model": app_settings.llm_model,
+                "temperature": _LLM_TEMPERATURE,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": getattr(app_settings, "task_prompt", "")},
+                ],
+                "tools": skill_stack_service.runtime.build_tools(run_type=run_type),
+                "tool_choice": "auto",
+            },
+            effort=getattr(app_settings, "llm_reasoning_effort", None),
+            run_type=run_type,
+        )
 
     def build_request_payload_from_messages(
         self,
@@ -827,13 +906,17 @@ class LLMService:
         if system_prompt:
             payload_messages.append({"role": "system", "content": system_prompt})
         payload_messages.extend(dict(message) for message in messages)
-        return _apply_reasoning_options({
-            "model": app_settings.llm_model,
-            "temperature": _LLM_TEMPERATURE,
-            "messages": payload_messages,
-            "tools": skill_stack_service.runtime.build_tools(run_type=run_type),
-            "tool_choice": "auto",
-        })
+        return _apply_reasoning_options(
+            {
+                "model": app_settings.llm_model,
+                "temperature": _LLM_TEMPERATURE,
+                "messages": payload_messages,
+                "tools": skill_stack_service.runtime.build_tools(run_type=run_type),
+                "tool_choice": "auto",
+            },
+            effort=getattr(app_settings, "llm_reasoning_effort", None),
+            run_type=run_type,
+        )
 
     @staticmethod
     def _augment_system_prompt(
@@ -961,6 +1044,7 @@ class LLMService:
         cancel_event: threading.Event | None = None,
         context_window_tokens: int | None = None,
         tools_override: list[dict[str, Any]] | None = None,
+        reasoning_effort: Any = None,
     ) -> dict[str, Any]:
         _emit = emit if callable(emit) else (lambda *_a, **_kw: None)
         messages: list[dict[str, Any]] = [dict(m) for m in initial_messages]
@@ -982,15 +1066,19 @@ class LLMService:
 
         for iteration in range(_MAX_TOOL_ITERATIONS):
             _raise_if_cancelled(cancel_event)
-            iteration_payload = _apply_reasoning_options({
-                "model": model,
-                "temperature": _LLM_TEMPERATURE,
-                "messages": messages,
-                "tools": effective_tools
-                if effective_tools is not None
-                else skill_stack_service.runtime.build_tools(run_type=run_type),
-                "tool_choice": "auto",
-            })
+            iteration_payload = _apply_reasoning_options(
+                {
+                    "model": model,
+                    "temperature": _LLM_TEMPERATURE,
+                    "messages": messages,
+                    "tools": effective_tools
+                    if effective_tools is not None
+                    else skill_stack_service.runtime.build_tools(run_type=run_type),
+                    "tool_choice": "auto",
+                },
+                effort=reasoning_effort,
+                run_type=run_type,
+            )
             _emit("llm_request", iteration=iteration + 1, model=model)
             try:
                 response_payload = self._call_llm_stream(
@@ -1218,6 +1306,7 @@ class LLMService:
         stream_payload["stream"] = True
 
         last_error: LLMUpstreamError | None = None
+        reasoning_stripped = False
         for attempt in range(_LLM_UPSTREAM_MAX_RETRIES):
             last_error = None
             for include_usage in (True, False):
@@ -1241,6 +1330,25 @@ class LLMService:
                     break
 
             if last_error is None:
+                continue
+            if (
+                last_error.status_code == 400
+                and not reasoning_stripped
+                and (
+                    "reasoning" in str(last_error).lower()
+                    or "thinking" in str(last_error).lower()
+                )
+            ):
+                # 上游不认识 thinking/reasoning_effort（换了模型或网关降级）：
+                # 剔除这些参数重试一次，思考等级失效但整轮请求不失败。
+                reasoning_stripped = True
+                stream_payload.pop("thinking", None)
+                stream_payload.pop("reasoning_effort", None)
+                logger.warning(
+                    "LLM upstream rejected reasoning options with 400, "
+                    "retrying without them: %s",
+                    last_error,
+                )
                 continue
             if _should_fallback_to_non_stream(last_error):
                 if callable(emit):

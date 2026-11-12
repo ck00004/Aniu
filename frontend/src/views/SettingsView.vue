@@ -27,6 +27,22 @@
               <p class="field-help">要使用的大模型名称，例如 `gpt-4o-mini`。</p>
             </label>
             <label class="field">
+              <span>思考等级</span>
+              <select v-model="settings.llm_reasoning_effort">
+                <option value="auto">自动（分析类 high / 盘中 off）</option>
+                <option value="off">关闭（最快、最省）</option>
+                <option value="low">低</option>
+                <option value="medium">中</option>
+                <option value="high">高</option>
+                <option value="max">最高（最慢、最贵）</option>
+              </select>
+              <p class="field-help">
+                开启后模型会先推理再回答，判断更稳但更慢更贵（实测同一请求
+                completion token 由 2 增至 30）。自动=分析/复盘用 high、盘中
+                交易轮次用 off；上游不支持该参数时会自动降级重试。
+              </p>
+            </label>
+            <label class="field">
               <span>妙想密钥</span>
               <input v-model="settings.mx_api_key" type="password" placeholder="妙想接口 apikey" />
               <p class="field-help">用于访问东方财富妙想接口的密钥。</p>

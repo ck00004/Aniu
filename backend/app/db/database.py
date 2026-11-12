@@ -152,6 +152,10 @@ def _ensure_app_settings_columns(engine) -> None:
         statements.append(
             "ALTER TABLE app_settings ADD COLUMN cls_api_base_url VARCHAR(255)"
         )
+    if "llm_reasoning_effort" not in columns:
+        statements.append(
+            "ALTER TABLE app_settings ADD COLUMN llm_reasoning_effort VARCHAR(16) DEFAULT 'auto'"
+        )
     if "disabled_skill_ids_json" not in columns:
         statements.append(
             "ALTER TABLE app_settings ADD COLUMN disabled_skill_ids_json TEXT DEFAULT '[]'"

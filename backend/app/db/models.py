@@ -42,6 +42,10 @@ class AppSettings(Base):
     llm_base_url: Mapped[str | None] = mapped_column(String(255), nullable=True)
     llm_api_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     llm_model: Mapped[str] = mapped_column(String(128), default="gpt-4o-mini")
+    # 思考等级：auto（按运行类型默认：分析 high / 盘中 off）| off | low | medium | high | max
+    llm_reasoning_effort: Mapped[str] = mapped_column(
+        String(16), default="auto", server_default="auto"
+    )
     disabled_skill_ids_json: Mapped[str] = mapped_column(
         Text,
         default="[]",

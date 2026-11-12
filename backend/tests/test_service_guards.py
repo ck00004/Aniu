@@ -1312,7 +1312,9 @@ def test_build_request_payload_from_messages_enables_deepseek_v4_pro_reasoning()
     )
 
     assert payload["thinking"] == {"type": "enabled"}
-    assert payload["reasoning_effort"] == "max"
+    # 2026-11 起 auto 的默认值按运行类型决定：analysis → high（原为 max），
+    # 盘中 trade → off。等级可经 app_settings.llm_reasoning_effort 覆盖。
+    assert payload["reasoning_effort"] == "high"
     assert "temperature" not in payload
 
 
