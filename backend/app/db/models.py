@@ -42,9 +42,13 @@ class AppSettings(Base):
     llm_base_url: Mapped[str | None] = mapped_column(String(255), nullable=True)
     llm_api_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     llm_model: Mapped[str] = mapped_column(String(128), default="gpt-4o-mini")
-    # 思考等级：auto（按运行类型默认：分析 high / 盘中 off）| off | low | medium | high | max
+    # 是否开启思考（用户自己决定，默认关闭＝与历史行为一致）
+    llm_thinking_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="0"
+    )
+    # 思考等级：low | medium | high | max（仅在 llm_thinking_enabled=True 时生效）
     llm_reasoning_effort: Mapped[str] = mapped_column(
-        String(16), default="auto", server_default="auto"
+        String(16), default="high", server_default="high"
     )
     disabled_skill_ids_json: Mapped[str] = mapped_column(
         Text,

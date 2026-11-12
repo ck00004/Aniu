@@ -42,19 +42,8 @@ _DEEPSEEK_THINKING_MODEL_PREFIXES = (
 # 思考分支沦为死代码（2026-11 线上排查确认）。这里统一剥离前缀再判断。
 _PROVIDER_PREFIX_RE = re.compile(r"^[A-Za-z]{2,8}\s*:\s*")
 
-# 思考等级白名单；auto 交给"按运行类型默认"处理
-_REASONING_EFFORT_LEVELS = ("off", "low", "medium", "high", "max")
-# auto 时的默认：分析类需要质量 → high；盘中交易轮次强调延迟/成本 → off
-_AUTO_EFFORT_BY_RUN_TYPE = {
-    "analysis": "high",
-    "trade": "off",
-}
-# 已知支持 reasoning 参数的模型前缀（auto 模式下只对这些生效，避免给
-# 不支持的模型塞参数导致 400）
-_REASONING_CAPABLE_PREFIXES = (
-    "deepseek-v4",
-    "mimo-v2",
-)
+# 思考等级白名单（是否开启由 app_settings.llm_thinking_enabled 单独控制）
+_REASONING_EFFORT_LEVELS = ("low", "medium", "high", "max")
 _DEEPSEEK_IGNORED_SAMPLING_KEYS = (
     "temperature",
     "top_p",
@@ -278,85 +267,54 @@ def _should_enable_deepseek_thinking(model: Any) -> bool:
     return normalized.startswith(_DEEPSEEK_THINKING_MODEL_PREFIXES)
 
 
-def _supports_reasoning(model: Any) -> bool:
-    """模型是否已知支持 reasoning 参数（auto 模式的守门人）。"""
-    normalized = _strip_provider_prefix(model)
-    if not normalized:
-        return False
-    return normalized.startswith(_REASONING_CAPABLE_PREFIXES)
-
-
 def _normalize_reasoning_effort(value: Any) -> str | None:
-    """归一思考等级；None 表示"未指定"（交给 auto 逻辑）。
+    """把思考等级归一成 low/medium/high/max；None 表示未指定（落到 high）。
 
-    历史实现把 low/medium 一律折叠成 high；但网关实测接受低档，
-    且盘中轮次用 low 能显著省 token，因此改为透传：
-    low/medium/high 原样，xhigh/max → max，off/none/disabled → off。
+    兼容早期草稿里的值：xhigh/max → max，auto/off/none → None
+    （是否关闭思考由 llm_thinking_enabled 决定，不再靠等级值表达）。
     """
     normalized = str(value or "").strip().lower()
     if not normalized:
         return None
-    if normalized in {"off", "none", "disabled", "关闭"}:
-        return "off"
     if normalized in {"xhigh", "max", "最高"}:
         return "max"
+    if normalized in {"off", "none", "disabled", "关闭", "auto", "自动"}:
+        return None
     if normalized in {"low", "medium", "high"}:
         return normalized
     return None
 
 
-def _auto_effort_for_run_type(run_type: str | None) -> str:
-    """auto 模式下按运行类型取默认等级（分析类 high、盘中 off）。"""
-    normalized = str(run_type or "").strip().lower()
-    return _AUTO_EFFORT_BY_RUN_TYPE.get(normalized, "high")
-
-
-def _default_deepseek_reasoning_effort(payload: dict[str, Any]) -> str:
-    tools = payload.get("tools")
-    if isinstance(tools, list) and tools:
-        return "max"
-    return "high"
-
-
 def _apply_reasoning_options(
     payload: dict[str, Any],
     *,
+    thinking_enabled: Any = None,
     effort: Any = None,
-    run_type: str | None = None,
 ) -> dict[str, Any]:
-    """按设置给请求体加上思维链参数。
+    """按用户设置给请求体加上思维链参数。
 
-    优先级：`effort`（来自 app_settings.llm_reasoning_effort）
-      * `off`            → 显式关闭，剔除 thinking/reasoning_effort；
-      * low/medium/high/max → 强制开启并指定等级（对任意模型生效，
-        若上游不支持由 400 回退兜底，见 `_call_llm_stream`）；
-      * `auto`/None      → 按运行类型默认（analysis→high、trade→off），
-        且只对已知支持 reasoning 的模型生效，避免给其它模型塞参数。
+    两个设置项，职责分开、互不推断：
+      * `thinking_enabled`（app_settings.llm_thinking_enabled）→ 开 / 关；
+      * `effort`（app_settings.llm_reasoning_effort）→ low / medium / high / max。
+
+    关闭时剔除全部参数（与历史行为一致）；开启时按模型家族补 `thinking`
+    字段（DeepSeek 风格需显式 enabled 并去掉采样参数，MiMo 同样需要），
+    其余 OpenAI 兼容模型只发 `reasoning_effort`。
+    上游若不认这些参数，由 `_call_llm_stream` 的 400 回退兜底。
     """
     adjusted = dict(payload)
-    requested = _normalize_reasoning_effort(effort)
-
-    if requested == "off":
+    enabled = (
+        thinking_enabled
+        if isinstance(thinking_enabled, bool)
+        else str(thinking_enabled or "").strip().lower() in {"1", "true", "yes", "on"}
+    )
+    if not enabled:
         adjusted.pop("thinking", None)
         adjusted.pop("reasoning_effort", None)
         return adjusted
 
-    if requested in _REASONING_EFFORT_LEVELS:  # low/medium/high/max
-        adjusted["reasoning_effort"] = requested
-        if _should_enable_deepseek_thinking(adjusted.get("model")):
-            adjusted["thinking"] = {"type": "enabled"}
-            for key in _DEEPSEEK_IGNORED_SAMPLING_KEYS:
-                adjusted.pop(key, None)
-        return adjusted
-
-    # ---- auto ----
-    auto_effort = _auto_effort_for_run_type(run_type)
-    if auto_effort == "off" or not _supports_reasoning(adjusted.get("model")):
-        adjusted.pop("thinking", None)
-        adjusted.pop("reasoning_effort", None)
-        return adjusted
-
-    adjusted["reasoning_effort"] = auto_effort
+    level = _normalize_reasoning_effort(effort) or "high"
+    adjusted["reasoning_effort"] = level
     if _should_enable_mimo_thinking(adjusted.get("model")):
         adjusted["thinking"] = {"type": "enabled"}
     if _should_enable_deepseek_thinking(adjusted.get("model")):
@@ -832,6 +790,7 @@ class LLMService:
         run_type: str | None = None,
         emit: Any = None,
         cancel_event: threading.Event | None = None,
+        thinking_enabled: Any = None,
         reasoning_effort: Any = None,
     ) -> tuple[str, dict[str, Any], dict[str, Any]]:
         payload_messages: list[dict[str, Any]] = []
@@ -852,8 +811,8 @@ class LLMService:
                 "temperature": _LLM_TEMPERATURE,
                 "messages": payload_messages,
             },
+            thinking_enabled=thinking_enabled,
             effort=reasoning_effort,
-            run_type=run_type,
         )
         response_payload = self._call_llm_stream(
             base_url=base_url,
@@ -886,8 +845,8 @@ class LLMService:
                 "tools": skill_stack_service.runtime.build_tools(run_type=run_type),
                 "tool_choice": "auto",
             },
+            thinking_enabled=getattr(app_settings, "llm_thinking_enabled", None),
             effort=getattr(app_settings, "llm_reasoning_effort", None),
-            run_type=run_type,
         )
 
     def build_request_payload_from_messages(
@@ -914,8 +873,8 @@ class LLMService:
                 "tools": skill_stack_service.runtime.build_tools(run_type=run_type),
                 "tool_choice": "auto",
             },
+            thinking_enabled=getattr(app_settings, "llm_thinking_enabled", None),
             effort=getattr(app_settings, "llm_reasoning_effort", None),
-            run_type=run_type,
         )
 
     @staticmethod
@@ -1044,6 +1003,7 @@ class LLMService:
         cancel_event: threading.Event | None = None,
         context_window_tokens: int | None = None,
         tools_override: list[dict[str, Any]] | None = None,
+        thinking_enabled: Any = None,
         reasoning_effort: Any = None,
     ) -> dict[str, Any]:
         _emit = emit if callable(emit) else (lambda *_a, **_kw: None)
@@ -1076,8 +1036,8 @@ class LLMService:
                     else skill_stack_service.runtime.build_tools(run_type=run_type),
                     "tool_choice": "auto",
                 },
+                thinking_enabled=thinking_enabled,
                 effort=reasoning_effort,
-                run_type=run_type,
             )
             _emit("llm_request", iteration=iteration + 1, model=model)
             try:

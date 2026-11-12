@@ -152,9 +152,13 @@ def _ensure_app_settings_columns(engine) -> None:
         statements.append(
             "ALTER TABLE app_settings ADD COLUMN cls_api_base_url VARCHAR(255)"
         )
+    if "llm_thinking_enabled" not in columns:
+        statements.append(
+            "ALTER TABLE app_settings ADD COLUMN llm_thinking_enabled BOOLEAN DEFAULT 0"
+        )
     if "llm_reasoning_effort" not in columns:
         statements.append(
-            "ALTER TABLE app_settings ADD COLUMN llm_reasoning_effort VARCHAR(16) DEFAULT 'auto'"
+            "ALTER TABLE app_settings ADD COLUMN llm_reasoning_effort VARCHAR(16) DEFAULT 'high'"
         )
     if "disabled_skill_ids_json" not in columns:
         statements.append(
@@ -199,6 +203,21 @@ def _ensure_app_settings_columns(engine) -> None:
             "ALTER TABLE app_settings ADD COLUMN automation_dream_time VARCHAR(8) DEFAULT '00:30'"
         )
 
+    # 历史/草稿值归一（幂等；app_settings 只有一行，启动期成本可忽略）。
+    # 思考等级只保留四档，是否开启由 llm_thinking_enabled 单独控制。
+    statements.append(
+        "UPDATE app_settings SET llm_reasoning_effort = 'max' "
+        "WHERE lower(llm_reasoning_effort) IN ('xhigh','max')"
+    )
+    statements.append(
+        "UPDATE app_settings SET llm_reasoning_effort = 'high' "
+        "WHERE llm_reasoning_effort IS NULL "
+        "   OR lower(llm_reasoning_effort) NOT IN ('low','medium','high','max')"
+    )
+    statements.append(
+        "UPDATE app_settings SET llm_thinking_enabled = 0 "
+        "WHERE llm_thinking_enabled IS NULL"
+    )
     if not statements:
         return
 

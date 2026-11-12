@@ -1270,11 +1270,13 @@ def test_build_initial_request_payload_uses_run_type_tool_profile() -> None:
 
 
 def test_build_initial_request_payload_enables_thinking_for_mimo_models() -> None:
+    """思考改由 app_settings.llm_thinking_enabled 控制（不再按模型名自动开）。"""
     app_settings = SimpleNamespace(
         llm_model="mimo-v2.5-pro",
         system_prompt="system",
         task_prompt="task",
         run_type="analysis",
+        llm_thinking_enabled=True,
     )
 
     payload = llm_service.build_initial_request_payload(app_settings)
@@ -1304,6 +1306,8 @@ def test_build_request_payload_from_messages_enables_deepseek_v4_pro_reasoning()
         system_prompt="system",
         run_type="analysis",
         prompt_templates=None,
+        llm_thinking_enabled=True,
+        llm_reasoning_effort="high",
     )
 
     payload = llm_service.build_request_payload_from_messages(
@@ -1334,6 +1338,8 @@ def test_generate_text_strips_temperature_for_deepseek_v4_pro(monkeypatch) -> No
         api_key="token",
         system_prompt="system",
         messages=[{"role": "user", "content": "hello"}],
+        thinking_enabled=True,
+        reasoning_effort="high",
     )
 
     assert text == "ok"
@@ -1789,6 +1795,8 @@ def test_agent_loop_replays_reasoning_content_for_mimo_tool_turns() -> None:
             "result": {"arguments": arguments},
         },
         emit=lambda *_a, **_kw: None,
+        thinking_enabled=True,
+        reasoning_effort="high",
     )
 
     assert result["final_answer"] == "最终结论。"

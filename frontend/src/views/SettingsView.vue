@@ -27,19 +27,27 @@
               <p class="field-help">要使用的大模型名称，例如 `gpt-4o-mini`。</p>
             </label>
             <label class="field">
+              <span>开启思考</span>
+              <input v-model="settings.llm_thinking_enabled" type="checkbox" />
+              <p class="field-help">
+                勾选后模型先推理再作答，判断更稳，但更慢更贵（实测同一请求
+                completion token 由 2 增至 30 左右）。默认关闭＝与以前行为一致。
+              </p>
+            </label>
+            <label class="field">
               <span>思考等级</span>
-              <select v-model="settings.llm_reasoning_effort">
-                <option value="auto">自动（分析类 high / 盘中 off）</option>
-                <option value="off">关闭（最快、最省）</option>
-                <option value="low">低</option>
+              <select
+                v-model="settings.llm_reasoning_effort"
+                :disabled="!settings.llm_thinking_enabled"
+              >
+                <option value="low">低（省 token）</option>
                 <option value="medium">中</option>
-                <option value="high">高</option>
+                <option value="high">高（推荐）</option>
                 <option value="max">最高（最慢、最贵）</option>
               </select>
               <p class="field-help">
-                开启后模型会先推理再回答，判断更稳但更慢更贵（实测同一请求
-                completion token 由 2 增至 30）。自动=分析/复盘用 high、盘中
-                交易轮次用 off；上游不支持该参数时会自动降级重试。
+                仅"开启思考"时生效。上游若不支持该参数会自动降级重试，
+                不会让本轮请求失败。
               </p>
             </label>
             <label class="field">

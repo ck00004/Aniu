@@ -7,6 +7,7 @@ export interface AppSettings {
   llm_base_url: string | null
   llm_api_key: string | null
   llm_model: string
+  llm_thinking_enabled?: boolean
   llm_reasoning_effort?: string
   system_prompt: string
   prompt_templates: Record<string, string>

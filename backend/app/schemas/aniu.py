@@ -17,23 +17,21 @@ def _mask_key(value: str | None) -> str | None:
     return value[:3] + "****" + value[-4:]
 
 
-_REASONING_EFFORT_VALUES = {"auto", "off", "low", "medium", "high", "max"}
+_REASONING_EFFORT_VALUES = ("low", "medium", "high", "max")
 
 
 def _normalize_effort_value(value: object) -> str:
-    """思考等级白名单归一（None/空 → auto；不合法 → auto）。
+    """思考等级归一：只保留四档，默认 high。
 
-    在前端约束之外再做一次后端归一：非法值如果静默落到下游，会被当作
-    "未知等级"丢弃，排查时只表现为"设置不生效"。
+    兼容历史/草稿值：xhigh→max；auto/off/none/关闭→high（是否关闭思考
+    由 llm_thinking_enabled 决定，等级字段不表达"关闭"）。
     """
     normalized = str(value or "").strip().lower()
     if normalized in {"xhigh", "max", "最高"}:
         return "max"
-    if normalized in {"关闭", "none", "disabled"}:
-        return "off"
-    if normalized in {"自动", ""}:
-        return "auto"
-    return normalized if normalized in _REASONING_EFFORT_VALUES else "auto"
+    if normalized in {"low", "medium", "high"}:
+        return normalized
+    return "high"
 
 
 class AppSettingsBase(BaseModel):
@@ -44,12 +42,14 @@ class AppSettingsBase(BaseModel):
     llm_base_url: str | None = Field(default=None, max_length=512)
     llm_api_key: str | None = Field(default=None, max_length=512)
     llm_model: str = Field(default="gpt-4o-mini", max_length=128)
+    llm_thinking_enabled: bool = Field(
+        default=False,
+        description="是否开启思考（思维链）。关闭时完全不发送 reasoning 参数。",
+    )
     llm_reasoning_effort: str = Field(
-        default="auto",
+        default="high",
         max_length=16,
-        description=(
-            "思考等级：auto（分析 high / 盘中 off）| off | low | medium | high | max"
-        ),
+        description="思考等级：low | medium | high | max（仅开启思考时生效）",
     )
     system_prompt: str = Field(max_length=20000)
     prompt_templates: dict[str, str] = Field(default_factory=dict)
@@ -587,22 +587,3 @@ class MemoryDreamListRead(BaseModel):
 class MemoryDreamRunResponse(BaseModel):
     dream: MemoryDreamRead
     started: bool
-
-
-_REASONING_EFFORT_VALUES = {"auto", "off", "low", "medium", "high", "max"}
-
-
-def _normalize_effort_value(value: object) -> str:
-    """思考等级白名单归一（None/空 → auto；不合法 → auto）。
-
-    写成模块级函数并在 AppSettingsBase 上挂 validator，避免只在前端约束而
-    后端放过非法值（非法值会被下游当作"未知"静默丢弃，反而更难排查）。
-    """
-    normalized = str(value or "").strip().lower()
-    if normalized in {"xhigh", "最高"}:
-        return "max"
-    if normalized in {"关闭", "none", "disabled"}:
-        return "off"
-    if normalized in {"自动", ""}:
-        return "auto"
-    return normalized if normalized in _REASONING_EFFORT_VALUES else "auto"

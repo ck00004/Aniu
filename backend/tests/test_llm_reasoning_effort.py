@@ -1,15 +1,12 @@
-"""思考等级（reasoning effort）配置的回归测试。
+"""思考开关 / 思考等级 的回归测试。
 
-背景（2026-11 排查）：代码里本来有"思考"分支，但
-`_should_enable_deepseek_thinking()` 用 `startswith("deepseek-v4-pro")` 判断，
-而网关返回的模型名统一带 provider 前缀（`cn:deepseek-v4-pro`），**永远匹配
-不上** → 思考分支是死代码，线上从未开启过思考，且没有任何配置入口。
+设计（2026-11 按用户要求调整）：**两个独立设置项，代码不做任何替用户推断**。
 
-本次改动：
-  1. 剥离 provider 前缀后再判断；
-  2. app_settings.llm_reasoning_effort（auto/off/low/medium/high/max）可配；
-  3. auto = 按运行类型默认（analysis → high，trade → off）；
-  4. 上游 400 拒绝 reasoning 参数时自动剔除并重试（思考失效但不整轮失败）。
+  * `app_settings.llm_thinking_enabled`：是否开启思考（默认 False＝与历史行为一致）
+  * `app_settings.llm_reasoning_effort`：low / medium / high / max（仅开启时生效）
+
+同时修掉一个线上缺陷：原判断 `model.startswith("deepseek-v4-pro")` 在网关返回
+`cn:deepseek-v4-pro` 时永远不成立，思考分支是死代码；现在先剥离 provider 前缀。
 """
 
 from pathlib import Path
@@ -25,87 +22,93 @@ from app.services.llm_service import (
     LLMUpstreamError,
     _apply_reasoning_options,
     _strip_provider_prefix,
-    _supports_reasoning,
     llm_service,
 )
 
 
-def _payload(model: str, *, tools: bool = True) -> dict:
-    payload: dict = {"model": model, "temperature": 0.2, "messages": []}
-    if tools:
-        payload["tools"] = [{"type": "function", "function": {"name": "x"}}]
-        payload["tool_choice"] = "auto"
-    return payload
+def _payload(model: str) -> dict:
+    return {
+        "model": model,
+        "temperature": 0.2,
+        "messages": [],
+        "tools": [{"type": "function", "function": {"name": "x"}}],
+        "tool_choice": "auto",
+    }
 
 
 def test_provider_prefix_is_stripped():
     assert _strip_provider_prefix("cn:deepseek-v4-pro") == "deepseek-v4-pro"
     assert _strip_provider_prefix("CN:DeepSeek-V4-Pro") == "deepseek-v4-pro"
     assert _strip_provider_prefix("deepseek-v4-pro") == "deepseek-v4-pro"
-    # 不能把 gpt-4o-mini 的连字符误当分隔符切掉
+    # 不能把 gpt-4o-mini 的连字符误当分隔符
     assert _strip_provider_prefix("gpt-4o-mini") == "gpt-4o-mini"
 
 
-def test_prefixed_thinking_model_enables_thinking():
-    """线上真实写法 `cn:deepseek-v4-pro` 必须能打开思考（旧实现这里是 False）。"""
-    out = _apply_reasoning_options(_payload("cn:deepseek-v4-pro"), run_type="analysis")
-    assert out["thinking"] == {"type": "enabled"}
-    assert out["reasoning_effort"] == "high"
-    # DeepSeek 思考模式不接受采样参数
-    assert "temperature" not in out
-
-
-def test_off_disables_everything():
-    out = _apply_reasoning_options(
-        _payload("cn:deepseek-v4-pro"), effort="off", run_type="analysis"
-    )
+def test_default_is_thinking_disabled():
+    """默认不开启：请求体里不出现任何思考参数（等于历史行为）。"""
+    out = _apply_reasoning_options(_payload("cn:deepseek-v4.1-flash"))
     assert "thinking" not in out
     assert "reasoning_effort" not in out
-    # 关闭思考后温度参数保留（普通采样）
     assert out["temperature"] == 0.2
 
 
-@pytest.mark.parametrize("level", ["low", "medium", "high", "max"])
-def test_explicit_levels_are_passed_through(level: str):
-    out = _apply_reasoning_options(_payload("cn:deepseek-v4-pro"), effort=level)
-    assert out["reasoning_effort"] == level
-
-
-def test_explicit_level_applies_to_any_model():
-    """用户显式选档时不再限制模型名单（不支持则由 400 降级兜底）。"""
-    out = _apply_reasoning_options(_payload("cn:glm-5.3"), effort="high")
-    assert out["reasoning_effort"] == "high"
-    assert "thinking" not in out  # 非 deepseek 风格不加 thinking 字段
-
-
-def test_auto_uses_run_type_default():
-    analysis = _apply_reasoning_options(_payload("cn:deepseek-v4-pro"), run_type="analysis")
-    trade = _apply_reasoning_options(_payload("cn:deepseek-v4-pro"), run_type="trade")
-    assert analysis["reasoning_effort"] == "high"
-    assert "reasoning_effort" not in trade
-    assert "thinking" not in trade
-
-
-def test_auto_skips_models_without_reasoning_support():
-    """auto 不给未知模型塞参数（避免 400），但显式选档仍生效。"""
-    assert _supports_reasoning("cn:deepseek-v4.1-flash") is True
-    assert _supports_reasoning("cn:glm-5.3") is False
-    out = _apply_reasoning_options(_payload("cn:glm-5.3"), run_type="analysis")
+def test_disabled_explicitly():
+    out = _apply_reasoning_options(
+        _payload("cn:deepseek-v4-pro"), thinking_enabled=False, effort="max"
+    )
+    assert "thinking" not in out
     assert "reasoning_effort" not in out
 
 
-def test_mimo_still_enables_thinking_in_auto():
-    out = _apply_reasoning_options(_payload("cn:mimo-v2.5-pro"), run_type="analysis")
+@pytest.mark.parametrize("level", ["low", "medium", "high", "max"])
+def test_enabled_passes_chosen_level(level: str):
+    out = _apply_reasoning_options(
+        _payload("cn:deepseek-v4.1-flash"), thinking_enabled=True, effort=level
+    )
+    assert out["reasoning_effort"] == level
+
+
+def test_enabled_without_level_defaults_to_high():
+    out = _apply_reasoning_options(
+        _payload("cn:deepseek-v4.1-flash"), thinking_enabled=True
+    )
+    assert out["reasoning_effort"] == "high"
+
+
+def test_deepseek_thinking_model_gets_thinking_flag_and_drops_sampling():
+    out = _apply_reasoning_options(
+        _payload("cn:deepseek-v4-pro"), thinking_enabled=True, effort="medium"
+    )
     assert out["thinking"] == {"type": "enabled"}
+    assert out["reasoning_effort"] == "medium"
+    assert "temperature" not in out
 
 
-def test_settings_value_flows_into_request_payload():
-    """app_settings.llm_reasoning_effort 必须真的进入请求体。"""
+def test_mimo_gets_thinking_flag():
+    out = _apply_reasoning_options(
+        _payload("cn:mimo-v2.5-pro"), thinking_enabled=True, effort="low"
+    )
+    assert out["thinking"] == {"type": "enabled"}
+    assert out["reasoning_effort"] == "low"
+
+
+def test_legacy_effort_values_are_normalized():
+    """旧值/脏值不报错：xhigh→max，auto/off/未知→high（关闭看开关）。"""
+    cases = (("xhigh", "max"), ("auto", "high"), ("off", "high"), ("bogus", "high"))
+    for legacy, expected in cases:
+        out = _apply_reasoning_options(
+            _payload("cn:deepseek-v4.1-flash"), thinking_enabled=True, effort=legacy
+        )
+        assert out["reasoning_effort"] == expected, legacy
+
+
+def test_settings_flow_into_request_payload():
     settings = SimpleNamespace(
         llm_model="cn:deepseek-v4.1-flash",
         system_prompt="system",
         run_type="analysis",
         prompt_templates=None,
+        llm_thinking_enabled=True,
         llm_reasoning_effort="max",
     )
     payload = llm_service.build_request_payload_from_messages(
@@ -114,19 +117,34 @@ def test_settings_value_flows_into_request_payload():
     assert payload["reasoning_effort"] == "max"
 
 
-def test_settings_off_overrides_auto_default():
+def test_settings_off_overrides_level():
     settings = SimpleNamespace(
         llm_model="cn:deepseek-v4-pro",
         system_prompt="system",
         run_type="analysis",
         prompt_templates=None,
-        llm_reasoning_effort="off",
+        llm_thinking_enabled=False,
+        llm_reasoning_effort="max",
     )
     payload = llm_service.build_request_payload_from_messages(
         app_settings=settings, messages=[{"role": "user", "content": "hi"}]
     )
     assert "reasoning_effort" not in payload
     assert "thinking" not in payload
+
+
+def test_missing_settings_fields_default_to_disabled():
+    """老配置（没有这两个字段）必须与历史行为一致：不发送思考参数。"""
+    settings = SimpleNamespace(
+        llm_model="cn:deepseek-v4-pro",
+        system_prompt="system",
+        run_type="analysis",
+        prompt_templates=None,
+    )
+    payload = llm_service.build_request_payload_from_messages(
+        app_settings=settings, messages=[{"role": "user", "content": "hi"}]
+    )
+    assert "reasoning_effort" not in payload
 
 
 def test_400_on_reasoning_params_retries_without_them(monkeypatch):
@@ -148,7 +166,7 @@ def test_400_on_reasoning_params_retries_without_them(monkeypatch):
         base_url="http://127.0.0.1:1/v1",
         api_key="k",
         payload=_apply_reasoning_options(
-            _payload("cn:deepseek-v4-pro"), effort="high"
+            _payload("cn:deepseek-v4-pro"), thinking_enabled=True, effort="high"
         ),
         timeout_seconds=5,
     )
@@ -160,8 +178,8 @@ def test_400_on_reasoning_params_retries_without_them(monkeypatch):
     assert "thinking" not in attempts[-1]
 
 
-def test_update_settings_persists_effort_and_affects_payload(monkeypatch):
-    """端到端：写设置 → 读回 → 进入请求体。"""
+def test_update_settings_persists_both_fields(monkeypatch):
+    """端到端：开关 + 等级都能写库并进入请求体。"""
     import os
     import tempfile
 
@@ -183,9 +201,15 @@ def test_update_settings_persists_effort_and_affects_payload(monkeypatch):
     try:
         with session_scope() as db:
             updated = aniu_service.update_settings(
-                db, AppSettingsUpdate(system_prompt="s", llm_reasoning_effort="HIGH")
+                db,
+                AppSettingsUpdate(
+                    system_prompt="s",
+                    llm_thinking_enabled=True,
+                    llm_reasoning_effort="MEDIUM",
+                ),
             )
-            assert updated.llm_reasoning_effort == "high"
+            assert updated.llm_thinking_enabled is True
+            assert updated.llm_reasoning_effort == "medium"
 
         with session_scope() as db:
             settings = aniu_service.get_or_create_settings(db)
@@ -193,16 +217,17 @@ def test_update_settings_persists_effort_and_affects_payload(monkeypatch):
             payload = llm_service.build_request_payload_from_messages(
                 app_settings=settings, messages=[{"role": "user", "content": "hi"}]
             )
-        assert payload["reasoning_effort"] == "high"
+        assert payload["reasoning_effort"] == "medium"
 
-        # 改成 off 后请求体里不应再出现思考参数
+        # 关掉开关后：等级保留，但请求体不再带思考参数
         with session_scope() as db:
             aniu_service.update_settings(
-                db, AppSettingsUpdate(system_prompt="s", llm_reasoning_effort="off")
+                db, AppSettingsUpdate(system_prompt="s", llm_thinking_enabled=False)
             )
         with session_scope() as db:
             settings = aniu_service.get_or_create_settings(db)
             settings.run_type = "analysis"
+            assert settings.llm_reasoning_effort == "medium"
             payload = llm_service.build_request_payload_from_messages(
                 app_settings=settings, messages=[{"role": "user", "content": "hi"}]
             )
