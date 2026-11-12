@@ -216,18 +216,38 @@ export const useAppStore = defineStore('app', () => {
   const canManualRefreshAccount = computed(() => accountRefreshRemainingMs.value <= 0)
   const accountRefreshCooldownText = computed(() => formatCooldownDuration(accountRefreshRemainingMs.value))
 
+  // 可空字段的 UI 兜底值（后端返回 null 时用）
+  const SETTINGS_NULL_FALLBACKS: Record<string, unknown> = {
+    mx_api_key: '',
+    jin10_api_base_url: 'http://127.0.0.1:3000',
+    cls_api_base_url: 'http://127.0.0.1:3000',
+    llm_base_url: '',
+    llm_api_key: '',
+  }
+
   function applySettings(payload: AppSettings) {
-    settings.provider_name = payload.provider_name
-    settings.mx_api_key = payload.mx_api_key ?? ''
-    settings.jin10_api_base_url = payload.jin10_api_base_url ?? 'http://127.0.0.1:3000'
-    settings.cls_api_base_url = payload.cls_api_base_url ?? 'http://127.0.0.1:3000'
-    settings.llm_base_url = payload.llm_base_url ?? ''
-    settings.llm_api_key = payload.llm_api_key ?? ''
-    settings.llm_model = payload.llm_model
-    settings.system_prompt = payload.system_prompt
+    // 全量覆盖，而不是逐字段白名单赋值。
+    // 2026-11 事故：新增 llm_thinking_enabled / llm_reasoning_effort 后，保存确实
+    // 写进了库（接口 GET 也返回了），但这里漏掉拷贝 → 刷新页面被 defaultSettings()
+    // 的默认值盖掉，表现为"点了保存、刷新又变回去"。改成整对象合并后，以后
+    // 后端新增字段也不会再被静默丢弃。
+    Object.assign(settings, payload)
+
+    for (const [key, fallback] of Object.entries(SETTINGS_NULL_FALLBACKS)) {
+      const current = (settings as unknown as Record<string, unknown>)[key]
+      if (current === null || current === undefined) {
+        ;(settings as unknown as Record<string, unknown>)[key] = fallback
+      }
+    }
+
     settings.prompt_templates = { ...(payload.prompt_templates ?? {}) }
-    settings.automation_context_window_tokens = payload.automation_context_window_tokens ?? 131072
+    settings.automation_context_window_tokens =
+      payload.automation_context_window_tokens ?? 131072
     settings.automation_dream_time = payload.automation_dream_time ?? '00:30'
+    // 思考开关/等级：布尔与字符串都要有确定值，避免 v-model 绑到 null
+    settings.llm_thinking_enabled = Boolean(payload.llm_thinking_enabled)
+    settings.llm_reasoning_effort =
+      String(payload.llm_reasoning_effort ?? '').trim() || 'high'
   }
 
   function applySchedules(payload: ScheduleConfig[]) {
