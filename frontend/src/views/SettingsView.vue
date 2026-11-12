@@ -36,18 +36,17 @@
             </label>
             <label class="field">
               <span>思考等级</span>
-              <select
+              <input
                 v-model="settings.llm_reasoning_effort"
-                :disabled="!settings.llm_thinking_enabled"
-              >
-                <option value="low">低（省 token）</option>
-                <option value="medium">中</option>
-                <option value="high">高（推荐）</option>
-                <option value="max">最高（最慢、最贵）</option>
-              </select>
+                placeholder="手动输入，如 high / medium / low / max"
+                maxlength="16"
+              />
               <p class="field-help">
-                仅"开启思考"时生效。上游若不支持该参数会自动降级重试，
-                不会让本轮请求失败。
+                手动输入，按原文发送、不做改写（留空按 <code>high</code>）。
+                实测本网关接受：<code>low</code> / <code>medium</code> /
+                <code>high</code> / <code>max</code> / <code>minimal</code>；
+                其它值（如 <code>veryhigh</code>）会被网关拒绝，届时本轮自动
+                关闭思考重试，不会失败。仅"开启思考"勾选时生效。
               </p>
             </label>
             <label class="field">

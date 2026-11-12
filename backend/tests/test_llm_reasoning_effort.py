@@ -92,14 +92,43 @@ def test_mimo_gets_thinking_flag():
     assert out["reasoning_effort"] == "low"
 
 
-def test_legacy_effort_values_are_normalized():
-    """旧值/脏值不报错：xhigh→max，auto/off/未知→high（关闭看开关）。"""
-    cases = (("xhigh", "max"), ("auto", "high"), ("off", "high"), ("bogus", "high"))
-    for legacy, expected in cases:
+def test_effort_is_passed_through_verbatim():
+    """等级是手动输入：只做去空白/小写/别名归一，其它值原样发送。"""
+    cases = (
+        ("HIGH", "high"),
+        (" max ", "max"),
+        ("xhigh", "max"),
+        ("minimal", "minimal"),
+        ("veryhigh", "veryhigh"),
+        ("最高", "max"),
+    )
+    for raw, expected in cases:
         out = _apply_reasoning_options(
-            _payload("cn:deepseek-v4.1-flash"), thinking_enabled=True, effort=legacy
+            _payload("cn:deepseek-v4.1-flash"), thinking_enabled=True, effort=raw
         )
-        assert out["reasoning_effort"] == expected, legacy
+        assert out["reasoning_effort"] == expected, raw
+
+
+def test_empty_effort_falls_back_to_high():
+    for empty in (None, "", "   "):
+        out = _apply_reasoning_options(
+            _payload("cn:deepseek-v4.1-flash"), thinking_enabled=True, effort=empty
+        )
+        assert out["reasoning_effort"] == "high"
+
+
+def test_schema_keeps_manual_value():
+    """写入路径不能把用户手输的等级改写成 high。"""
+    from app.schemas.aniu import AppSettingsBase
+
+    for raw, expected in (
+        ("minimal", "minimal"),
+        ("VERYHIGH", "veryhigh"),
+        (" max ", "max"),
+        ("", "high"),
+    ):
+        model = AppSettingsBase(system_prompt="s", llm_reasoning_effort=raw)
+        assert model.llm_reasoning_effort == expected, raw
 
 
 def test_settings_flow_into_request_payload():
@@ -236,3 +265,62 @@ def test_update_settings_persists_both_fields(monkeypatch):
         database_module._engine = None
         database_module._session_local = None
         get_settings.cache_clear()
+
+
+def test_unknown_level_503_from_gateway_degrades_instead_of_failing(monkeypatch):
+    """实测：未知等级被网关拒时返回 503（no_healthy_account），
+    必须剔除参数重试，而不是让整轮交易分析失败。"""
+    attempts: list[dict] = []
+
+    def fake_consume(self, *, payload, **kwargs):
+        attempts.append(dict(payload))
+        if "reasoning_effort" in payload:
+            raise LLMUpstreamError(
+                'HTTP 503: {"error":{"code":"no_healthy_account",'
+                '"gateway_hint":"request parameters were rejected by the model"}}',
+                status_code=503,
+            )
+        return {"choices": [{"message": {"content": "ok"}}], "stream_meta": {}}
+
+    monkeypatch.setattr(LLMService, "_consume_llm_stream", fake_consume)
+
+    events: list[tuple] = []
+    result = llm_service._call_llm_stream(
+        base_url="http://127.0.0.1:1/v1",
+        api_key="k",
+        payload=_apply_reasoning_options(
+            _payload("cn:deepseek-v4.1-flash"), thinking_enabled=True, effort="veryhigh"
+        ),
+        timeout_seconds=5,
+        emit=lambda *a, **kw: events.append((a, kw)),
+    )
+
+    assert result["choices"][0]["message"]["content"] == "ok"
+    assert attempts[0]["reasoning_effort"] == "veryhigh"
+    assert "reasoning_effort" not in attempts[-1]
+    # 用户可见的降级提示
+    assert any("思考等级" in str(kw.get("message", "")) for _, kw in events)
+
+
+def test_irrelevant_5xx_keeps_reasoning_params(monkeypatch):
+    """与思考参数无关的 5xx 不应被误判成参数问题（仍按原样重试）。"""
+    calls: list[dict] = []
+
+    def fake_consume(self, *, payload, **kwargs):
+        calls.append(dict(payload))
+        if len(calls) == 1:
+            raise LLMUpstreamError("HTTP 502: upstream connect error", status_code=502)
+        return {"choices": [{"message": {"content": "ok"}}], "stream_meta": {}}
+
+    monkeypatch.setattr(LLMService, "_consume_llm_stream", fake_consume)
+
+    result = llm_service._call_llm_stream(
+        base_url="http://127.0.0.1:1/v1",
+        api_key="k",
+        payload=_apply_reasoning_options(
+            _payload("cn:deepseek-v4.1-flash"), thinking_enabled=True, effort="high"
+        ),
+        timeout_seconds=5,
+    )
+    assert result["choices"][0]["message"]["content"] == "ok"
+    assert calls[-1]["reasoning_effort"] == "high"

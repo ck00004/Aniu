@@ -42,8 +42,8 @@ _DEEPSEEK_THINKING_MODEL_PREFIXES = (
 # 思考分支沦为死代码（2026-11 线上排查确认）。这里统一剥离前缀再判断。
 _PROVIDER_PREFIX_RE = re.compile(r"^[A-Za-z]{2,8}\s*:\s*")
 
-# 思考等级白名单（是否开启由 app_settings.llm_thinking_enabled 单独控制）
-_REASONING_EFFORT_LEVELS = ("low", "medium", "high", "max")
+# 思考等级为手动输入（low/medium/high/max 为常用值，但不做白名单限制），
+# 是否开启由 app_settings.llm_thinking_enabled 单独控制。
 _DEEPSEEK_IGNORED_SAMPLING_KEYS = (
     "temperature",
     "top_p",
@@ -247,6 +247,32 @@ def _should_fallback_to_non_stream(exc: LLMUpstreamError) -> bool:
     return exc.status_code == 400
 
 
+# 上游"参数不被接受"的常见措辞（不同网关/中转会包成 400、422 甚至 503）
+_REASONING_REJECTION_HINTS = (
+    "reasoning",
+    "thinking",
+    "parameter",
+    "unsupported",
+    "invalid_request",
+    "rejected",
+)
+
+
+def _looks_like_reasoning_rejection(exc: LLMUpstreamError) -> bool:
+    """判断这次失败是否可能由 thinking/reasoning_effort 参数引起。
+
+    实测（2026-11-12，本项目的网关）：`reasoning_effort=veryhigh` 这种未知
+    档位被拒时返回的是 **503 no_healthy_account**，错误体里写着
+    "request parameters were rejected by the model …"，而不是 400。
+    只兜 400 会让整轮运行失败，因此这里放宽到 4xx/5xx + 关键词命中。
+    """
+    status = exc.status_code or 0
+    if status and status < 400:
+        return False
+    text = str(exc).lower()
+    return any(hint in text for hint in _REASONING_REJECTION_HINTS)
+
+
 def _strip_provider_prefix(model: Any) -> str:
     """剥离网关的 provider 前缀：`cn:deepseek-v4-pro` → `deepseek-v4-pro`。"""
     normalized = str(model or "").strip().lower()
@@ -267,22 +293,28 @@ def _should_enable_deepseek_thinking(model: Any) -> bool:
     return normalized.startswith(_DEEPSEEK_THINKING_MODEL_PREFIXES)
 
 
-def _normalize_reasoning_effort(value: Any) -> str | None:
-    """把思考等级归一成 low/medium/high/max；None 表示未指定（落到 high）。
+# 常见等级别名（其余值原样透传，尊重手动输入）
+_REASONING_EFFORT_ALIASES = {
+    "最小": "minimal",
+    "最低": "low",
+    "低": "low",
+    "中": "medium",
+    "高": "high",
+    "最高": "max",
+    "xhigh": "max",
+}
 
-    兼容早期草稿里的值：xhigh/max → max，auto/off/none → None
-    （是否关闭思考由 llm_thinking_enabled 决定，不再靠等级值表达）。
+
+def _normalize_reasoning_effort(value: Any) -> str | None:
+    """思考等级：手动输入的字符串原样保留，只做去空白/小写/别名归一。
+
+    不做白名单收敛：用户填 `minimal`、`veryhigh` 等网关自定义档位时不能被
+    悄悄改成 high；上游不认该值时由 `_call_llm_stream` 的 400 回退兜底。
     """
     normalized = str(value or "").strip().lower()
     if not normalized:
         return None
-    if normalized in {"xhigh", "max", "最高"}:
-        return "max"
-    if normalized in {"off", "none", "disabled", "关闭", "auto", "自动"}:
-        return None
-    if normalized in {"low", "medium", "high"}:
-        return normalized
-    return None
+    return _REASONING_EFFORT_ALIASES.get(normalized, normalized)
 
 
 def _apply_reasoning_options(
@@ -1292,23 +1324,31 @@ class LLMService:
             if last_error is None:
                 continue
             if (
-                last_error.status_code == 400
-                and not reasoning_stripped
-                and (
-                    "reasoning" in str(last_error).lower()
-                    or "thinking" in str(last_error).lower()
-                )
+                not reasoning_stripped
+                and ("reasoning_effort" in stream_payload or "thinking" in stream_payload)
+                and _looks_like_reasoning_rejection(last_error)
             ):
-                # 上游不认识 thinking/reasoning_effort（换了模型或网关降级）：
-                # 剔除这些参数重试一次，思考等级失效但整轮请求不失败。
+                # 上游不接受 thinking/reasoning_effort（未知等级、模型不支持、
+                # 或网关降级）：剔除后重试一次。思考等级失效，但整轮不失败。
                 reasoning_stripped = True
+                rejected_level = stream_payload.pop("reasoning_effort", None)
                 stream_payload.pop("thinking", None)
-                stream_payload.pop("reasoning_effort", None)
                 logger.warning(
-                    "LLM upstream rejected reasoning options with 400, "
-                    "retrying without them: %s",
+                    "LLM upstream rejected reasoning options "
+                    "(effort=%s, status=%s), retrying without them: %s",
+                    rejected_level,
+                    last_error.status_code,
                     last_error,
                 )
+                if callable(emit):
+                    emit(
+                        "stage",
+                        stage="llm",
+                        message=(
+                            f"上游不接受思考等级 {rejected_level}，已自动关闭思考"
+                            "并重试本轮请求"
+                        ),
+                    )
                 continue
             if _should_fallback_to_non_stream(last_error):
                 if callable(emit):

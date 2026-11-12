@@ -17,21 +17,30 @@ def _mask_key(value: str | None) -> str | None:
     return value[:3] + "****" + value[-4:]
 
 
-_REASONING_EFFORT_VALUES = ("low", "medium", "high", "max")
+# 常见等级别名（其余值原样透传给网关，由上游决定是否支持）
+_REASONING_EFFORT_ALIASES = {
+    "最小": "minimal",
+    "最低": "low",
+    "低": "low",
+    "中": "medium",
+    "高": "high",
+    "最高": "max",
+    "xhigh": "max",
+}
 
 
 def _normalize_effort_value(value: object) -> str:
-    """思考等级归一：只保留四档，默认 high。
+    """思考等级：**手动输入的字符串原样保留**，只做去空白/小写/别名归一。
 
-    兼容历史/草稿值：xhigh→max；auto/off/none/关闭→high（是否关闭思考
-    由 llm_thinking_enabled 决定，等级字段不表达"关闭"）。
+    不做白名单强转——手动输入就该被尊重：用户填 `minimal`、`veryhigh` 等
+    网关自定义档位时，不能被后端悄悄改成 high。若上游不认识该值，
+    `_call_llm_stream` 的 400 回退会剔除参数重试，不会让整轮请求失败。
+    空值 → `high`（默认档）。
     """
     normalized = str(value or "").strip().lower()
-    if normalized in {"xhigh", "max", "最高"}:
-        return "max"
-    if normalized in {"low", "medium", "high"}:
-        return normalized
-    return "high"
+    if not normalized:
+        return "high"
+    return _REASONING_EFFORT_ALIASES.get(normalized, normalized)
 
 
 class AppSettingsBase(BaseModel):
@@ -49,7 +58,10 @@ class AppSettingsBase(BaseModel):
     llm_reasoning_effort: str = Field(
         default="high",
         max_length=16,
-        description="思考等级：low | medium | high | max（仅开启思考时生效）",
+        description=(
+            "思考等级：手动输入（常用 low/medium/high/max，也接受网关支持的其他"
+            "档位），仅开启思考时生效"
+        ),
     )
     system_prompt: str = Field(max_length=20000)
     prompt_templates: dict[str, str] = Field(default_factory=dict)
