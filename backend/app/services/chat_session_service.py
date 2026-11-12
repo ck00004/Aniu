@@ -809,6 +809,12 @@ class ChatSessionService:
                     tool_context={"app_settings": settings_snapshot},
                     emit=_emit,
                     cancel_event=cancel_event,
+                    thinking_enabled=getattr(
+                        settings_snapshot, "llm_thinking_enabled", None
+                    ),
+                    reasoning_effort=getattr(
+                        settings_snapshot, "llm_reasoning_effort", None
+                    ),
                 )
                 captured_replay_messages[:] = list(result.get("replay_messages") or [])
                 # 多轮工具调用的 usage 按轮累计后随消息落库，

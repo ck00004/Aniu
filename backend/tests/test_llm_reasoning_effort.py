@@ -324,3 +324,77 @@ def test_irrelevant_5xx_keeps_reasoning_params(monkeypatch):
     )
     assert result["choices"][0]["message"]["content"] == "ok"
     assert calls[-1]["reasoning_effort"] == "high"
+
+
+def test_chat_forwards_thinking_settings(monkeypatch):
+    """聊天路径此前没接思考开关（即使打开了也不会思考），必须透传。"""
+    captured: dict = {}
+
+    def fake_agent_loop(self, **kwargs):
+        captured.update(kwargs)
+        return {"final_answer": "ok", "messages": [], "responses": [], "tool_calls": []}
+
+    monkeypatch.setattr(LLMService, "_agent_loop", fake_agent_loop)
+
+    llm_service.chat(
+        model="cn:deepseek-v4.1-flash",
+        base_url="http://127.0.0.1:1/v1",
+        api_key="k",
+        system_prompt="s",
+        messages=[{"role": "user", "content": "hi"}],
+        thinking_enabled=True,
+        reasoning_effort="max",
+    )
+
+    assert captured["thinking_enabled"] is True
+    assert captured["reasoning_effort"] == "max"
+
+
+def test_generate_text_forwards_thinking_settings(monkeypatch):
+    """新闻诊断等辅助生成路径同样透传（否则开关对它们无效）。"""
+    captured: dict = {}
+
+    def fake_call_llm_stream(self, *, payload, **kwargs):
+        captured.update(payload)
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    monkeypatch.setattr(LLMService, "_call_llm_stream", fake_call_llm_stream)
+
+    llm_service.generate_text(
+        model="cn:deepseek-v4.1-flash",
+        base_url="http://127.0.0.1:1/v1",
+        api_key="k",
+        system_prompt="s",
+        messages=[{"role": "user", "content": "hi"}],
+        thinking_enabled=True,
+        reasoning_effort="medium",
+    )
+    assert captured["reasoning_effort"] == "medium"
+
+
+def test_single_global_settings_drives_all_payload_builders():
+    """全局唯一：同一份 app_settings 驱动调度运行与聊天两条构造路径。"""
+    settings = SimpleNamespace(
+        llm_model="cn:deepseek-v4.1-flash",
+        system_prompt="system",
+        task_prompt="task",
+        run_type="analysis",
+        prompt_templates=None,
+        llm_thinking_enabled=True,
+        llm_reasoning_effort="max",
+    )
+
+    scheduled = llm_service.build_initial_request_payload(settings)
+    chat = llm_service.build_request_payload_from_messages(
+        app_settings=settings, messages=[{"role": "user", "content": "hi"}]
+    )
+
+    assert scheduled["reasoning_effort"] == "max"
+    assert chat["reasoning_effort"] == "max"
+
+    # 关掉同一份配置，两条路径同时失效
+    settings.llm_thinking_enabled = False
+    assert "reasoning_effort" not in llm_service.build_initial_request_payload(settings)
+    assert "reasoning_effort" not in llm_service.build_request_payload_from_messages(
+        app_settings=settings, messages=[{"role": "user", "content": "hi"}]
+    )

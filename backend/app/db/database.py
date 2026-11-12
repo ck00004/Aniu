@@ -204,7 +204,8 @@ def _ensure_app_settings_columns(engine) -> None:
         )
 
     # 历史/草稿值归一（幂等；app_settings 只有一行，启动期成本可忽略）。
-    # 思考等级只保留四档，是否开启由 llm_thinking_enabled 单独控制。
+    # 思考等级为手动输入值；历史/草稿里的 auto、off、xhigh 等归一为常用值，
+    # 是否开启思考由 llm_thinking_enabled 单独控制。
     statements.append(
         "UPDATE app_settings SET llm_reasoning_effort = 'max' "
         "WHERE lower(llm_reasoning_effort) IN ('xhigh','max')"

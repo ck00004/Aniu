@@ -737,6 +737,8 @@ class LLMService:
         tool_context: dict[str, Any] | None = None,
         emit: Any = None,
         cancel_event: threading.Event | None = None,
+        thinking_enabled: Any = None,
+        reasoning_effort: Any = None,
     ) -> dict[str, Any]:
         payload_messages: list[dict[str, Any]] = []
         effective_system_prompt = self._augment_system_prompt(
@@ -773,6 +775,8 @@ class LLMService:
             tool_executor=_chat_tool_executor,
             emit=emit,
             cancel_event=cancel_event,
+            thinking_enabled=thinking_enabled,
+            reasoning_effort=reasoning_effort,
         )
         result["initial_message_count"] = len(payload_messages)
         result["replay_messages"] = self.extract_turn_replay_messages(
@@ -794,6 +798,8 @@ class LLMService:
         tool_context: dict[str, Any] | None = None,
         emit: Any = None,
         cancel_event: threading.Event | None = None,
+        thinking_enabled: Any = None,
+        reasoning_effort: Any = None,
     ) -> str:
         result = self.chat_with_details(
             model=model,
@@ -806,6 +812,8 @@ class LLMService:
             tool_context=tool_context,
             emit=emit,
             cancel_event=cancel_event,
+            thinking_enabled=thinking_enabled,
+            reasoning_effort=reasoning_effort,
         )
         return result["final_answer"] or "模型本轮未返回可展示内容。"
 

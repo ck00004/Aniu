@@ -361,6 +361,9 @@ class MemoryDreamService:
             ),
             prompt_templates=getattr(settings, "prompt_templates", None) or {},
             run_type="dream",
+            # 思考开关是全局设置：梦境整理与调度运行共用
+            llm_thinking_enabled=getattr(settings, "llm_thinking_enabled", None),
+            llm_reasoning_effort=getattr(settings, "llm_reasoning_effort", None),
             timeout_seconds=600,
             automation_context_window_tokens=None,
             tools_override=build_dream_tools(),

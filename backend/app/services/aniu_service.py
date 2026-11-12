@@ -2292,6 +2292,9 @@ class AniuService:
             messages=messages,
             timeout_seconds=1800,
             tool_context={"app_settings": settings},
+            # 思考开关是全局设置，聊天与调度运行共用同一份配置
+            thinking_enabled=getattr(settings, "llm_thinking_enabled", None),
+            reasoning_effort=getattr(settings, "llm_reasoning_effort", None),
         )
 
         return {
@@ -2352,6 +2355,12 @@ class AniuService:
                     tool_context={"app_settings": settings_snapshot},
                     emit=_emit,
                     cancel_event=cancel_event,
+                    thinking_enabled=getattr(
+                        settings_snapshot, "llm_thinking_enabled", None
+                    ),
+                    reasoning_effort=getattr(
+                        settings_snapshot, "llm_reasoning_effort", None
+                    ),
                 )
                 _emit("completed", message=content)
             except LLMStreamCancelled:
@@ -2949,6 +2958,8 @@ class AniuService:
                     timeout_seconds=int(getattr(settings, "timeout_seconds", 60) or 60),
                     run_type=None,
                     emit=None,
+                    thinking_enabled=getattr(settings, "llm_thinking_enabled", None),
+                    reasoning_effort=getattr(settings, "llm_reasoning_effort", None),
                 )
                 chunk_outputs.append(chunk_text)
 
@@ -2981,6 +2992,8 @@ class AniuService:
                     timeout_seconds=int(getattr(settings, "timeout_seconds", 60) or 60),
                     run_type=None,
                     emit=None,
+                    thinking_enabled=getattr(settings, "llm_thinking_enabled", None),
+                    reasoning_effort=getattr(settings, "llm_reasoning_effort", None),
                 )
 
             final_summary = self._summarize_news_source_analysis(final_text)
